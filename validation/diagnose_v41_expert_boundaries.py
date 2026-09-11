@@ -7,7 +7,12 @@ import json
 import torch
 
 from b12x.moe import fused_moe
-from tests.moe.test_deepseek_v41_experts import _decode, _mxfp8, _oracle, _setup
+from tests._reference.deepseek_v41_moe import (
+    _decode,
+    _mxfp8,
+    moe_reference_deepseek_v41 as _oracle,
+)
+from tests.moe.test_deepseek_v41_experts import _setup
 
 
 def report(label, actual, expected, limit=8):

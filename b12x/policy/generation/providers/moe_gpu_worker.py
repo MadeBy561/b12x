@@ -733,11 +733,21 @@ def _candidates_for_geometry(
 ) -> tuple[MoeCandidate, ...]:
     recipe = geometry.recipe
     if recipe.numerical_recipe == "deepseek_v41":
-        return (MoeCandidate.create({
+        dynamic_candidate = MoeCandidate.create({
             "backend": "dynamic", "dynamic_route_mode": "grouped",
             "dynamic_tile_m": 64, "route_planner": "internal",
             "max_active_clusters": None, "w4a16_route_mode": None,
-        }),)
+        })
+        if geometry.hidden_size % 256 or geometry.intermediate_size % 128:
+            return (dynamic_candidate,)
+        return (
+            MoeCandidate.create({
+                "backend": "micro", "dynamic_route_mode": None,
+                "dynamic_tile_m": None, "route_planner": "internal",
+                "max_active_clusters": None, "w4a16_route_mode": None,
+            }),
+            dynamic_candidate,
+        )
     if recipe.quant_mode == "nvfp4_auto":
         from dataclasses import replace
         return tuple(
@@ -937,22 +947,46 @@ def _eligible_candidates_for_case(
                 deterministic_output=False,
             ):
                 continue
-        if candidate.config["backend"] == "micro" and not _impl._policy_micro_supported(
-            _impl.MoeDecodeQuery(
-                quant_mode=geometry.recipe.quant_mode,
-                source_format=_impl._canonical_moe_policy_source_format(
-                    geometry.recipe.source_format
-                ),
-                activation=geometry.activation,
-                num_experts=geometry.num_experts,
-                hidden_size=geometry.hidden_size,
-                intermediate_size=geometry.intermediate_size,
-                top_k=case.top_k,
-                num_tokens=case.num_tokens,
-                routed_rows=case.routed_rows,
-            )
-        ):
-            continue
+        if candidate.config["backend"] == "micro":
+            if geometry.recipe.numerical_recipe == "deepseek_v41":
+                from b12x.moe.fused_moe._policy import validate_moe_decode_config
+
+                query = _impl.MoeDecodeQuery(
+                    quant_mode=geometry.recipe.quant_mode,
+                    source_format=geometry.recipe.source_format,
+                    activation=geometry.activation,
+                    num_experts=geometry.num_experts,
+                    hidden_size=geometry.hidden_size,
+                    intermediate_size=geometry.intermediate_size,
+                    top_k=case.top_k,
+                    num_tokens=case.num_tokens,
+                    routed_rows=case.routed_rows,
+                    numerical_recipe=geometry.recipe.numerical_recipe,
+                )
+                try:
+                    validate_moe_decode_config(
+                        query,
+                        _impl.MoeDecodeConfig.from_profile(candidate.config),
+                        None,
+                    )
+                except (TypeError, ValueError):
+                    continue
+            elif not _impl._policy_micro_supported(
+                _impl.MoeDecodeQuery(
+                    quant_mode=geometry.recipe.quant_mode,
+                    source_format=_impl._canonical_moe_policy_source_format(
+                        geometry.recipe.source_format
+                    ),
+                    activation=geometry.activation,
+                    num_experts=geometry.num_experts,
+                    hidden_size=geometry.hidden_size,
+                    intermediate_size=geometry.intermediate_size,
+                    top_k=case.top_k,
+                    num_tokens=case.num_tokens,
+                    routed_rows=case.routed_rows,
+                )
+            ):
+                continue
         if (
             candidate.config["backend"] == "w4a16"
             and candidate.config["w4a16_route_mode"] == "direct"

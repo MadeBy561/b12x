@@ -8,58 +8,7 @@ from b12x._lib.runtime_control import (
     freeze_kernel_resolution,
     unfreeze_kernel_resolution,
 )
-
-
-def _mxfp8(x):
-    blocks = x.float().reshape(*x.shape[:-1], -1, 32)
-    scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax(-1, keepdim=True).clamp_min(1.0e-4) / 448.0)))
-    return ((blocks / scale).to(torch.float8_e4m3fn).float() * scale).reshape(x.shape)
-
-
-def _decode(packed, scales):
-    codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2).long()
-    lut = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.], device=packed.device)
-    scale = torch.exp2(scales.float() - 127).repeat_interleave(32, dim=-1)
-    return lut[codes] * scale
-
-
-def _gemm_k32(activations, weights):
-    """Published kernel.py:534-554 uses FP32 accumulation of K32 partials.
-
-    MX scales are exact powers of two, so decoding each K32 operand group
-    commutes with its contraction; summing all K at once does not preserve
-    the reference's intermediate FP32 rounding.
-    """
-    result = torch.zeros(
-        (activations.shape[0], weights.shape[0]),
-        dtype=torch.float32,
-        device=activations.device,
-    )
-    for k in range(0, activations.shape[1], 32):
-        result.add_(activations[:, k:k + 32] @ weights[:, k:k + 32].T)
-    return result
-
-
-def _oracle(x, ids, weights, checkpoint, *, round_fc1=True, weight_before_fc2=True):
-    w13, sf13, w2, sf2 = checkpoint
-    result = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-    x8 = _mxfp8(x)
-    for expert in range(w13.shape[0]):
-        token, slot = torch.where(ids == expert)
-        if not token.numel():
-            continue
-        gate, up = _gemm_k32(x8[token], _decode(w13[expert], sf13[expert])).chunk(2, dim=-1)
-        if round_fc1:
-            gate, up = gate.bfloat16().float(), up.bfloat16().float()
-        mid = torch.nn.functional.silu(gate.clamp(max=10.)) * up.clamp(-10., 10.)
-        route = weights[token, slot, None]
-        if weight_before_fc2:
-            mid = mid * route
-        down = _gemm_k32(_mxfp8(mid.bfloat16()), _decode(w2[expert], sf2[expert])).bfloat16().float()
-        if not weight_before_fc2:
-            down = down * route
-        result.index_add_(0, token, down)
-    return result
+from tests._reference.deepseek_v41_moe import moe_reference_deepseek_v41 as _oracle
 
 
 def _setup(experts, hidden, intermediate, topk, capacity):
@@ -124,17 +73,21 @@ def test_deepseek_v41_rounding_and_router_placement():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("local_experts,topk", [(48, 6), (16, 3)])
-def test_deepseek_v41_local_experts_live_counts_and_graph(local_experts, topk):
+@pytest.mark.parametrize("local_experts,topk,capacity", [(48, 6, 65), (16, 3, 65), (96, 6, 8), (16, 3, 8)])
+def test_deepseek_v41_local_experts_live_counts_and_graph(local_experts, topk, capacity):
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
-        plan, experts, scratch, checkpoint, x, ids, weights, output = _setup(local_experts, 5120, 2304, topk, 65)
+        plan, experts, scratch, checkpoint, x, ids, weights, output = _setup(local_experts, 5120, 2304, topk, capacity)
+        for storage in scratch.values():
+            storage.fill_(0xA5)
         freeze_kernel_resolution("V4.1 expert capacity reuse")
         try:
-            for count in (1, 7, 65):
+            for count in (1, 7, capacity):
                 binding = fused_moe.bind(plan, scratch=scratch, experts=experts, a=x[:count], topk_ids=ids[:count], topk_weights=weights[:count], output=output[:count], input_scales_static=True)
+                allocated_before = torch.cuda.memory_allocated()
                 fused_moe.run(binding=binding)
+                assert torch.cuda.memory_allocated() == allocated_before
                 expected = _oracle(x[:count], ids[:count], weights[:count], checkpoint)
                 torch.testing.assert_close(output[:count], expected, rtol=.01, atol=.08)
             binding = fused_moe.bind(plan, scratch=scratch, experts=experts, a=x, topk_ids=ids, topk_weights=weights, output=output, input_scales_static=True)
@@ -156,3 +109,15 @@ def test_deepseek_v41_local_experts_live_counts_and_graph(local_experts, topk):
             unfreeze_kernel_resolution()
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("capacity", [8, 65])
+def test_deepseek_v41_rejects_bf16_route_weights_at_bind(capacity):
+    plan, experts, scratch, _, x, ids, weights, output = _setup(4, 256, 128, 3, capacity)
+    with pytest.raises(TypeError, match="FP32"):
+        fused_moe.bind(
+            plan, scratch=scratch, experts=experts, a=x,
+            topk_ids=ids, topk_weights=weights.bfloat16(), output=output,
+            input_scales_static=True,
+        )

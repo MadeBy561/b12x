@@ -287,7 +287,7 @@ COMMON_MOE_MODELS = (
         hidden_size=5120, intermediate_size=2304, num_experts=384,
         native_top_k=6, activation="silu", recipe_families=("deepseek-v41",),
         source="DeepSeek-V4.1-Flash inference/model.py:830-904",
-        tp_sizes=(1, 8), expert_parallel=True,
+        tp_sizes=(1, 4, 8), expert_parallel=True,
     ),
     MoeModelGeometry(
         model_id="deepseek-v4.1-dspark",
@@ -524,6 +524,12 @@ MOE_BENCHMARK_PRESETS = (
         preset_id="deepseek-v4-flash",
         model_id="deepseek-v4-flash",
         recipe_id="e8m0-w4a16",
+        tp_size=4,
+    ),
+    MoeBenchmarkPreset(
+        preset_id="deepseek-v4.1-flash",
+        model_id="deepseek-v4.1-flash",
+        recipe_id="deepseek-v41-mxfp4",
         tp_size=4,
     ),
     MoeBenchmarkPreset(

@@ -2754,6 +2754,7 @@ class MoEDynamicKernelBackend:
                     gate_tile_cnt,
                     Int32(b_down.shape[0]) // Int32(256),
                     max_active_clusters,
+                    Int32(0),
                     stream,
                 )
 

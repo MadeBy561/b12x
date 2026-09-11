@@ -4,7 +4,7 @@ import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -679,6 +679,77 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
         if config["backend"] == "dynamic"
     } == route_modes
     assert all(config["w4a16_route_mode"] is None for config in configs)
+
+
+def test_deepseek_v41_micro_policy_requires_small_aligned_geometry() -> None:
+    from b12x.moe.fused_moe._policy import (
+        MoeDecodeConfig,
+        MoeDecodeQuery,
+        validate_moe_decode_config,
+    )
+
+    config = MoeDecodeConfig(
+        backend="micro",
+        route_planner="internal",
+        max_active_clusters=None,
+    )
+    query = MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=128,
+        top_k=2,
+        num_tokens=8,
+        routed_rows=16,
+        numerical_recipe="deepseek_v41",
+    )
+
+    validate_moe_decode_config(query, config, None)
+    with pytest.raises(ValueError, match="capacity from 1 to 8"):
+        validate_moe_decode_config(
+            replace(query, num_tokens=9, routed_rows=18), config, None
+        )
+    with pytest.raises(ValueError, match="K divisible by 256"):
+        validate_moe_decode_config(
+            replace(query, hidden_size=384), config, None
+        )
+
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.numerical_recipe == "deepseek_v41"
+    )
+    candidates = _candidates_for_geometry(geometry, sm_count=48)
+    assert {candidate.config["backend"] for candidate in candidates} == {
+        "dynamic",
+        "micro",
+    }
+    case = next(
+        case
+        for case in expand_sweep_cases(geometries=(geometry,))
+        if case.num_tokens == 8 and case.route_pattern == "balanced"
+    )
+    assert any(
+        candidate.config["backend"] == "micro"
+        for candidate in moe_gpu_worker._eligible_candidates_for_case(
+            geometry, case, candidates
+        )
+    )
+    assert not any(
+        candidate.config["backend"] == "micro"
+        for candidate in moe_gpu_worker._eligible_candidates_for_case(
+            geometry, replace(case, num_tokens=9), candidates
+        )
+    )
+    assert {
+        candidate.config["backend"]
+        for candidate in _candidates_for_geometry(
+            replace(geometry, hidden_size=geometry.hidden_size + 128),
+            sm_count=48,
+        )
+    } == {"dynamic"}
 
 
 def test_nvfp4_triton_route_candidates_only_use_the_supported_tile() -> None:

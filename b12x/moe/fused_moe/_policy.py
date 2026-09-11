@@ -104,8 +104,33 @@ def validate_moe_decode_config(
     if query.numerical_recipe == "deepseek_v41":
         if query.quant_mode != "w4a8_mx" or query.source_format != "fp4_e8m0_k32" or query.activation != "silu":
             raise ValueError("deepseek_v41 requires MXFP4 A8 SiLU")
-        if (config.backend, config.route_planner, config.dynamic_tile_m, config.dynamic_route_mode) != ("dynamic", "internal", 64, "grouped"):
-            raise ValueError("deepseek_v41 requires materialized M64 grouped dynamic execution")
+        dynamic_v41 = (
+            config.backend,
+            config.route_planner,
+            config.dynamic_tile_m,
+            config.dynamic_route_mode,
+        ) == ("dynamic", "internal", 64, "grouped")
+        micro_v41 = (
+            config.backend,
+            config.route_planner,
+            config.dynamic_tile_m,
+            config.dynamic_route_mode,
+        ) == ("micro", "internal", None, None)
+        if micro_v41:
+            if not 1 <= query.num_tokens <= 8:
+                raise ValueError(
+                    "deepseek_v41 micro execution requires capacity from 1 to 8"
+                )
+            if query.hidden_size % 256 or query.intermediate_size % 128:
+                raise ValueError(
+                    "deepseek_v41 micro execution requires K divisible by 256 "
+                    "and N divisible by 128"
+                )
+        elif not dynamic_v41:
+            raise ValueError(
+                "deepseek_v41 requires materialized M64 grouped dynamic "
+                "or eligible micro execution"
+            )
     if query.quant_mode == "nvfp4_auto":
         if query.source_format != "modelopt_nvfp4" or query.activation != "silu":
             raise ValueError("automatic MoE precision requires ModelOpt NVFP4 weights and SiLU")

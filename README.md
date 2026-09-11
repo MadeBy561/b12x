@@ -288,6 +288,39 @@ Set `B12X_PRINT_COMPILE_PROGRESS=1` to log each compiler invocation with its
 cache-key parameters and duration — useful for figuring out what warmup
 actually covered. `B12X_TIMING=1` enables per-kernel timing logs.
 
+## DeepSeek V4.1 Flash MoE benchmark
+
+The `deepseek-v4.1-flash` checkpoint profile defaults to W4A8 (`w4a8_mx`)
+and TP4. It is distinct from the V4.0 `deepseek-v4-flash` profile:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/benchmark_moe.py \
+  --model-profile deepseek-v4.1-flash \
+  --batch-sizes 1 2 4 8 --reference none --cuda-graph --graph-only
+```
+
+Use `--model-path` to select a local V4.1 checkpoint and `--tp-rank` to select
+the rank slice (default 0). V4.1 partitions whole experts: TP4 has 96 local
+experts, hidden size 5120, full intermediate width 2304, and global top-k 6.
+Text routing uses the checkpoint gate and selection-only bias; nonlocal routes
+are masked without renormalizing local weights. The timed output is the FP32
+local routed sum, excluding the shared expert and all-reduce.
+V4.1 bindings require FP32 routing weights; lower-precision tensors are rejected
+at bind rather than converted during execution.
+
+The profile uses V4.1's K32/BF16 rounding and pre-FC2 router-weight placement,
+checks its numerical oracle before timing, and reuses one fixed-capacity
+scratch plan across the requested token counts. Graph replay is checked
+against eager output. The default timing mode flushes L2 outside timed events.
+Decode capacities up to eight tokens use native micro kernels with independent
+gate/up projections, one-row activation broadcasts, and compact routed
+intermediates. Larger capacities retain grouped execution with M16 compute
+chunks inside the existing M64 source layout. Both paths preserve the same
+V4.1 quantization and rounding boundaries; micro does not reuse V4.0's
+BF16-input tiny-decode approximation.
+This adds a benchmark preset and TP4 policy-generation coverage, not a newly
+tuned embedded GPU profile.
+
 ## Where to look next
 
 - `tests/` is the executable spec — per-group API and numerical-reference

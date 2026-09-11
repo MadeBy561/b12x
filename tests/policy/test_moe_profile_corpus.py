@@ -46,6 +46,25 @@ def test_common_models_expand_declared_parallel_degrees() -> None:
                     assert (model.model_id, recipe.recipe_id, tp_size) in covered
 
 
+def test_deepseek_v41_flash_tp4_partitions_whole_experts() -> None:
+    ((geometry, alias),) = (
+        (geometry, alias)
+        for geometry in expand_physical_geometries()
+        for alias in geometry.aliases
+        if alias.model_id == "deepseek-v4.1-flash"
+        and alias.tp_size == 4
+        and geometry.recipe.recipe_id == "deepseek-v41-mxfp4"
+    )
+
+    assert geometry.num_experts == 96
+    assert geometry.hidden_size == 5120
+    assert geometry.intermediate_size == 2304
+    assert alias.logical_intermediate_sizes == (2304,)
+    assert alias.native_top_k == 6
+    assert geometry.recipe.quant_mode == "w4a8_mx"
+    assert geometry.recipe.numerical_recipe == "deepseek_v41"
+
+
 def test_unaligned_three_wide_shard_is_padded_instead_of_rejected() -> None:
     recipe = MoeRecipe(
         recipe_id="nvfp4-test",
@@ -289,6 +308,7 @@ def test_modelopt_w4a8_corpus_excludes_non_route_complete_relu2_pairs() -> None:
 def test_moe_benchmark_preset_catalog_is_fully_mapped_to_the_corpus() -> None:
     expected = {
         "deepseek-v4-flash",
+        "deepseek-v4.1-flash",
         "dsv4f",
         "dsv4f-nvfp4",
         "glm51",
