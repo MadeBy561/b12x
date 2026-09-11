@@ -36,6 +36,47 @@ _DEVICE = DeviceIdentity(
 )
 
 
+@pytest.mark.parametrize("capacity", [1, 6, 16, 32, 33, 192])
+def test_v41_m16_explicit_override_accepts_only_planned_tp_geometry(capacity):
+    from b12x.moe.fused_moe._policy import (
+        MOE_DECODE_POLICY, MoeDecodeConfig, MoeDecodeQuery,
+    )
+
+    query = MoeDecodeQuery(
+        quant_mode="w4a8_mx", source_format="fp4_e8m0_k32", activation="silu",
+        num_experts=384, hidden_size=5120, intermediate_size=640, top_k=6,
+        num_tokens=capacity, routed_rows=capacity * 6,
+        numerical_recipe="deepseek_v41",
+    )
+    config = MoeDecodeConfig(
+        backend="dynamic", route_planner="internal", max_active_clusters=None,
+        dynamic_tile_m=16, dynamic_route_mode="grouped",
+    )
+    context = PolicyContext.for_identity(_DEVICE)
+    result = context.resolve(MOE_DECODE_POLICY, query, override=config)
+    assert result.config == config
+    assert result.source is PolicySource.OVERRIDE
+    for change in (
+        {"num_tokens": 193, "routed_rows": 1158},
+        {"num_experts": 192, "intermediate_size": 2304},
+        {"top_k": 3},
+        {"hidden_size": 4096},
+    ):
+        with pytest.raises(ValueError, match="M16 requires"):
+            context.resolve(MOE_DECODE_POLICY, replace(query, **change), override=config)
+    context.resolve(
+        MOE_DECODE_POLICY,
+        replace(query, num_experts=96, intermediate_size=2304, num_tokens=4096, routed_rows=24576),
+        override=replace(config, dynamic_tile_m=64),
+    )
+    ep_query = replace(query, num_experts=96, intermediate_size=2304)
+    if capacity <= 32:
+        context.resolve(MOE_DECODE_POLICY, ep_query, override=config)
+    else:
+        with pytest.raises(ValueError, match="M16 requires"):
+            context.resolve(MOE_DECODE_POLICY, ep_query, override=config)
+
+
 @dataclass(frozen=True)
 class _Query:
     family: str

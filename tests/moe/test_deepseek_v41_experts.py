@@ -11,7 +11,7 @@ from b12x._lib.runtime_control import (
 from tests._reference.deepseek_v41_moe import moe_reference_deepseek_v41 as _oracle
 
 
-def _setup(experts, hidden, intermediate, topk, capacity):
+def _setup(experts, hidden, intermediate, topk, capacity, *, policy=None):
     generator = torch.Generator(device="cuda").manual_seed(41083)
     w13 = torch.randint(0, 256, (experts, 2 * intermediate, hidden // 2), dtype=torch.uint8, device="cuda", generator=generator)
     w2 = torch.randint(0, 256, (experts, hidden, intermediate // 2), dtype=torch.uint8, device="cuda", generator=generator)
@@ -31,6 +31,7 @@ def _setup(experts, hidden, intermediate, topk, capacity):
     plan = fused_moe.plan_execution(
         experts=prepared,
         capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
+        policy=policy,
     )
     fused_moe.prewarm(plan)
     scratch = {spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device) for spec in plan.scratch_specs()}
@@ -41,6 +42,74 @@ def _setup(experts, hidden, intermediate, topk, capacity):
     weights = torch.rand((capacity, topk), generator=generator, device="cuda") * .7 + .07
     output = torch.empty((capacity, hidden), device="cuda", dtype=torch.float32)
     return plan, prepared, scratch, checkpoint, x, ids, weights, output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("geometry,counts", [
+    ((384, 640, 192), (1, 6, 16, 32, 33, 192)),
+    ((96, 2304, 32), (1, 6, 16, 32)),
+])
+def test_v41_m16_matches_m64_after_poison_and_graph_route_changes(geometry, counts):
+    """Every consumed route slot must be rewritten without a barrier reset."""
+    from b12x.moe.fused_moe._policy import MoeDecodeConfig
+    from b12x.policy import PolicyContext
+
+    policy = PolicyContext.for_device("cuda").with_override(
+        "moe.decode",
+        MoeDecodeConfig(
+            backend="dynamic", route_planner="internal", max_active_clusters=None,
+            dynamic_tile_m=16, dynamic_route_mode="grouped",
+        ),
+    )
+    expert_count, intermediate, capacity = geometry
+    plan, experts, scratch, _, x, ids, weights, output = _setup(
+        expert_count, 5120, intermediate, 6, capacity, policy=policy,
+    )
+    control = fused_moe.plan_execution(
+        experts=experts,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=6),
+    )
+    fused_moe.prewarm(control)
+    control_scratch = {
+        s.name: torch.empty(s.shape, dtype=s.dtype, device=s.device)
+        for s in control.scratch_specs()
+    }
+    expected = torch.empty_like(output)
+
+    def bind(p, storage, out, count):
+        return fused_moe.bind(
+            p, scratch=storage, experts=experts, a=x[:count],
+            topk_ids=ids[:count], topk_weights=weights[:count],
+            output=out[:count], input_scales_static=True,
+        )
+
+    freeze_kernel_resolution("V4.1 M16 planned capacity reuse")
+    try:
+        for count in counts:
+            for storage in scratch.values():
+                storage.view(torch.uint8).fill_(0xA5)
+            candidate = bind(plan, scratch, output, count)
+            reference = bind(control, control_scratch, expected, count)
+            fused_moe.run(binding=reference)
+            fused_moe.run(binding=candidate)
+            torch.testing.assert_close(output[:count], expected[:count], rtol=0, atol=0)
+        candidate = bind(plan, scratch, output, capacity)
+        reference = bind(control, control_scratch, expected, capacity)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_moe.run(binding=candidate)
+        ids.fill_(-1)
+        ids[::2, 0] = expert_count - 1
+        weights.mul_(.8)
+        x.mul_(.5)
+        graph.replay()
+        fused_moe.run(binding=reference)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        ids.fill_(-1)
+        graph.replay()
+        torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+    finally:
+        unfreeze_kernel_resolution()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

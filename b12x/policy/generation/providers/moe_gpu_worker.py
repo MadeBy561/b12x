@@ -20,7 +20,7 @@ from b12x.policy.generation.moe_corpus import (
     MoeSweepCase,
 )
 
-from .moe import MoeCandidate, MoeMeasurement
+from .moe import MoeCandidate, MoeMeasurement, _config_covers_query
 
 _MAX_RELATIVE_NORM_ERROR = 0.1
 _W4A8_MAX_RELATIVE_NORM_ERROR = 0.12
@@ -733,20 +733,28 @@ def _candidates_for_geometry(
 ) -> tuple[MoeCandidate, ...]:
     recipe = geometry.recipe
     if recipe.numerical_recipe == "deepseek_v41":
-        dynamic_candidate = MoeCandidate.create({
-            "backend": "dynamic", "dynamic_route_mode": "grouped",
-            "dynamic_tile_m": 64, "route_planner": "internal",
-            "max_active_clusters": None, "w4a16_route_mode": None,
-        })
+        tile_sizes = (64,)
+        if geometry.hidden_size == 5120 and (
+            geometry.num_experts, geometry.intermediate_size
+        ) in ((384, 640), (96, 2304)):
+            tile_sizes = (64, 16)
+        dynamic_candidates = tuple(
+            MoeCandidate.create({
+                "backend": "dynamic", "dynamic_route_mode": "grouped",
+                "dynamic_tile_m": tile_m, "route_planner": "internal",
+                "max_active_clusters": None, "w4a16_route_mode": None,
+            })
+            for tile_m in tile_sizes
+        )
         if geometry.hidden_size % 256 or geometry.intermediate_size % 128:
-            return (dynamic_candidate,)
+            return dynamic_candidates
         return (
             MoeCandidate.create({
                 "backend": "micro", "dynamic_route_mode": None,
                 "dynamic_tile_m": None, "route_planner": "internal",
                 "max_active_clusters": None, "w4a16_route_mode": None,
             }),
-            dynamic_candidate,
+            *dynamic_candidates,
         )
     if recipe.quant_mode == "nvfp4_auto":
         from dataclasses import replace
@@ -921,6 +929,10 @@ def _eligible_candidates_for_case(
         )
     eligible = []
     for candidate in candidates:
+        if geometry.recipe.numerical_recipe == "deepseek_v41" and not (
+            _config_covers_query(case.query(), candidate.config)
+        ):
+            continue
         if candidate.config["backend"] == "dynamic":
             dynamic_n = _impl._dynamic_kernel_intermediate_size(
                 geometry.intermediate_size,

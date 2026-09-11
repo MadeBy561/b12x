@@ -795,6 +795,38 @@ def test_every_corpus_geometry_and_capacity_has_an_applicable_candidate() -> Non
 
 
 @pytest.mark.parametrize(
+    ("num_experts", "intermediate_size", "capacity"),
+    ((96, 2304, 32), (384, 640, 192)),
+)
+def test_native_m16_tuner_obeys_runtime_geometry_and_capacity_contract(
+    num_experts: int, intermediate_size: int, capacity: int,
+) -> None:
+    base = next(
+        geometry for geometry in expand_physical_geometries()
+        if geometry.recipe.numerical_recipe == "deepseek_v41"
+        and geometry.num_experts == 96
+        and geometry.native_top_ks == frozenset((6,))
+    )
+    geometry = replace(
+        base, num_experts=num_experts, intermediate_size=intermediate_size,
+    )
+    template = expand_sweep_cases(geometries=(geometry,))[0]
+    candidates = _candidates_for_geometry(geometry, sm_count=188)
+    assert {c.config["dynamic_tile_m"] for c in candidates} == {None, 16, 64}
+    for top_k in (3, 6):
+        for num_tokens in (1, 6, capacity, capacity + 1):
+            case = replace(template, top_k=top_k, num_tokens=num_tokens)
+            eligible = moe_gpu_worker._eligible_candidates_for_case(
+                geometry, case, candidates,
+            )
+            expected = {16, 64} if top_k == 6 and num_tokens <= capacity else {64}
+            if num_tokens <= 8:
+                expected.add(None)  # Preserve upstream native micro eligibility.
+            assert {c.config["dynamic_tile_m"] for c in eligible} == expected
+            assert all(_config_covers_query(case.query(), c.config) for c in eligible)
+
+
+@pytest.mark.parametrize(
     ("quant_mode", "expect_dynamic_direct"),
     (("w4a8_mx", True), ("w4a8_nvfp4", False)),
 )

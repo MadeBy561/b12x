@@ -84,7 +84,9 @@ class W4A8MaterializedPhase2Kernel:
                 raise ValueError(
                     "direct materialized phase 2 requires deepseek_v41 source_tile_m=1"
                 )
-        elif source_tile_m not in (64, 128):
+        elif source_tile_m not in (64, 128) and not (
+            self.deepseek_v41 and source_tile_m == 16
+        ):
             raise ValueError(
                 f"materialized phase 2 source_tile_m must be 64 or 128, got {source_tile_m}"
             )

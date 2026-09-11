@@ -77,12 +77,22 @@ class W4A8MaterializedPhase1Kernel:
     ):
         self.fast_math = bool(fast_math)
         self.deepseek_v41 = numerical_recipe == "deepseek_v41"
-        if source_tile_m not in (64, 128):
+        if source_tile_m not in (64, 128) and not (
+            self.deepseek_v41 and source_tile_m == 16
+        ):
             raise ValueError(
                 f"materialized phase 1 source_tile_m must be 64 or 128, got {source_tile_m}"
             )
         self.tile_m = 16 if self.deepseek_v41 else 64
         self.tile_n = 128
+        # Only the opt-in M16 source plan changes staging; preserve upstream
+        # grouped M64 and direct-micro paths and their K32 accumulation order.
+        self.native_k128 = self.deepseek_v41 and source_tile_m == 16 and trellis_bits is None
+        self.tile_k = 128 if self.native_k128 else 64
+        self.k32_per_stage = self.tile_k // 32
+        self.k_stages_per_128 = 128 // self.tile_k
+        self.a_vecs = self.tile_k // 16
+        self.a_vecs_log2 = 3 if self.native_k128 else 2
         self.stages = 2
         # A retains a 128-byte row stride even though each stage advances K64.
         # The XOR vector mapping used by QMMA can address all eight 16-byte
@@ -195,11 +205,11 @@ class W4A8MaterializedPhase1Kernel:
         # two K32 blocks and one tile_n part from the enclosing N256xK128 tile.
         stage_chunk_count = self.tile_n // 32
         for i in cutlass.range_constexpr(
-            (2 * stage_chunk_count * 32 + self.threads_per_cta - 1)
+            (self.k32_per_stage * stage_chunk_count * 32 + self.threads_per_cta - 1)
             // self.threads_per_cta
         ):
             idx = tid + Int32(i * self.threads_per_cta)
-            if idx < Int32(2 * stage_chunk_count * 32):
+            if idx < Int32(self.k32_per_stage * stage_chunk_count * 32):
                 lane = idx & Int32(31)
                 kc = idx >> Int32(5)
                 chunk = kc % Int32(stage_chunk_count)
@@ -280,20 +290,25 @@ class W4A8MaterializedPhase1Kernel:
         # map.  Invalid tail rows may read token zero safely; no output is
         # published for them.
         for i in cutlass.range_constexpr(
-            (self.tile_m * 4 + self.threads_per_cta - 1) // self.threads_per_cta
+            (self.tile_m * self.a_vecs + self.threads_per_cta - 1) // self.threads_per_cta
         ):
             idx = tid + Int32(i * self.threads_per_cta)
-            if idx < Int32(self.tile_m * 4):
-                row = idx >> Int32(2)
-                vec = idx & Int32(3)
+            if idx < Int32(self.tile_m * self.a_vecs):
+                row = idx >> Int32(self.a_vecs_log2)
+                vec = idx & Int32(self.a_vecs - 1)
                 tok = Int32(0)
                 if row < valid_rows:
                     tok = token_map[physical_row_base + row].to(Int32)
                     if cutlass.const_expr(self.deterministic_output):
                         tok = tok // Int32(self.num_topk)
-                physical_vec = vec ^ (row & Int32(7))
+                row_xor = row & Int32(7)
+                if cutlass.const_expr(self.native_k128):
+                    row_xor = ((row & Int32(1)) << Int32(2)) | (row & Int32(2))
+                physical_vec = vec ^ row_xor
                 src_word = (
-                    Int64(tok) * Int64(words_per_token) + Int64(k64_slice * 16 + vec * 4)
+                    Int64(tok) * Int64(words_per_token)
+                    + Int64(k64_slice) * Int64(self.tile_k // 4)
+                    + Int64(vec) * Int64(4)
                 )
                 cp_async4_shared_global(
                     a_base + row * Int32(128) + (physical_vec << Int32(4)),
@@ -306,14 +321,15 @@ class W4A8MaterializedPhase1Kernel:
                 tok = token_map[physical_row_base + tid].to(Int32)
                 if cutlass.const_expr(self.deterministic_output):
                     tok = tok // Int32(self.num_topk)
-            sf_src = Int64(tok) * Int64(input_k128_tiles) * Int64(4) + Int64(k64_slice >> 1) * Int64(4)
+            sf_src = (Int64(tok) * Int64(input_k128_tiles)
+                      + Int64(k64_slice // Int32(self.k_stages_per_128))) * Int64(4)
             cp_async_u32_shared_global(
                 sfa_base + (tid << Int32(2)),
                 get_ptr_as_int64(scale_storage, sf_src),
             )
 
-        k128_slice = k64_slice >> Int32(1)
-        k_half = k64_slice & Int32(1)
+        k128_slice = k64_slice // Int32(self.k_stages_per_128)
+        k_half = k64_slice & Int32(self.k_stages_per_128 - 1)
         input_k128_count = input_k128_tiles
 
         packed_parts = Int32(256 // self.tile_n)
@@ -325,11 +341,11 @@ class W4A8MaterializedPhase1Kernel:
         gate_packed_half = gate_tile % packed_parts
 
         up_tile = (
-            expert_idx * packed_w13_tiles + up_packed_tile
-        ) * input_k128_count + k128_slice
+            Int64(expert_idx) * Int64(packed_w13_tiles) + Int64(up_packed_tile)
+        ) * Int64(input_k128_count) + Int64(k128_slice)
         gate_tile_idx = (
-            expert_idx * packed_w13_tiles + gate_packed_tile
-        ) * input_k128_count + k128_slice
+            Int64(expert_idx) * Int64(packed_w13_tiles) + Int64(gate_packed_tile)
+        ) * Int64(input_k128_count) + Int64(k128_slice)
 
         if cutlass.const_expr(self.w4a8_trellis):
             # Projection-major [proj][E][K16][N16] trellis windows (the
@@ -479,7 +495,7 @@ class W4A8MaterializedPhase1Kernel:
             if cutlass.const_expr(self.trellis_direct_lut):
                 trellis_lut_addr = trellis_lut.iterator.toint()
 
-        input_k64_tiles = input_k128_tiles * Int32(2)
+        input_k64_tiles = input_k128_tiles * Int32(self.k_stages_per_128)
         for preload_slice in cutlass.range_constexpr(self.stages - 1):
             k64_slice = Int32(preload_slice)
             if k64_slice < input_k64_tiles:
@@ -562,14 +578,17 @@ class W4A8MaterializedPhase1Kernel:
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
 
-            scale_shift = Uint32(k64_slice & Int32(1)) * Uint32(16)
+            scale_shift = Uint32(k64_slice & Int32(self.k_stages_per_128 - 1)) * Uint32(16)
             asc = cute.make_rmem_tensor((self.tile_m // 16,), Uint32)
             for blk in cutlass.range_constexpr(self.tile_m // 16):
                 sf_row = Int32(blk * 16) + q + ((lane & Int32(1)) << Int32(3))
                 asc[blk] = ld_shared_u32(sfa_base + (sf_row << Int32(2))) >> scale_shift
 
-            for kb in cutlass.range_constexpr(2):
-                u_phys = (Int32(kb * 2) + (c >> Int32(1))) ^ q
+            for kb in cutlass.range_constexpr(self.k32_per_stage):
+                row_xor = q
+                if cutlass.const_expr(self.native_k128):
+                    row_xor = ((q & Int32(1)) << Int32(2)) | (q & Int32(2))
+                u_phys = (Int32(kb * 2) + (c >> Int32(1))) ^ row_xor
                 a_frag = cute.make_rmem_tensor((self.tile_m // 16, 4), Uint32)
                 for blk in cutlass.range_constexpr(self.tile_m // 16):
                     a_lo = (

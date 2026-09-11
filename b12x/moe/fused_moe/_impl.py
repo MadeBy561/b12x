@@ -2752,7 +2752,9 @@ def _heuristic_moe_decode_config(
             )
         return MoeDecodeConfig(
             backend="dynamic", route_planner="internal", max_active_clusters=None,
-            dynamic_tile_m=64, dynamic_route_mode="grouped",
+            # M16 stays opt-in until the rebased native path is GPU-qualified.
+            dynamic_tile_m=64,
+            dynamic_route_mode="grouped",
         )
     if query.quant_mode == "nvfp4_auto":
         if (
@@ -10965,7 +10967,7 @@ def _get_dynamic_kernel(
         ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
-            8,
+            9,
             cache_key,
         ),
         dsl_compile_options=dsl_compile_options,
@@ -11151,6 +11153,8 @@ def _launch_dynamic_flat(
             planned_tile_m=planned_tile_m,
         )
     )
+    if numerical_recipe == "deepseek_v41" and selected_tile_m == 16:
+        materialize_intermediate = True
     external_route_plan_supported = _dynamic_external_route_plan_supported(
         quant_mode=quant_mode,
         activation=activation,
@@ -11185,7 +11189,10 @@ def _launch_dynamic_flat(
             )
     if not multicta_enabled:
         effective_mac = 1
-    elif w4a8_repacked and selected_tile_m <= 32:
+    elif (
+        w4a8_repacked and selected_tile_m <= 32
+        and numerical_recipe != "deepseek_v41"
+    ):
         # The compact repacked-W4A8 storage specialization is deliberately
         # sized for two resident CTAs/SM (49.15 KiB and a two-block register
         # limit).  The generic resident-grid cap is one CTA/SM because its
@@ -11258,7 +11265,20 @@ def _launch_dynamic_flat(
         planned_tile_m=planned_tile_m,
         numerical_recipe=numerical_recipe,
     )
-    if volatile_launch_state:
+    # NativeM16Prepare and FC1/FC2 are stream-ordered launches and never read
+    # the resident-grid barrier words. Keep resets on every cooperative path.
+    native_m16_no_grid_barrier = bool(
+        numerical_recipe == "deepseek_v41"
+        and quant_mode == "w4a8_mx"
+        and selected_tile_m == 16
+        and materialize_intermediate
+        and deterministic_output
+        and E in (96, 384)
+        and k == 5120
+        and num_topk == 6
+        and not external_route_plan
+    )
+    if volatile_launch_state and not native_m16_no_grid_barrier:
         barrier_count.zero_()
         barrier_epoch.zero_()
 

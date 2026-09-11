@@ -137,6 +137,7 @@ from b12x.moe._shared.kernels.w4a8_phase1 import (
 from b12x.moe._shared.kernels.w4a8_phase2 import (
     W4A8MaterializedPhase2Kernel,
 )
+from b12x.moe._shared.kernels.native_m16_prepare import NativeM16Prepare
 from b12x.moe._shared.kernels.nvfp4_phase1 import (
     Nvfp4MaterializedPhase1Kernel,
 )
@@ -722,10 +723,10 @@ class MoEDynamicKernelBackend:
         if self.deepseek_v41 and not (
             quant_recipe == "w4a8_mx" and activation == "silu"
             and w4a8_repacked and materialize_intermediate
-            and deterministic_output and mma_tiler_mn == (64, 128)
+            and deterministic_output and mma_tiler_mn in ((16, 128), (64, 128))
             and share_input_across_experts and not direct_routing
         ):
-            raise ValueError("deepseek_v41 requires the planned materialized M64 W4A8 pipeline")
+            raise ValueError("deepseek_v41 requires the planned materialized M16/M64 W4A8 pipeline")
         if quant_recipe not in {
             "nvfp4",
             "w4a8_mx",
@@ -876,6 +877,7 @@ class MoEDynamicKernelBackend:
         )
         self.w4a8_split_materialized = bool(
             self.w4a8_m64_materialized or self.w4a8_m128_materialized
+            or (self.deepseek_v41 and mma_tiler_mn == (16, 128))
         )
         # NVFP4 split-materialized (large-M prefill): the cooperative kernel
         # keeps only the routing/input-quantization front-end (it publishes
@@ -910,6 +912,7 @@ class MoEDynamicKernelBackend:
         if int(num_topk) <= 0:
             raise ValueError(f"num_topk must be positive, got {num_topk}")
         self.num_topk = int(num_topk)
+        self.native_m16_prepare = NativeM16Prepare(self.num_topk)
         materialized_source_tile_m = (
             mma_tiler_mn[0]
             if (self.w4a8_split_materialized or self.nvfp4_split_materialized)
@@ -2569,100 +2572,113 @@ class MoEDynamicKernelBackend:
         b_w13_u32 = cute.recast_tensor(b_w13, cutlass.Uint32)
         b_down_u32 = cute.recast_tensor(b_down, cutlass.Uint32)
         grid = (*self.cluster_shape_mn, max_active_clusters)
-        self.kernel(
-            a_input,
-            topk_ids,
-            topk_weights,
-            packed_a_storage,
-            scale_storage,
-            intermediate_u32,
-            barrier_count,
-            barrier_epoch,
-            pair_head,
-            producers_done_count,
-            all_work_published,
-            task_head,
-            task_tail,
-            task_ready,
-            task_expert,
-            task_m_tile,
-            task_slice_begin,
-            task_slice_count,
-            task_valid_rows,
-            tile_write_count,
-            tma_a,
-            gA,
-            tma_sfa,
-            gSFA,
-            tma_b_w13,
-            gB_w13,
-            tma_sfb_w13,
-            gSFB_w13,
-            tma_b_w13_gate,
-            gB_w13_gate,
-            tma_sfb_w13_gate,
-            gSFB_w13_gate,
-            tma_b_down,
-            gB_down,
-            tma_sfb_down,
-            gSFB_down,
-            self.tiled_mma,
-            self.mma_atom,
-            self.cta_layout_mnk,
-            self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
-            self.sfa_smem_layout_staged,
-            self.sfb_smem_layout_staged,
-            self.epi_smem_layout_staged,
-            # Packed FP6 B staging layout (placeholder when not w6a8_mx; only
-            # traced under the const_expr is_w6a8 branches).
-            self.b_packed_smem_layout_staged
-            if self.is_w6a8
-            else self.sfa_smem_layout_staged,
-            # swap_ab FC1 objects (placeholders when off; only used under the
-            # const_expr swap branch). cute requires region-local values, so the
-            # fc1 tiled_mma + SF layouts are passed as params, not via self.
-            self.fc1_tiled_mma if self.swap_ab else self.tiled_mma,
-            self.fc1_sfa_smem_layout_staged
-            if self.swap_ab
-            else self.sfa_smem_layout_staged,
-            self.fc1_sfb_smem_layout_staged
-            if self.swap_ab
-            else self.sfb_smem_layout_staged,
-            launch_params,
-            expert_write_rows,
-            expert_tile_base,
-            input_global_scale,
-            alpha,
-            down_alpha,
-            global_scale,
-            scatter_output,
-            token_map,
-            token_weights,
-            sfb_w13_mx,
-            sfb_down_mx,
-            w13_residual,
-            down_residual,
-            b_w13_u32,
-            b_down_u32,
-            w13_rp,
-            w13_sfb_rp,
-            down_rp,
-            down_sfb_rp,
-            trellis_lut,
-            trellis_rotations,
-        ).launch(
-            grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            cluster=[1, 1, 1],
-            # The phase boundaries below use a software grid barrier.  A
-            # regular launch can admit only part of the grid while auxiliary
-            # stream work occupies the remaining SMs, leaving resident CTAs
-            # spinning and the unscheduled CTAs unable to arrive.  Cooperative
-            # launch makes the all-CTA residency contract explicit.
-            cooperative=True,
-            stream=stream,
-        )
+        if cutlass.const_expr(
+            self.deepseek_v41 and self.tile_shape_mnk[0] == 16
+            and self.external_materialized_fc1 and self.deterministic_output
+            and self.num_topk == 6 and row_counts.shape[0] in (96, 384)
+            and a_input.shape[1] == 5120
+        ):
+            self.native_m16_prepare(
+                a_input, topk_ids, topk_weights, packed_a_storage, scale_storage,
+                row_counts, expert_tile_base, scatter_output, token_map,
+                token_weights, task_expert, task_valid_rows, task_head,
+                task_tail, all_work_published, gate_tile_cnt, stream,
+            )
+        else:
+            self.kernel(
+                a_input,
+                topk_ids,
+                topk_weights,
+                packed_a_storage,
+                scale_storage,
+                intermediate_u32,
+                barrier_count,
+                barrier_epoch,
+                pair_head,
+                producers_done_count,
+                all_work_published,
+                task_head,
+                task_tail,
+                task_ready,
+                task_expert,
+                task_m_tile,
+                task_slice_begin,
+                task_slice_count,
+                task_valid_rows,
+                tile_write_count,
+                tma_a,
+                gA,
+                tma_sfa,
+                gSFA,
+                tma_b_w13,
+                gB_w13,
+                tma_sfb_w13,
+                gSFB_w13,
+                tma_b_w13_gate,
+                gB_w13_gate,
+                tma_sfb_w13_gate,
+                gSFB_w13_gate,
+                tma_b_down,
+                gB_down,
+                tma_sfb_down,
+                gSFB_down,
+                self.tiled_mma,
+                self.mma_atom,
+                self.cta_layout_mnk,
+                self.a_smem_layout_staged,
+                self.b_smem_layout_staged,
+                self.sfa_smem_layout_staged,
+                self.sfb_smem_layout_staged,
+                self.epi_smem_layout_staged,
+                # Packed FP6 B staging layout (placeholder when not w6a8_mx; only
+                # traced under the const_expr is_w6a8 branches).
+                self.b_packed_smem_layout_staged
+                if self.is_w6a8
+                else self.sfa_smem_layout_staged,
+                # swap_ab FC1 objects (placeholders when off; only used under the
+                # const_expr swap branch). cute requires region-local values, so the
+                # fc1 tiled_mma + SF layouts are passed as params, not via self.
+                self.fc1_tiled_mma if self.swap_ab else self.tiled_mma,
+                self.fc1_sfa_smem_layout_staged
+                if self.swap_ab
+                else self.sfa_smem_layout_staged,
+                self.fc1_sfb_smem_layout_staged
+                if self.swap_ab
+                else self.sfb_smem_layout_staged,
+                launch_params,
+                expert_write_rows,
+                expert_tile_base,
+                input_global_scale,
+                alpha,
+                down_alpha,
+                global_scale,
+                scatter_output,
+                token_map,
+                token_weights,
+                sfb_w13_mx,
+                sfb_down_mx,
+                w13_residual,
+                down_residual,
+                b_w13_u32,
+                b_down_u32,
+                w13_rp,
+                w13_sfb_rp,
+                down_rp,
+                down_sfb_rp,
+                trellis_lut,
+                trellis_rotations,
+            ).launch(
+                grid=grid,
+                block=[self.threads_per_cta, 1, 1],
+                cluster=[1, 1, 1],
+                # The phase boundaries below use a software grid barrier.  A
+                # regular launch can admit only part of the grid while auxiliary
+                # stream work occupies the remaining SMs, leaving resident CTAs
+                # spinning and the unscheduled CTAs unable to arrive.  Cooperative
+                # launch makes the all-CTA residency contract explicit.
+                cooperative=True,
+                stream=stream,
+            )
         # External split-materialized launch (same @cute.jit call, same
         # stream as the cooperative front-end above, so CUDA-graph capture
         # covers every kernel with no host reads and no replay-time
