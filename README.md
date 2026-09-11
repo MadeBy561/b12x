@@ -321,6 +321,39 @@ BF16-input tiny-decode approximation.
 This adds a benchmark preset and TP4 policy-generation coverage, not a newly
 tuned embedded GPU profile.
 
+## DeepSeek mHC benchmark
+
+`benchmark_residual.py` has checkpoint-backed `deepseek-v4-flash` and
+`deepseek-v4.1-flash` profiles. They invoke the actual mHC adapters from the
+requested vLLM checkout, including fused RMSNorm and V4.1's incoming/predicted
+mix handoff:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/benchmark_residual.py \
+  --model-profile deepseek-v4.1-flash \
+  --vllm-path ~/projects/vllm-hh-rebase \
+  --tokens 8 --l2-flush --output /tmp/mhc-v41.json
+```
+
+Switch to `--model-profile deepseek-v4-flash` for V4.0. `--model-path` selects
+an explicit checkpoint; otherwise the loader uses its Hugging Face cache.
+The default is layer 3's attention-post/FFN-pre boundary, with native checkpoint
+parameters and synthetic BF16 activations. Timings cover CUDA graph replay on
+one rank, not a model forward or collective. Hidden width is not TP-sharded
+inside mHC. The current adapters are called directly rather than forced through
+a separate Dynamo compilation mode.
+
+Each named profile checks residual, activation, and mixing outputs against its
+oracle before timing and after replay, freezes kernel resolution, and locks the
+vLLM workspace against growth. JSON output retains raw samples, GPU operating
+state, checkpoint weight hashes, and b12x/vLLM source provenance. The existing
+synthetic microbenchmark remains available with `--model-profile custom`.
+Lagged decode prepares the BF16-rounded collapse and its squared-sum partials
+alongside the residual/projection pass, then normalizes independent hidden
+tiles. It reuses existing scratch capacity and output storage; prefill keeps
+its established rounding path. Compile identities include the actual static
+block geometry and prepared-lagged mode, never the live token/CTA count.
+
 ## Where to look next
 
 - `tests/` is the executable spec — per-group API and numerical-reference

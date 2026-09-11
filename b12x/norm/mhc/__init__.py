@@ -18,9 +18,14 @@ the original current-mix behavior. ``run_pre`` accepts either an expanded
 ``[tokens, 4, hidden]`` residual with full ``fn[24, 4 * hidden]`` or the older
 broadcast ``[tokens, hidden]`` residual with pre-summed ``fn[24, hidden]``.
 Scratch ``split_k`` defaults to ``4 * hidden / 256`` (80 for hidden 5120).
-Lagged mixing specializes the existing finalize; projection remains a separate
-pass, not a single Mega-mHC kernel. Caller-owned paths support CUDA graphs,
-not Dynamo tracing.
+Lagged decode computes the BF16 collapse and squared-sum partials in the
+parallel first pass, reusing the otherwise-unused Gram scratch rows. Tiled
+finalization then applies RMSNorm without a full-hidden reduction in one CTA.
+Caller-owned ``y`` storage must be disjoint from inputs, residual output, and
+scratch because the first pass writes it early. Prefill retains its existing
+scalar-rounding contract. These remain separate producer/finalizer launches,
+not a single Mega-mHC kernel. Caller-owned paths support CUDA graphs, not
+Dynamo tracing.
 
 Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
 ``run_*`` (capture safe; torch.compile-safe via opaque custom ops).

@@ -711,6 +711,16 @@ def _lagged_mix_views(
     return pre_mix, pre_out
 
 
+def _validate_lagged_y_output(
+    y: torch.Tensor,
+    tensors: tuple[torch.Tensor | None, ...],
+) -> None:
+    # The prepared lagged path writes y while other CTAs still read inputs.
+    # Its caller-owned destination must not share storage with those inputs.
+    if any(tensor is not None and torch._C._overlaps(y, tensor) for tensor in tensors):
+        raise ValueError("lagged mHC y output must not alias inputs, residual output, or scratch")
+
+
 def _b12x_mhc_pre_impl(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -947,6 +957,15 @@ def _b12x_mhc_pre_impl(
             and pre_mix is not None
             and norm_weight is not None
         )
+        lagged_prepared = (
+            pre_mix is not None and not use_lagged_prefill
+            and (binding.plan.caps.max_tokens if binding is not None else tokens)
+            < int(os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
+        )
+        if lagged_prepared:
+            _validate_lagged_y_output(
+                y_out, (residual, fn, hc_scale, hc_base, norm_weight, residual_out, partials),
+            )
         if use_lagged_prefill:
             from b12x.norm.mhc._pre_prefill import prepare_lagged_prefill
 
@@ -962,6 +981,8 @@ def _b12x_mhc_pre_impl(
                 partials=partials,
                 out=residual_out,
                 compute_gram=norm_weight is not None and pre_mix is None,
+                pre_mix=pre_mix if lagged_prepared else None,
+                y=y_out if lagged_prepared else None,
             )
         run_mhc_finalize_gram(
             residual=residual_out,
@@ -979,6 +1000,7 @@ def _b12x_mhc_pre_impl(
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
             compact_partials=use_lagged_prefill,
+            lagged_prepared=lagged_prepared,
             compact_projection_splits=(
                 planned_config.projection_k_splits if use_lagged_prefill else 1
             ),
@@ -1353,6 +1375,14 @@ def _b12x_mhc_post_pre_impl(
                 num_tokens=tokens,
                 hidden_size=hidden_size,
             )
+        lagged_prepared = pre_mix is not None and decode_source_splits == 0 and not (
+            use_prefill_tf32_mma or use_prefill_bf16_mma or use_prefill_block_m or use_prefill_compact
+        )
+        if lagged_prepared:
+            _validate_lagged_y_output(
+                y_out, (x, residual, prev_post, prev_comb, fn, hc_scale, hc_base,
+                        norm_weight, residual_out, partials),
+            )
         if use_prefill_tf32_mma:
             run_mhc_post_pre_prefill_gram(
                 x=x,
@@ -1417,6 +1447,8 @@ def _b12x_mhc_post_pre_impl(
                 partials=partials,
                 out=residual_out,
                 compute_gram=norm_weight is not None and pre_mix is None,
+                pre_mix=pre_mix if lagged_prepared else None,
+                y=y_out if lagged_prepared else None,
             )
         run_mhc_finalize_gram(
             residual=residual_out,
@@ -1433,6 +1465,7 @@ def _b12x_mhc_post_pre_impl(
             sinkhorn_iters=sinkhorn_iters,
             norm_weight=norm_weight,
             norm_eps=float(norm_eps),
+            lagged_prepared=lagged_prepared,
             compact_partials=(
                 use_prefill_tf32_mma
                 or use_prefill_bf16_mma
