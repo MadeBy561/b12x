@@ -1,10 +1,13 @@
-"""Native unquantized GEMV-style projections with BF16/FP32 operands.
+"""Native unquantized tensor-core/SIMT projections with BF16/FP32 operands.
 
 ``mm`` runs ``y = x @ weight.T + bias`` through opaque torch custom ops.
 FP32 accumulation and bias addition happen before the final BF16/FP32 cast.
-Caller-owned ``out`` avoids allocation; live rows and input strides reuse
-one geometry/type specialization. ``precompile`` compiles and warm-runs that
-specialization before CUDA graph capture. There is no cuBLAS fallback.
+Caller-owned row-strided ``out`` avoids allocation. BF16/BF16 projections
+use tiled tensor-core GEMM when their row/output geometry provides sufficient
+parallelism; small-row/skinny projections and any FP32 operand retain SIMT.
+One geometry/type-specialized compiled callable owns both GPU entrypoints.
+Live rows and input strides are runtime arguments. ``precompile`` warm-runs
+all eligible entrypoints before capture. There is no quantization or cuBLAS fallback.
 
 Example:
     from b12x.gemm import bf16_gemv

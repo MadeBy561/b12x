@@ -2275,7 +2275,8 @@ def _sparse_mla_decode_grid_flat_launch(
         # v30: empty-split exit arrives on the speculative stage before waiting.
         # v31: vector Q staging excluded for NVFP4 (BF16 Q) caches.
         # v32: speculative first-chunk copies gated on the split being active.
-        32,
+        # v33: paired-lane NVFP4/V4.1 PV dequantization.
+        33,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),

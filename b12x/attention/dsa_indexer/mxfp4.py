@@ -5,6 +5,7 @@ product, and head sum to BF16 (model.py:550-559). Selection must follow the TP
 sum. Reuse the exact native row selector, not the MSA page/head-max reduction
 or the streaming top-k's unrelated candidate folds.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -70,16 +71,38 @@ class _Quantize:
         self.page_size = page_size
 
     @cute.jit
-    def __call__(self, x: cute.Pointer, q: cute.Pointer, scales: cute.Pointer,
-                 slots: cute.Pointer, rows: Int32, pool_pages: Int64,
-                 page_stride: Int64, stream: cuda.CUstream):
-        self.kernel(_flat(x), _flat(q), _flat(scales), _flat(slots), rows,
-                    pool_pages, page_stride).launch(
-            grid=((rows * 4 + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream)
+    def __call__(
+        self,
+        x: cute.Pointer,
+        q: cute.Pointer,
+        scales: cute.Pointer,
+        slots: cute.Pointer,
+        rows: Int32,
+        pool_pages: Int64,
+        page_stride: Int64,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            _flat(x),
+            _flat(q),
+            _flat(scales),
+            _flat(slots),
+            rows,
+            pool_pages,
+            page_stride,
+        ).launch(grid=((rows * 4 + 7) // 8, 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, x: cute.Tensor, q: cute.Tensor, scales: cute.Tensor,
-               slots: cute.Tensor, rows: Int32, pool_pages: Int64, page_stride: Int64):
+    def kernel(
+        self,
+        x: cute.Tensor,
+        q: cute.Tensor,
+        scales: cute.Tensor,
+        slots: cute.Tensor,
+        rows: Int32,
+        pool_pages: Int64,
+        page_stride: Int64,
+    ):
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         group = Int32(bx) * Int32(8) + Int32(tx) // Int32(32)
@@ -89,7 +112,9 @@ class _Quantize:
             v = Float32(x[Int64(group) * Int64(32) + Int64(lane)])
             amax = fabs_f32(v)
             for shift in cutlass.range_constexpr(5):
-                amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, offset=1 << shift))
+                amax = fmax_f32(
+                    amax, cute.arch.shuffle_sync_bfly(amax, offset=1 << shift)
+                )
             amax = fmax_f32(amax, Float32(6.0 * 2.0**-126))
             _, sf = pow2_ceil_ue8m0(amax * Float32(1.0 / 6.0))
             scaled = v * ue8m0_to_output_scale(sf)
@@ -104,10 +129,16 @@ class _Quantize:
                 token = slot % Int64(self.page_size)
                 valid = slot >= Int64(0) and page < pool_pages
                 data_base = page * page_stride + token * Int64(64)
-                scale_base = page * page_stride + Int64(self.page_size * 64) + token * Int64(4)
+                scale_base = (
+                    page * page_stride + Int64(self.page_size * 64) + token * Int64(4)
+                )
             if valid:
                 if lane % Int32(2) == Int32(0):
-                    q[data_base + Int64(group % Int32(4)) * Int64(16) + Int64(lane // Int32(2))] = Uint8(packed)
+                    q[
+                        data_base
+                        + Int64(group % Int32(4)) * Int64(16)
+                        + Int64(lane // Int32(2))
+                    ] = Uint8(packed)
                 if lane == Int32(0):
                     scales[scale_base + Int64(group % Int32(4))] = Uint8(sf)
 
@@ -119,35 +150,103 @@ class _PagedScore:
     FP8 tokens. This makes the later reindex path proportional to candidate
     capacity and keeps every gather at the paged source (no full-context mask).
     """
+
     def __init__(self, heads: int, candidates: bool, page_size: int):
         self.heads = heads
         self.candidates = candidates
         self.page_size = page_size
 
     @cute.jit
-    def __call__(self, q: cute.Pointer, qs: cute.Pointer, weights: cute.Pointer,
-                 pool: cute.Pointer, pages: cute.Pointer, lengths: cute.Pointer,
-                 active: cute.Pointer, candidates: cute.Pointer, candidate_lengths: cute.Pointer,
-                 scores: cute.Pointer, rows: Int32, width: Int32, page_width: Int32,
-                 page_row_stride: Int64, pool_stride: Int64, pool_pages: Int64,
-                 stream: cuda.CUstream):
-        self.kernel(_flat(q), _flat(qs), _flat(weights), _flat(pool), _flat(pages),
-                    _flat(lengths), _flat(active), _flat(candidates), _flat(candidate_lengths),
-                    _flat(scores), rows, width, page_width, page_row_stride, pool_stride,
-                    pool_pages).launch(grid=((width + 7) // 8, rows, 1),
-                                       block=(256, 1, 1), stream=stream)
+    def __call__(
+        self,
+        q: cute.Pointer,
+        qs: cute.Pointer,
+        weights: cute.Pointer,
+        pool: cute.Pointer,
+        pages: cute.Pointer,
+        lengths: cute.Pointer,
+        active: cute.Pointer,
+        candidates: cute.Pointer,
+        candidate_lengths: cute.Pointer,
+        scores: cute.Pointer,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
+        stream: cuda.CUstream,
+    ):
+        block_cols = Int32(8)
+        if cutlass.const_expr(not self.candidates):
+            if width >= Int32(65536):
+                block_cols = Int32(256)
+        self.kernel(
+            _flat(q),
+            _flat(qs),
+            _flat(weights),
+            _flat(pool),
+            _flat(pages),
+            _flat(lengths),
+            _flat(active),
+            _flat(candidates),
+            _flat(candidate_lengths),
+            _flat(scores),
+            rows,
+            width,
+            page_width,
+            page_row_stride,
+            pool_stride,
+            pool_pages,
+            block_cols,
+        ).launch(
+            grid=((width + block_cols - Int32(1)) // block_cols, rows, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
 
     @cute.kernel
-    def kernel(self, q: cute.Tensor, qs: cute.Tensor, weights: cute.Tensor,
-               pool: cute.Tensor, pages: cute.Tensor, lengths: cute.Tensor,
-               active: cute.Tensor, candidates: cute.Tensor, candidate_lengths: cute.Tensor,
-               scores: cute.Tensor, rows: Int32, width: Int32, page_width: Int32,
-               page_row_stride: Int64, pool_stride: Int64, pool_pages: Int64):
+    def kernel(
+        self,
+        q: cute.Tensor,
+        qs: cute.Tensor,
+        weights: cute.Tensor,
+        pool: cute.Tensor,
+        pages: cute.Tensor,
+        lengths: cute.Tensor,
+        active: cute.Tensor,
+        candidates: cute.Tensor,
+        candidate_lengths: cute.Tensor,
+        scores: cute.Tensor,
+        rows: Int32,
+        width: Int32,
+        page_width: Int32,
+        page_row_stride: Int64,
+        pool_stride: Int64,
+        pool_pages: Int64,
+        block_cols: Int32,
+    ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
         lane = Int32(tx) % Int32(32)
-        col = Int32(bx) * Int32(8) + Int32(tx) // Int32(32)
-        if col < width:
+        block_start = Int32(bx) * block_cols
+        if block_cols > Int32(8):
+            # Each CTA owns both clearing and scoring its contiguous tile.
+            # This keeps short-context graph replay from launching one CTA
+            # per eight entries across the entire reserved context capacity.
+            clear_col = block_start + Int32(tx)
+            if clear_col < width:
+                scores[Int64(row) * Int64(width) + Int64(clear_col)] = BFloat16(
+                    -float("inf")
+                )
+            cute.arch.sync_threads()
+        end = cutlass.min(width, block_start + block_cols)
+        if block_cols > Int32(8):
+            end = cutlass.min(
+                end, cutlass.max(Int32(0), cutlass.min(lengths[row], active[0]))
+            )
+        col = block_start + Int32(tx) // Int32(32)
+        while col < end:
             pos = col
             valid = True
             if cutlass.const_expr(self.candidates):
@@ -157,7 +256,12 @@ class _PagedScore:
             valid = valid and pos // Int32(self.page_size) < page_width
             page = Int64(-1)
             if valid:
-                page = Int64(pages[Int64(row) * page_row_stride + Int64(pos // Int32(self.page_size))])
+                page = Int64(
+                    pages[
+                        Int64(row) * page_row_stride
+                        + Int64(pos // Int32(self.page_size))
+                    ]
+                )
             valid = valid and page >= Int64(0) and page < pool_pages
             total = Float32(0.0)
             if valid:
@@ -167,8 +271,12 @@ class _PagedScore:
                 kvals = cute.make_rmem_tensor((4,), Float32)
                 for pair in cutlass.range_constexpr(2):
                     byte_col = lane + Int32(pair * 32)
-                    k0, k1 = f16x2_to_f32x2(fp4_decode_2(Uint32(pool[kb + Int64(byte_col)])))
-                    scale = u32_as_f32(Uint32(pool[sb + Int64(byte_col // Int32(16))]) << Uint32(23))
+                    k0, k1 = f16x2_to_f32x2(
+                        fp4_decode_2(Uint32(pool[kb + Int64(byte_col)]))
+                    )
+                    scale = u32_as_f32(
+                        Uint32(pool[sb + Int64(byte_col // Int32(16))]) << Uint32(23)
+                    )
                     kvals[pair * 2] = Float32(BFloat16(k0 * scale))
                     kvals[pair * 2 + 1] = Float32(BFloat16(k1 * scale))
                 for head in cutlass.range(self.heads):
@@ -177,14 +285,20 @@ class _PagedScore:
                     dot = Float32(0.0)
                     for pair in cutlass.range_constexpr(2):
                         byte_col = lane + Int32(pair * 32)
-                        q0, q1 = f16x2_to_f32x2(fp4_decode_2(Uint32(q[qb + Int64(byte_col)])))
-                        scale = u32_as_f32(Uint32(qs[qsb + Int64(byte_col // Int32(16))]) << Uint32(23))
+                        q0, q1 = f16x2_to_f32x2(
+                            fp4_decode_2(Uint32(q[qb + Int64(byte_col)]))
+                        )
+                        scale = u32_as_f32(
+                            Uint32(qs[qsb + Int64(byte_col // Int32(16))]) << Uint32(23)
+                        )
                         dot += Float32(BFloat16(q0 * scale)) * kvals[pair * 2]
                         dot += Float32(BFloat16(q1 * scale)) * kvals[pair * 2 + 1]
                     for shift in cutlass.range_constexpr(5):
                         dot += cute.arch.shuffle_sync_bfly(dot, offset=1 << shift)
                     dot = fmax_f32(Float32(BFloat16(dot)), Float32(0.0))
-                    weight = Float32(weights[Int64(row) * Int64(self.heads) + Int64(head)])
+                    weight = Float32(
+                        weights[Int64(row) * Int64(self.heads) + Int64(head)]
+                    )
                     total += Float32(BFloat16(dot * weight))
             if lane == Int32(0):
                 # Keep invalid entries at -inf, including missing physical pages;
@@ -193,6 +307,7 @@ class _PagedScore:
                 if valid:
                     value = BFloat16(total)
                 scores[Int64(row) * Int64(width) + Int64(col)] = value
+            col += Int32(8)
 
 
 class _SelectPrepare:
@@ -201,21 +316,54 @@ class _SelectPrepare:
         self.blocks = blocks
 
     @cute.jit
-    def __call__(self, scores: cute.Pointer, logits: cute.Pointer, lengths: cute.Pointer,
-                 active: cute.Pointer, candidate_lengths: cute.Pointer, select_lengths: cute.Pointer,
-                 rows: Int32, width: Int32, output_width: Int32, stream: cuda.CUstream):
-        self.kernel(_flat(scores), _flat(logits), _flat(lengths), _flat(active),
-                    _flat(candidate_lengths), _flat(select_lengths), rows, width, output_width).launch(
-            grid=((output_width + 255) // 256, rows, 1), block=(256, 1, 1), stream=stream)
+    def __call__(
+        self,
+        scores: cute.Pointer,
+        logits: cute.Pointer,
+        lengths: cute.Pointer,
+        active: cute.Pointer,
+        candidate_lengths: cute.Pointer,
+        select_lengths: cute.Pointer,
+        rows: Int32,
+        width: Int32,
+        output_width: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            _flat(scores),
+            _flat(logits),
+            _flat(lengths),
+            _flat(active),
+            _flat(candidate_lengths),
+            _flat(select_lengths),
+            rows,
+            width,
+            output_width,
+        ).launch(
+            grid=((output_width + 255) // 256, rows, 1),
+            block=(256, 1, 1),
+            stream=stream,
+        )
 
     @cute.kernel
-    def kernel(self, scores: cute.Tensor, logits: cute.Tensor, lengths: cute.Tensor,
-               active: cute.Tensor, candidate_lengths: cute.Tensor, select_lengths: cute.Tensor,
-               rows: Int32, width: Int32, output_width: Int32):
+    def kernel(
+        self,
+        scores: cute.Tensor,
+        logits: cute.Tensor,
+        lengths: cute.Tensor,
+        active: cute.Tensor,
+        candidate_lengths: cute.Tensor,
+        select_lengths: cute.Tensor,
+        rows: Int32,
+        width: Int32,
+        output_width: Int32,
+    ):
         tx, _, _ = cute.arch.thread_idx()
         bx, row, _ = cute.arch.block_idx()
         col = Int32(bx) * Int32(256) + Int32(tx)
-        visible = cutlass.min(cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0)))
+        visible = cutlass.min(
+            cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0))
+        )
         extent = cutlass.min(visible, width)
         if cutlass.const_expr(self.candidates):
             extent = cutlass.min(cutlass.max(candidate_lengths[row], Int32(0)), width)
@@ -229,7 +377,10 @@ class _SelectPrepare:
                 for offset in cutlass.range_constexpr(8):
                     pos = col * Int32(8) + Int32(offset)
                     if pos < width and pos < visible:
-                        value = fmax_f32(value, Float32(scores[Int64(row) * Int64(width) + Int64(pos)]))
+                        value = fmax_f32(
+                            value,
+                            Float32(scores[Int64(row) * Int64(width) + Int64(pos)]),
+                        )
                 if visible > Int32(0) and col == (visible - Int32(1)) // Int32(8):
                     value = Float32(float("inf"))
             else:
@@ -244,23 +395,51 @@ class _SortPositions:
         self.expand_blocks = expand_blocks
 
     @cute.jit
-    def __call__(self, indices: cute.Pointer, values: cute.Pointer, out: cute.Pointer,
-                 out_values: cute.Pointer, lengths: cute.Pointer, active: cute.Pointer,
-                 out_lengths: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        self.kernel(_flat(indices), _flat(values), _flat(out), _flat(out_values),
-                    _flat(lengths), _flat(active), _flat(out_lengths)).launch(
-            grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
+    def __call__(
+        self,
+        indices: cute.Pointer,
+        values: cute.Pointer,
+        out: cute.Pointer,
+        out_values: cute.Pointer,
+        lengths: cute.Pointer,
+        active: cute.Pointer,
+        out_lengths: cute.Pointer,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            _flat(indices),
+            _flat(values),
+            _flat(out),
+            _flat(out_values),
+            _flat(lengths),
+            _flat(active),
+            _flat(out_lengths),
+        ).launch(grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, indices: cute.Tensor, values: cute.Tensor, out: cute.Tensor,
-               out_values: cute.Tensor, lengths: cute.Tensor, active: cute.Tensor,
-               out_lengths: cute.Tensor):
+    def kernel(
+        self,
+        indices: cute.Tensor,
+        values: cute.Tensor,
+        out: cute.Tensor,
+        out_values: cute.Tensor,
+        lengths: cute.Tensor,
+        active: cute.Tensor,
+        out_lengths: cute.Tensor,
+    ):
         tx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
-        si = smem.allocate_tensor(Int32, cute.make_layout((self.topk,)), byte_alignment=16)
-        sv = smem.allocate_tensor(Float32, cute.make_layout((self.topk,)), byte_alignment=16)
-        visible = cutlass.min(cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0)))
+        si = smem.allocate_tensor(
+            Int32, cute.make_layout((self.topk,)), byte_alignment=16
+        )
+        sv = smem.allocate_tensor(
+            Float32, cute.make_layout((self.topk,)), byte_alignment=16
+        )
+        visible = cutlass.min(
+            cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0))
+        )
         for slot in cutlass.range(Int32(tx), self.topk, 256):
             base = Int64(row) * Int64(self.topk) + Int64(slot)
             idx = indices[base]
@@ -293,7 +472,9 @@ class _SortPositions:
             if cutlass.const_expr(self.expand_blocks):
                 for offset in cutlass.range_constexpr(8):
                     pos = idx * Int32(8) + Int32(offset)
-                    out_pos = (Int64(row) * Int64(self.topk) + Int64(slot)) * Int64(8) + Int64(offset)
+                    out_pos = (Int64(row) * Int64(self.topk) + Int64(slot)) * Int64(
+                        8
+                    ) + Int64(offset)
                     out[out_pos] = Int32(-1)
                     if valid and pos < visible:
                         out[out_pos] = pos
@@ -324,7 +505,18 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         scalars = (Int32(1), Int64(1), Int64(4352))
     elif kind == "score":
         obj = _PagedScore(*recipe)
-        dtypes = (Uint8, Uint8, BFloat16, Uint8, Int32, Int32, Int32, Int32, Int32, BFloat16)
+        dtypes = (
+            Uint8,
+            Uint8,
+            BFloat16,
+            Uint8,
+            Int32,
+            Int32,
+            Int32,
+            Int32,
+            Int32,
+            BFloat16,
+        )
         scalars = (Int32(1), Int32(64), Int32(1), Int64(1), Int64(4352), Int64(1))
     elif kind == "prepare":
         obj = _SelectPrepare(*recipe)
@@ -336,9 +528,16 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         scalars = (Int32(1),)
     key = (kind, recipe, device_index)
     raise_if_kernel_resolution_frozen("cute.compile", target=obj, cache_key=key)
-    pointers = tuple(make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=1) for t in dtypes)
-    raw = b12x_compile(obj, *pointers, *scalars, current_cuda_stream(),
-                      compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 1, key))
+    pointers = tuple(
+        make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=1) for t in dtypes
+    )
+    raw = b12x_compile(
+        obj,
+        *pointers,
+        *scalars,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 2, key),
+    )
     return raw, dtypes
 
 
@@ -347,8 +546,11 @@ def _launch(kind, recipe, tensors, scalars):
         raise ValueError("native MXFP4 indexer requires CUDA tensors")
     with torch.cuda.device(tensors[0].device):
         raw, dtypes = _compile(kind, recipe, tensors[0].device.index)
-        raw(*(_ptr(t, dtype) for t, dtype in zip(tensors, dtypes, strict=True)),
-            *scalars, current_cuda_stream())
+        raw(
+            *(_ptr(t, dtype) for t, dtype in zip(tensors, dtypes, strict=True)),
+            *scalars,
+            current_cuda_stream(),
+        )
 
 
 def _check(tensor, name, shape, dtype, device):
@@ -360,8 +562,9 @@ def _check(tensor, name, shape, dtype, device):
         raise ValueError(f"{name} must be contiguous on {device}")
 
 
-def quantize_q_mxfp4(query: torch.Tensor, *, q_mxfp4: torch.Tensor,
-                     q_scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_q_mxfp4(
+    query: torch.Tensor, *, q_mxfp4: torch.Tensor, q_scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize already-RoPE'd BF16 ``[...,128]`` queries into caller buffers.
 
     Per-32 amax is floored at ``6*2**-126``; scale is ceil-pow2(amax/6),
@@ -375,13 +578,19 @@ def quantize_q_mxfp4(query: torch.Tensor, *, q_mxfp4: torch.Tensor,
     _check(q_scales, "q_scales", (*query.shape[:-1], 4), torch.uint8, query.device)
     rows = query.numel() // 128
     if rows:
-        _launch("quantize", (False, 64), (query, q_mxfp4, q_scales, query),
-                (rows, 0, 0))
+        _launch(
+            "quantize", (False, 64), (query, q_mxfp4, q_scales, query), (rows, 0, 0)
+        )
     return q_mxfp4, q_scales
 
 
-def quantize_write_index_k_mxfp4(keys: torch.Tensor, *, index_k_cache: torch.Tensor,
-                                  slot_mapping: torch.Tensor, page_size: int = 64) -> torch.Tensor:
+def quantize_write_index_k_mxfp4(
+    keys: torch.Tensor,
+    *,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int = 64,
+) -> torch.Tensor:
     """Quantize BF16 ``[rows,128]`` post-RoPE keys directly into paged storage.
 
     ``slot_mapping`` is caller-owned int64 physical token slots; negative slots
@@ -394,16 +603,28 @@ def quantize_write_index_k_mxfp4(keys: torch.Tensor, *, index_k_cache: torch.Ten
     _check(slot_mapping, "slot_mapping", (keys.shape[0],), torch.int64, keys.device)
     _check_pool(index_k_cache, page_bytes, keys.device)
     if keys.shape[0]:
-        _launch("quantize", (True, page_size), (keys, index_k_cache, index_k_cache, slot_mapping),
-                (keys.shape[0], index_k_cache.shape[0], index_k_cache.stride(0)))
+        _launch(
+            "quantize",
+            (True, page_size),
+            (keys, index_k_cache, index_k_cache, slot_mapping),
+            (keys.shape[0], index_k_cache.shape[0], index_k_cache.stride(0)),
+        )
     return index_k_cache
 
 
 def _check_pool(pool, page_bytes, device):
     if pool.ndim != 2 or pool.shape[1] != page_bytes or pool.dtype != torch.uint8:
         raise ValueError(f"index_k_cache must be uint8 (pages,{page_bytes})")
-    if pool.device != device or pool.stride(1) != 1 or pool.stride(0) < page_bytes or pool.stride(0) % 16 or pool.data_ptr() % 16:
-        raise ValueError("index_k_cache must have aligned, nonoverlapping page storage on the plan device")
+    if (
+        pool.device != device
+        or pool.stride(1) != 1
+        or pool.stride(0) < page_bytes
+        or pool.stride(0) % 16
+        or pool.data_ptr() % 16
+    ):
+        raise ValueError(
+            "index_k_cache must have aligned, nonoverlapping page storage on the plan device"
+        )
 
 
 @dataclass(frozen=True)
@@ -417,17 +638,28 @@ class MXFP4PagedPlan:
         return self
 
     def scratch_specs(self):
-        return (scratch_buffer_spec("paged_indexer.mxfp4", nbytes=self.nbytes, device=self.caps.device),)
+        return (
+            scratch_buffer_spec(
+                "paged_indexer.mxfp4", nbytes=self.nbytes, device=self.caps.device
+            ),
+        )
 
     def shapes_and_dtypes(self):
         return tuple((spec.shape, spec.dtype) for spec in self.scratch_specs())
 
-    def bind(self, *, scratch, **kwargs):
+    def bind(self, *, scratch, score_width=None, **kwargs):
         storage = scratch_tensor(scratch, self.scratch_specs(), owner="MXFP4 DSA")
         views = {}
         for name, shape, dtype, offset, _ in self.views:
+            if score_width is not None and name in ("scores", "logits"):
+                shape = (shape[0], score_width)
+            elif score_width is not None and name == "block_logits":
+                shape = (shape[0], (score_width + 7) // 8)
             views[name], _ = materialize_scratch_view(
-                storage, offset_bytes=offset, shape=shape, dtype=dtype,
+                storage,
+                offset_bytes=offset,
+                shape=shape,
+                dtype=dtype,
             )
         return MXFP4Runtime(scratch=views, **kwargs)
 
@@ -440,17 +672,21 @@ def plan_mxfp4(caps):
         raise ValueError("MXFP4 indexer requires a divisor of 32 global heads")
     if rows * width > 2**31 - 1:
         raise ValueError("MXFP4 logits exceed the row selector's kernel tensor limit")
-    shapes = [("scores", (rows, width), torch.bfloat16),
-              ("logits", (rows, width), torch.float32),
-              ("lengths", (rows,), torch.int32),
-              ("indices", (rows, caps.topk), torch.int32),
-              ("values", (rows, caps.topk), torch.float32),
-              ("sorted_values", (rows, caps.topk), torch.float32)]
+    shapes = [
+        ("scores", (rows, width), torch.bfloat16),
+        ("logits", (rows, width), torch.float32),
+        ("lengths", (rows,), torch.int32),
+        ("indices", (rows, caps.topk), torch.int32),
+        ("values", (rows, caps.topk), torch.float32),
+        ("sorted_values", (rows, caps.topk), torch.float32),
+    ]
     if caps.candidate_topk_blocks:
-        shapes += [("block_logits", (rows, (width + 7) // 8), torch.float32),
-                   ("block_lengths", (rows,), torch.int32),
-                   ("block_indices", (rows, caps.candidate_topk_blocks), torch.int32),
-                   ("block_values", (rows, caps.candidate_topk_blocks), torch.float32)]
+        shapes += [
+            ("block_logits", (rows, (width + 7) // 8), torch.float32),
+            ("block_lengths", (rows,), torch.int32),
+            ("block_indices", (rows, caps.candidate_topk_blocks), torch.int32),
+            ("block_values", (rows, caps.candidate_topk_blocks), torch.float32),
+        ]
     offset = 0
     views = []
     for name, shape, dtype in shapes:
@@ -476,11 +712,34 @@ class MXFP4Runtime:
     candidate_output_lengths: torch.Tensor | None
 
 
-def bind_mxfp4(plan, *, scratch, q_mxfp4, q_scales, query_weights, index_k_cache,
-                page_table, cache_lengths, active_width, output_indices, output_scores,
-                candidate_indices, candidate_lengths, candidate_output, candidate_output_lengths):
+def bind_mxfp4(
+    plan,
+    *,
+    scratch,
+    q_mxfp4,
+    q_scales,
+    query_weights,
+    index_k_cache,
+    page_table,
+    cache_lengths,
+    active_width,
+    output_indices,
+    output_scores,
+    candidate_indices,
+    candidate_lengths,
+    candidate_output,
+    candidate_output_lengths,
+    score_width=None,
+):
     from .api import Binding
+
     caps = plan.caps
+    width_capacity = caps.max_candidates or caps.max_page_table_width * caps.page_size
+    score_width = width_capacity if score_width is None else int(score_width)
+    if not 0 < score_width <= width_capacity:
+        raise ValueError("score_width must be positive and within planned capacity")
+    if caps.max_candidates and score_width != caps.max_candidates:
+        raise ValueError("candidate scoring retains its planned candidate width")
     if q_mxfp4 is None or q_mxfp4.ndim != 3:
         raise ValueError("MXFP4 recipe requires explicit q_mxfp4 and q_scales")
     rows = q_mxfp4.shape[0]
@@ -490,36 +749,91 @@ def bind_mxfp4(plan, *, scratch, q_mxfp4, q_scales, query_weights, index_k_cache
     _check(q_scales, "q_scales", (rows, caps.num_q_heads, 4), torch.uint8, caps.device)
     if query_weights.ndim == 3 and query_weights.shape[-1] == 1:
         query_weights = query_weights.view(rows, caps.num_q_heads)
-    _check(query_weights, "query_weights", (rows, caps.num_q_heads), torch.bfloat16, caps.device)
+    _check(
+        query_weights,
+        "query_weights",
+        (rows, caps.num_q_heads),
+        torch.bfloat16,
+        caps.device,
+    )
     _check_pool(index_k_cache, index_mxfp4_page_bytes(caps.page_size), caps.device)
     if page_table.ndim != 2 or page_table.shape[1] > caps.max_page_table_width:
         raise ValueError("page_table width exceeds planned capacity")
-    if page_table.dtype != torch.int32 or page_table.device != caps.device or page_table.stride(1) != 1:
-        raise ValueError("page_table must be int32 with unit inner stride on plan device")
+    if (
+        page_table.dtype != torch.int32
+        or page_table.device != caps.device
+        or page_table.stride(1) != 1
+    ):
+        raise ValueError(
+            "page_table must be int32 with unit inner stride on plan device"
+        )
     if page_table.shape[0] not in (1, rows):
         raise ValueError("page_table must have one shared row or one row per query")
     _check(cache_lengths, "cache_lengths", (rows,), torch.int32, caps.device)
     _check(active_width, "active_width", (1,), torch.int32, caps.device)
-    _check(output_indices, "output_indices", (rows, caps.topk), torch.int32, caps.device)
+    _check(
+        output_indices, "output_indices", (rows, caps.topk), torch.int32, caps.device
+    )
     if output_scores is not None:
-        _check(output_scores, "output_scores", (rows, caps.topk), torch.float32, caps.device)
+        _check(
+            output_scores,
+            "output_scores",
+            (rows, caps.topk),
+            torch.float32,
+            caps.device,
+        )
     if caps.max_candidates:
-        _check(candidate_indices, "candidate_indices", (rows, caps.max_candidates), torch.int32, caps.device)
-        _check(candidate_lengths, "candidate_lengths", (rows,), torch.int32, caps.device)
+        _check(
+            candidate_indices,
+            "candidate_indices",
+            (rows, caps.max_candidates),
+            torch.int32,
+            caps.device,
+        )
+        _check(
+            candidate_lengths, "candidate_lengths", (rows,), torch.int32, caps.device
+        )
     elif candidate_indices is not None or candidate_lengths is not None:
         raise ValueError("candidate inputs require max_candidates in Caps")
     if caps.candidate_topk_blocks:
-        _check(candidate_output, "candidate_output", (rows, caps.candidate_topk_blocks * 8), torch.int32, caps.device)
-        _check(candidate_output_lengths, "candidate_output_lengths", (rows,), torch.int32, caps.device)
+        _check(
+            candidate_output,
+            "candidate_output",
+            (rows, caps.candidate_topk_blocks * 8),
+            torch.int32,
+            caps.device,
+        )
+        _check(
+            candidate_output_lengths,
+            "candidate_output_lengths",
+            (rows,),
+            torch.int32,
+            caps.device,
+        )
     elif candidate_output is not None or candidate_output_lengths is not None:
         raise ValueError("candidate output requires candidate_topk_blocks in Caps")
-    runtime = plan.inner.bind(scratch=scratch, page_table=page_table, cache_lengths=cache_lengths,
-                              active_width=active_width, candidate_indices=candidate_indices,
-                              candidate_lengths=candidate_lengths, candidate_output=candidate_output,
-                              candidate_output_lengths=candidate_output_lengths)
-    return Binding(plan=plan, runtime=runtime, q_fp8=None, q_mxfp4=q_mxfp4, q_scales=q_scales,
-                   query_weights=query_weights, index_k_cache=index_k_cache,
-                   output_indices=output_indices, output_scores=output_scores)
+    runtime = plan.inner.bind(
+        scratch=scratch,
+        score_width=score_width,
+        page_table=page_table,
+        cache_lengths=cache_lengths,
+        active_width=active_width,
+        candidate_indices=candidate_indices,
+        candidate_lengths=candidate_lengths,
+        candidate_output=candidate_output,
+        candidate_output_lengths=candidate_output_lengths,
+    )
+    return Binding(
+        plan=plan,
+        runtime=runtime,
+        q_fp8=None,
+        q_mxfp4=q_mxfp4,
+        q_scales=q_scales,
+        query_weights=query_weights,
+        index_k_cache=index_k_cache,
+        output_indices=output_indices,
+        output_scores=output_scores,
+    )
 
 
 def score_mxfp4(binding):
@@ -527,13 +841,34 @@ def score_mxfp4(binding):
     rows = binding.q_mxfp4.shape[0]
     scores = rt.scratch["scores"][:rows]
     candidates = rt.candidate_indices if caps.max_candidates else rt.cache_lengths
-    candidate_lengths = rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    candidate_lengths = (
+        rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    )
     page_stride = 0 if rt.page_table.shape[0] == 1 else rt.page_table.stride(0)
-    _launch("score", (caps.num_q_heads, bool(caps.max_candidates), caps.page_size),
-            (binding.q_mxfp4, binding.q_scales, binding.query_weights, binding.index_k_cache,
-             rt.page_table, rt.cache_lengths, rt.active_width, candidates, candidate_lengths, scores),
-            (rows, scores.shape[1], rt.page_table.shape[1], page_stride,
-             binding.index_k_cache.stride(0), binding.index_k_cache.shape[0]))
+    _launch(
+        "score",
+        (caps.num_q_heads, bool(caps.max_candidates), caps.page_size),
+        (
+            binding.q_mxfp4,
+            binding.q_scales,
+            binding.query_weights,
+            binding.index_k_cache,
+            rt.page_table,
+            rt.cache_lengths,
+            rt.active_width,
+            candidates,
+            candidate_lengths,
+            scores,
+        ),
+        (
+            rows,
+            scores.shape[1],
+            rt.page_table.shape[1],
+            page_stride,
+            binding.index_k_cache.stride(0),
+            binding.index_k_cache.shape[0],
+        ),
+    )
     return scores
 
 
@@ -541,26 +876,82 @@ def select_mxfp4(binding):
     caps, rt = binding.plan.caps, binding.runtime
     rows = binding.q_mxfp4.shape[0]
     s = {name: view[:rows] for name, view in rt.scratch.items()}
-    candidate_lengths = rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
-    _launch("prepare", (bool(caps.max_candidates), False),
-            (s["scores"], s["logits"], rt.cache_lengths, rt.active_width, candidate_lengths, s["lengths"]),
-            (rows, s["scores"].shape[1], s["logits"].shape[1]))
-    run_row_topk(row_logits=s["logits"], lengths=s["lengths"], topk=caps.topk,
-                 output_values=s["values"], output_indices=s["indices"],
-                 output_gather_table=rt.candidate_indices)
-    out_values = binding.output_scores if binding.output_scores is not None else s["sorted_values"]
-    _launch("sort", (caps.topk, False),
-            (s["indices"], s["values"], binding.output_indices, out_values,
-             rt.cache_lengths, rt.active_width, s["lengths"]), (rows,))
+    candidate_lengths = (
+        rt.candidate_lengths if caps.max_candidates else rt.cache_lengths
+    )
+    _launch(
+        "prepare",
+        (bool(caps.max_candidates), False),
+        (
+            s["scores"],
+            s["logits"],
+            rt.cache_lengths,
+            rt.active_width,
+            candidate_lengths,
+            s["lengths"],
+        ),
+        (rows, s["scores"].shape[1], s["logits"].shape[1]),
+    )
+    run_row_topk(
+        row_logits=s["logits"],
+        lengths=s["lengths"],
+        topk=caps.topk,
+        output_values=s["values"],
+        output_indices=s["indices"],
+        output_gather_table=rt.candidate_indices,
+    )
+    out_values = (
+        binding.output_scores
+        if binding.output_scores is not None
+        else s["sorted_values"]
+    )
+    _launch(
+        "sort",
+        (caps.topk, False),
+        (
+            s["indices"],
+            s["values"],
+            binding.output_indices,
+            out_values,
+            rt.cache_lengths,
+            rt.active_width,
+            s["lengths"],
+        ),
+        (rows,),
+    )
     if caps.candidate_topk_blocks:
-        _launch("prepare", (False, True),
-                (s["scores"], s["block_logits"], rt.cache_lengths, rt.active_width,
-                 rt.cache_lengths, s["block_lengths"]),
-                (rows, s["scores"].shape[1], s["block_logits"].shape[1]))
-        run_row_topk(row_logits=s["block_logits"], lengths=s["block_lengths"],
-                     topk=caps.candidate_topk_blocks, output_values=s["block_values"],
-                     output_indices=s["block_indices"])
-        _launch("sort", (caps.candidate_topk_blocks, True),
-                (s["block_indices"], s["block_values"], rt.candidate_output, s["block_values"],
-                 rt.cache_lengths, rt.active_width, rt.candidate_output_lengths), (rows,))
+        _launch(
+            "prepare",
+            (False, True),
+            (
+                s["scores"],
+                s["block_logits"],
+                rt.cache_lengths,
+                rt.active_width,
+                rt.cache_lengths,
+                s["block_lengths"],
+            ),
+            (rows, s["scores"].shape[1], s["block_logits"].shape[1]),
+        )
+        run_row_topk(
+            row_logits=s["block_logits"],
+            lengths=s["block_lengths"],
+            topk=caps.candidate_topk_blocks,
+            output_values=s["block_values"],
+            output_indices=s["block_indices"],
+        )
+        _launch(
+            "sort",
+            (caps.candidate_topk_blocks, True),
+            (
+                s["block_indices"],
+                s["block_values"],
+                rt.candidate_output,
+                s["block_values"],
+                rt.cache_lengths,
+                rt.active_width,
+                rt.candidate_output_lengths,
+            ),
+            (rows,),
+        )
     return binding.output_indices

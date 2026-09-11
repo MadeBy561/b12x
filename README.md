@@ -100,10 +100,10 @@ caller-owned output, with Int32/Int64 IDs and Int64 table offsets. Its
 `precompile` entrypoint warms width/type specializations before capture;
 live row counts and table extents do not select compiler-cache entries.
 
-The V4.1 serving adapter retains checkpoint-native BF16 weight storage and
-BF16 activation/collective outputs instead of promoting them solely to match
-reference rounding. Native accumulation, normalization, routing scores and
-ratio-two softmax-pooling state remain FP32 where required. Speculative
+The V4.1 serving adapter retains checkpoint-native BF16 weights and activations.
+Model-required accumulation, normalization, routing scores, and ratio-two
+softmax-pooling state remain FP32. Routed MoE contributions are reduced and
+combined with the shared expert in FP32 before the final BF16 cast. Speculative
 rejection preserves per-token compressor partials in request-owned bounded
 rings rather than overwriting one terminal carry state.
 
@@ -120,11 +120,43 @@ initializes the full 1M context at a 4096-token batch capacity and 0.95 memory
 utilization; the record distinguishes capacity accounting from exercised
 prompt lengths and includes graph replay, rejection, and prefix-reuse checks.
 
-`comm.pcie.PCIeDmaAllReduce.prepare_eager_replay(dtype)` prepares a lossless,
-capacity-sized CUDA graph for large eager collectives. All ranks prepare it
-before serving. Live prefixes reuse that graph through fixed staging buffers;
-returned outputs remain independent across calls. Compressed wire modes and
-outer graph captures keep their existing execution paths.
+The [structural optimization qualification](validation/deepseek_v41/structural_optimization.json)
+records the subsequent prefill/decode work. Attention consumes a whole planned
+query batch after bounded indexer chunks, rather than launching attention for
+every 64 rows. Eager indexing bounds score/collective width by known visibility;
+captured indexing retains fixed capacity with tiled clearing of inactive columns.
+Lagged mHC uses native post-pre fusion except across Engram mutation. Dense
+execution regimes are prewarmed, and DSpark context preparation uses bounded
+graphs and KV-only checkpoint projections. SSD Engram uses prefix-bound hashing
+and lookup, with initialization and retired-row clearing owned by its staging
+buffer. The benchmarks retain distinct Engram/PLE quantization and hash contracts.
+
+The [CED acceptance record](validation/deepseek_v41/ced_prefill.json) covers
+full-row encoder execution and decoder global-KV preparation followed by
+bounded decoder replay. Each long request chunk keeps its trailing 128 decoder
+rows; short chunks continue the request's private SWA state. Decoder and draft
+SWA are not published to prefix caching, and encoder/global prefix hits leave
+at least 128 tokens to regenerate decoder state. Prompt-logprob requests retain
+full decoder rows. Sampling keeps its original row ABI; DSpark projects only
+the selected context rows. Replay is intentionally approximate, as described
+in the model report, rather than identical to full-decoder prefill.
+
+Engram also supports `ENGRAM_TABLE_MEMORY=ram` in the V4.1 launcher.
+Its packed E4M3 weights and E8M0 scales live in b12x CUDA-mapped host RAM;
+checkpoint loading writes only each TP shard directly into its final CPU
+aliases. Native GPU lookup reads those allocations over PCIe, without SSD
+transactions during generation. Both table owners remain alive through graph
+replay. The full checkpoint uses 188.83 GiB of pinned host RAM across TP4.
+The [RAM investigation record](validation/deepseek_v41/ram_engram.json) retains
+successful shard/replay smoke checks but is marked unsafe after a later host OOM.
+Use SSD storage while full-RAM peak memory remains unqualified.
+
+`comm.pcie.PCIeDmaAllReduce.prepare_eager_replay(dtype, max_elements=...)`
+prepares a lossless graph for a planned element bound. A larger FP32 workspace
+does not inflate the BF16 replay size. Exact-capacity eager inputs use fixed
+staging buffers; other supported sizes use raw DMA instead of transferring
+padding. Outputs remain independent. All ranks prepare the same dtype bounds
+before capture; compressed wire modes and outer captures keep their existing paths.
 
 `b12x` owns planning, scratch layout, and policy, so serving stacks only supply
 metadata and capacity limits.

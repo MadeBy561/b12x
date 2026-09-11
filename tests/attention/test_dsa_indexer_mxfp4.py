@@ -326,3 +326,57 @@ def test_fixed_graph_buffers_multiple_live_rows_and_visibility(page_size):
             torch.testing.assert_close(args["output_indices"], expected)
     finally:
         unfreeze_kernel_resolution()
+
+
+@pytest.mark.parametrize("source", [False, True])
+def test_bounded_score_width_reuses_capacity_and_preserves_selection(source):
+    """A live column bound must shrink real score work, not its allocation."""
+    torch.manual_seed(416)
+    device = torch.device("cuda")
+    q = torch.randn((3, 4, 128), dtype=torch.bfloat16, device=device)
+    keys = torch.randn((2304, 128), dtype=torch.bfloat16, device=device)
+    lengths = torch.tensor([0, 17, 2304], dtype=torch.int32, device=device)
+    plan, args = _allocate(
+        q, keys, lengths, source=source, high_pages=True, page_size=256
+    )
+    weights = torch.ones((3, 4), dtype=torch.bfloat16, device=device) / 64
+    api.run(api.bind(plan, query_weights=weights, **args))
+    expected_scores = _oracle_scores(q, keys, weights)
+    freeze_kernel_resolution("bounded MXFP4 score width")
+    try:
+        for width in (129, 513, 2051):
+            lengths.copy_(
+                torch.tensor([0, width // 2, width], dtype=torch.int32, device=device)
+            )
+            binding = api.bind(plan, query_weights=weights, score_width=width, **args)
+            scores = api.score(binding)
+            assert scores.shape == (3, width)
+            assert scores.is_contiguous()
+            positions = torch.arange(width, device=device)
+            expected = expected_scores[:, :width].masked_fill(
+                positions[None] >= lengths[:, None], -torch.inf
+            )
+            torch.testing.assert_close(scores, expected, atol=0, rtol=0)
+            api.select(binding)
+            _assert_topk(expected, args["output_indices"], args["output_scores"])
+            if source:
+                for row, count in enumerate((0, width // 2, width)):
+                    assert args["candidate_output_lengths"][row].item() == count
+                    torch.testing.assert_close(
+                        args["candidate_output"][row, :count],
+                        torch.arange(count, device=device, dtype=torch.int32),
+                    )
+                    assert args["candidate_output"][row, count:].eq(-1).all()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            api.run(binding)
+        lengths.copy_(torch.tensor([0, 3, 1023], dtype=torch.int32, device=device))
+        args["scratch"].fill_(0xA5)
+        graph.replay()
+        positions = torch.arange(width, device=device)
+        expected = expected_scores[:, :width].masked_fill(
+            positions[None] >= lengths[:, None], -torch.inf
+        )
+        _assert_topk(expected, args["output_indices"], args["output_scores"])
+    finally:
+        unfreeze_kernel_resolution()
