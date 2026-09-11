@@ -43,7 +43,18 @@ def _oracle_quant(x):
 def _oracle_scores(q, k, weights):
     _, _, q = _oracle_quant(q)
     _, _, k = _oracle_quant(k)
-    dot = torch.einsum("rhd,kd->rhk", q, k)
+    # The native contract accumulates each dot in FP32, then rounds once to
+    # BF16. cuBLAS may otherwise insert BF16 partial reductions on larger M.
+    reduced_precision = (
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    )
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        dot = torch.einsum("rhd,kd->rhk", q, k)
+    finally:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+            reduced_precision
+        )
     return (dot.relu() * weights[..., None]).sum(1)
 
 
@@ -499,5 +510,120 @@ def test_bounded_score_width_reuses_capacity_and_preserves_selection(source):
             positions[None] >= lengths[:, None], -torch.inf
         )
         _assert_topk(expected, args["output_indices"], args["output_scores"])
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns():
+    """A serving-sized output must not retain poisoned or invalid-page scores."""
+    torch.manual_seed(4132)
+    device = torch.device("cuda")
+    rows, heads, populated, capacity = 3, 32, 32769, 1048576
+    q = torch.randn((rows, heads, 128), dtype=torch.bfloat16, device=device) / 4
+    keys = torch.randn((populated, 128), dtype=torch.bfloat16, device=device) / 4
+    weights = torch.randn((rows, heads), dtype=torch.bfloat16, device=device) / 32
+    lengths = torch.full((rows,), populated, dtype=torch.int32, device=device)
+    _, args = _allocate(q, keys, lengths, high_pages=True, page_size=128)
+    args["page_table"][0, 1] = -1
+    plan = api.plan(
+        api.Caps(
+            device=device,
+            num_q_heads=heads,
+            max_q_rows=rows,
+            max_page_table_width=capacity // 128,
+            page_size=128,
+            cache_format="mxfp4",
+            topk=512,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    args["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+    binding = api.bind(plan, query_weights=weights, **args)
+    scores = api.score(binding)
+    api.select(binding)
+    reference = _oracle_scores(q, keys, weights)
+    reference[:, 128:256] = -torch.inf
+    positions = torch.arange(populated, device=device)
+    expected = torch.full_like(scores, -torch.inf)
+    freeze_kernel_resolution("full-capacity MXFP4 head and visibility boundaries")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            api.score(binding)
+            api.select(binding)
+        for live_lengths in ((0, 129, 32769), (65, 17001, 16417)):
+            lengths.copy_(torch.tensor(live_lengths, dtype=torch.int32, device=device))
+            args["scratch"].fill_(0x7F)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            expected.fill_(-torch.inf)
+            expected[:, :populated] = reference.masked_fill(
+                positions[None] >= lengths[:, None], -torch.inf
+            )
+            torch.testing.assert_close(scores, expected, rtol=0, atol=0)
+            _assert_topk(expected, args["output_indices"], args["output_scores"])
+    finally:
+        unfreeze_kernel_resolution()
+
+
+def test_source_selection_replay_reaches_newest_block_beyond_first_stripe():
+    """The source selector must consume distant live blocks, not poisoned tails."""
+    device = torch.device("cuda")
+    capacity = 1048576
+    q = torch.ones((1, 1, 128), dtype=torch.bfloat16, device=device)
+    keys = torch.ones((128, 128), dtype=torch.bfloat16, device=device)
+    lengths = torch.tensor([128], dtype=torch.int32, device=device)
+    _, args = _allocate(q, keys, lengths, source=True, high_pages=True, page_size=128)
+    plan = api.plan(
+        api.Caps(
+            device=device,
+            num_q_heads=1,
+            max_q_rows=1,
+            max_page_table_width=capacity // 128,
+            page_size=128,
+            cache_format="mxfp4",
+            topk=512,
+            candidate_topk_blocks=2048,
+        )
+    )
+    (spec,) = plan.scratch_specs()
+    args["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+    binding = api.bind(
+        plan,
+        query_weights=torch.ones((1, 1), dtype=torch.bfloat16, device=device),
+        **args,
+    )
+    scores = api.score(binding)
+    api.select(binding)
+    freeze_kernel_resolution("source block selection across persistent stripes")
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            api.select(binding)
+        for visible in (524293, capacity):
+            lengths.fill_(visible)
+            args["active_width"].fill_(visible)
+            args["scratch"].fill_(0x7F)
+            # Supply the caller-reduced BF16 scores across the public TP boundary.
+            scores.fill_(-4)
+            scores[:, : 2047 * 8] = 4
+            args["candidate_output"].fill_(-99)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            newest_start = ((visible - 1) // 8) * 8
+            expected = torch.cat(
+                (
+                    torch.arange(2047 * 8, dtype=torch.int32, device=device),
+                    torch.arange(
+                        newest_start, visible, dtype=torch.int32, device=device
+                    ),
+                )
+            )
+            count = expected.numel()
+            assert args["candidate_output_lengths"].item() == count
+            torch.testing.assert_close(
+                args["candidate_output"][0, :count], expected, rtol=0, atol=0
+            )
+            assert bool((args["candidate_output"][0, count:] == -1).all())
     finally:
         unfreeze_kernel_resolution()

@@ -1371,10 +1371,7 @@ def _fp32_to_ue8m0_byte(scale: Float32) -> Uint32:
 @cute.jit
 def _ld_u8_zext(base_addr: Int32, byte_off: Int32) -> Uint32:
     """Load one u8 from smem (base+byte_off), zero-extended to u32."""
-    word = byte_off & ~Int32(3)
-    sh = (byte_off & Int32(3)) * Int32(8)
-    val = ld_shared_u32(base_addr + word)
-    return (val >> sh.to(Uint32)) & Uint32(0xFF)
+    return ld_shared_u8_offset(base_addr + byte_off, 0)
 
 
 @cute.jit
@@ -1492,14 +1489,10 @@ def _nvfp4_pair_bfloat2(
     v1 = Float32(0.0)
     scale_f = Float32(0.0)
     if swa == Int32(1):
-        v0 = cvt_e4m3_to_f32_via_f16(
-            _ld_u8_zext(kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even)
+        packed = _ld_u16_zext(
+            kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even
         )
-        v1 = cvt_e4m3_to_f32_via_f16(
-            _ld_u8_zext(
-                kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even + Int32(1)
-            )
-        )
+        v0, v1 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(packed))
         scale_f = _ue8m0_byte_to_fp32(
             _ld_u8_zext(
                 kv_fp4_base_addr,
