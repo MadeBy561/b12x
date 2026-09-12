@@ -155,15 +155,14 @@ def validate_moe_decode_config(
         and query.source_format == "fp4_e8m0_k32"
         and query.intermediate_size % 128 == 64
     )
-    if compact_n64_w4a8 and (
-        config.backend != "dynamic"
-        or config.route_planner != "internal"
+    if compact_n64_w4a8 and config.backend == "dynamic" and (
+        config.route_planner != "internal"
         or config.dynamic_tile_m != 16
         or config.dynamic_route_mode != "grouped"
     ):
         raise ValueError(
-            "compact N64-tail W4A8 weights require the internal grouped "
-            "dynamic M16 pipeline"
+            "compact N64-tail W4A8 dynamic execution requires the internal "
+            "grouped M16 pipeline"
         )
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:

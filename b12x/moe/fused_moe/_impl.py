@@ -2243,6 +2243,9 @@ def clear_tp_moe_caches() -> None:
     from b12x.moe._shared.kernels.w4a16.kernel import (
         clear_w4a16_kernel_cache,
     )
+    from b12x.moe._shared.kernels.w4a8_compact_micro import (
+        _compiled_direct_w4a8_compact,
+    )
 
     global _LAST_WEIGHTS
     global _LAST_KERNEL
@@ -2252,6 +2255,7 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_SWAP_AB_OVERRIDE
     _WEIGHT_CACHE.clear()
     clear_w4a16_kernel_cache()
+    _compiled_direct_w4a8_compact.cache_clear()
     _MICRO_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
     _MAC_CACHE.clear()
@@ -2534,11 +2538,14 @@ def _w4a8_mx_micro_supported(
                 weight_E=weight_E,
             )
         )
-    # Exact N64-tail preparation stores compact N128/N64 tiles rather than
-    # tiny_decode's padded N256/K128 layout.  Dispatching that payload to
-    # tiny_decode reads across tile and expert boundaries.
     if source_format == "fp4_e8m0_k32" and n % 128 == 64:
-        return False
+        return bool(
+            1 <= num_tokens <= _MICRO_MAX_TOKENS
+            and k % 256 == 0
+            and activation == "silu"
+            and 0 < num_topk <= 32
+            and weight_E > 0
+        )
     return _tiny_decode_enabled() and _tiny_decode_supports(
         num_tokens=num_tokens,
         k=k,
@@ -2767,9 +2774,8 @@ def _heuristic_moe_decode_config(
             and query.intermediate_size % 128 == 64
         )
         if compact_n64_pipeline:
-            # Exact N64-tail weights use the split-materialized kernels. Their
-            # M16 specialization consumes the compact layout directly while
-            # retaining the common BF16 activation and route-reduction contract.
+            # Larger compact launches use the split-materialized M16 kernels.
+            # The direct compact micro path owns one through eight live tokens.
             dynamic_tile_m = 16
             dynamic_route_mode = "grouped"
         else:
@@ -3802,6 +3808,24 @@ def _plan_core_workspace(
                     micro_intermediate_elements,
                     direct_micro_tokens * num_topk * (n // 2)
                     + direct_micro_tokens * num_topk * (n // 128) * 257,
+                )
+            if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+                from b12x.moe._shared.kernels.w4a8_compact_micro import (
+                    micro_scratch_nbytes,
+                )
+
+                micro_intermediate_elements = max(
+                    micro_intermediate_elements,
+                    (
+                        micro_scratch_nbytes(
+                            direct_micro_tokens,
+                            k,
+                            n,
+                            num_topk,
+                        )
+                        + 3
+                    )
+                    // 4,
                 )
         if direct_micro_candidate:
             fc2_n_chunks = (n // 2 + 127) // 128
@@ -7246,6 +7270,24 @@ def plan_tp_moe_execution(
         scheduler=execution_scheduler,
         required_weight_layout=weight_plan.required_weight_layout(quant_mode),
     )
+    compact_w4a8_micro = bool(
+        implementation == "micro"
+        and quant_mode == "w4a8_mx"
+        and source_format == "fp4_e8m0_k32"
+        and n % 128 == 64
+    )
+    if compact_w4a8_micro:
+        if apply_router_weight_on_input:
+            raise ValueError(
+                "compact W4A8 micro requires route weights after FC2"
+            )
+        execution = replace(
+            execution,
+            gemm_engine=GemmEngine.MXFP8_QMMA,
+            reduction=OutputReduction.ROUTE_BUFFER_TOPK_SUM,
+            tile_m=16,
+            tile_n=128,
+        )
     if not weight_plan.supports(
         quant_mode=quant_mode,
         execution=execution,
@@ -7316,6 +7358,25 @@ def _validate_workspace(
             f"expected {(plan.implementation, plan.quant_mode, plan.weight_E, plan.k, plan.n, plan.num_topk, plan.device, plan.dtype)}, "
             f"got {actual}"
         )
+    if (
+        plan.implementation == "micro"
+        and plan.quant_mode == "w4a8_mx"
+        and plan.n % 128 == 64
+    ):
+        from b12x.moe._shared.kernels.w4a8_compact_micro import (
+            micro_scratch_nbytes,
+        )
+
+        required = micro_scratch_nbytes(
+            plan.max_rows // plan.num_topk,
+            plan.k,
+            plan.n,
+            plan.num_topk,
+        )
+        if workspace.micro_intermediate.nbytes < required:
+            raise ValueError(
+                "compact W4A8 micro workspace is smaller than its planned capacity"
+            )
     if plan.implementation == "w4a16":
         if not isinstance(workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -13220,6 +13281,44 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
     if not scatter_output.is_contiguous():
         raise ValueError("output must be contiguous")
+
+    compact_w4a8_micro = bool(
+        impl == "micro"
+        and quant_mode == "w4a8_mx"
+        and getattr(prepared_payload, "n64_repack", False)
+    )
+    if compact_w4a8_micro:
+        from b12x.moe._shared.kernels.w4a8_compact_micro import (
+            launch_w4a8_compact_micro,
+        )
+
+        route_output = launch_w4a8_compact_micro(
+            scratch=s.micro_intermediate,
+            a=a,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13=wv.w1_storage,
+            w13_scales=wv.w1_scale_storage,
+            w2=wv.w2_storage,
+            w2_scales=wv.w2_scale_storage,
+            alpha1=wv.w1_alpha,
+            alpha2=wv.w2_alpha,
+            input_scale=input_gs,
+            down_scale=down_input_scale,
+            max_tokens=plan.max_rows // num_topk,
+            num_topk=num_topk,
+            swiglu_limit=swiglu_limit,
+            fast_math=fast_math,
+        )
+        _launch_dynamic_topk_sum(
+            route_output=route_output,
+            output=scatter_output,
+            m=m,
+            num_topk=num_topk,
+            k=k,
+            stream=stream,
+        )
+        return scatter_output
 
     if impl == "dynamic":
         deterministic_output = plan.deterministic_output

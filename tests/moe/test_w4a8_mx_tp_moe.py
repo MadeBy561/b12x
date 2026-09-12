@@ -171,11 +171,12 @@ def _prepare(
             runtime.w2_sfb,
         )
     )
-    # Aligned shards repack in place; ceil-tiled tails (n % 128 != 0 for w2,
-    # (2n) % 256 != 0 for w13) can't fit the source storage and get fresh
-    # allocations instead.
-    has_tail = n % 128 != 0 or (2 * n) % 256 != 0
-    if has_tail:
+    # Exact N64 repacks preserve the source storage and specialize the runtime
+    # layout in place. Legacy ceil-tiled tails require larger allocations.
+    has_legacy_tail = (
+        (n % 128 != 0 or (2 * n) % 256 != 0) and not runtime.n64_repack
+    )
+    if has_legacy_tail:
         assert runtime_ptrs != source_ptrs
     else:
         assert runtime_ptrs == source_ptrs
@@ -956,3 +957,121 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
     assert cos > 0.998, cos
     n_ref = ref.float().norm().item()
     assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
+
+
+def test_compact_n64_plan_rebind_and_graph_replay_are_serving_stable() -> None:
+    _skip_if_unavailable()
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+    from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    n = 192
+    max_tokens = 64
+    live_counts = (1, 2, 8, 16, 64)
+    weights = _weights(n=n, seed=117)
+    x, topk_ids, topk_weights = _routed_inputs(max_tokens, 118)
+    references = {}
+    for rows in live_counts:
+        references[rows] = moe_reference_w4a8_mx(
+            x[:rows].float(),
+            weights["w13_fp4"],
+            weights["w13_mx"],
+            None,
+            weights["alphas"],
+            weights["w2_fp4"],
+            weights["w2_mx"],
+            None,
+            weights["alphas"],
+            topk_ids[:rows],
+            topk_weights[:rows],
+            _E,
+            _K,
+            n,
+            activation="silu",
+        )
+
+    experts = _prepare(weights, n=n)
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    plan = fused_moe.plan(
+        fused_moe.Caps(
+            max_tokens=max_tokens,
+            num_topk=_TOPK,
+            device=device,
+            weight_plan=experts.plan,
+            quant_mode="w4a8_mx",
+            core_token_counts=live_counts,
+            route_num_experts=0,
+        )
+    )
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert plan.launch_plan.execution.tile_m == 16
+
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in plan.scratch_specs()
+    )
+    output = torch.empty(max_tokens, _K, dtype=torch.bfloat16, device=device)
+
+    def bind(rows: int):
+        return fused_moe.bind(
+            plan,
+            scratch=scratch,
+            a=x[:rows],
+            experts=experts,
+            topk_ids=topk_ids[:rows],
+            topk_weights=topk_weights[:rows],
+            output=output[:rows],
+            input_scales_static=True,
+            fast_math=False,
+        )
+
+    for rows in live_counts:
+        fused_moe.run(binding=bind(rows))
+    torch.cuda.synchronize()
+    storage = (*scratch, output, x, topk_ids, topk_weights)
+    addresses = tuple(tensor.data_ptr() for tensor in storage)
+
+    freeze_kernel_resolution("compact N64 graph replay uses warmed micro and M16 plans")
+    try:
+        for rows in live_counts:
+            allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+            binding = bind(rows)
+            actual = fused_moe.run(binding=binding)
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+            assert tuple(tensor.data_ptr() for tensor in storage) == addresses
+            assert actual.data_ptr() == output.data_ptr()
+
+            graph = torch.cuda.CUDAGraph()
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+                allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+                fused_moe.run(binding=binding)
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                )
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            torch.cuda.synchronize()
+
+            for _ in range(3):
+                allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                )
+                assert tuple(tensor.data_ptr() for tensor in storage) == addresses
+                replayed = output[:rows]
+                assert replayed.isfinite().all()
+                assert replayed.abs().sum().item() > 0
+                cosine = torch.nn.functional.cosine_similarity(
+                    replayed.float().flatten(),
+                    references[rows].float().flatten(),
+                    dim=0,
+                ).item()
+                assert cosine > 0.998, (rows, cosine)
+    finally:
+        unfreeze_kernel_resolution()

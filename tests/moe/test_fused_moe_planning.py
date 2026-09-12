@@ -1067,7 +1067,7 @@ def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
 
 
 @pytest.mark.parametrize("num_tokens", (1, 2, 8, 16, 64))
-def test_compact_n64_w4a8_uses_common_grouped_m16_pipeline(
+def test_compact_n64_w4a8_uses_direct_micro_then_grouped_m16(
     num_tokens: int,
 ) -> None:
     query = fused_moe_impl.MoeDecodeQuery(
@@ -1084,15 +1084,22 @@ def test_compact_n64_w4a8_uses_common_grouped_m16_pipeline(
 
     config = fused_moe_impl._heuristic_moe_decode_config(query, None)
 
-    assert config == fused_moe_impl.MoeDecodeConfig(
-        backend="dynamic",
-        route_planner="internal",
-        max_active_clusters=None,
-        dynamic_tile_m=16,
-        dynamic_route_mode="grouped",
-        w4a16_route_mode=None,
-    )
-    assert not fused_moe_impl._policy_micro_supported(query)
+    if num_tokens <= 8:
+        assert config == fused_moe_impl.MoeDecodeConfig(
+            backend="micro",
+            route_planner="internal",
+            max_active_clusters=None,
+        )
+    else:
+        assert config == fused_moe_impl.MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_tile_m=16,
+            dynamic_route_mode="grouped",
+            w4a16_route_mode=None,
+        )
+    assert fused_moe_impl._policy_micro_supported(query) is (num_tokens <= 8)
 
 
 def test_compact_n64_w4a8_rejects_incompatible_profile_config() -> None:
@@ -1110,9 +1117,11 @@ def test_compact_n64_w4a8_rejects_incompatible_profile_config() -> None:
         routed_rows=6,
     )
     incompatible = fused_moe_impl.MoeDecodeConfig(
-        backend="micro",
+        backend="dynamic",
         route_planner="internal",
         max_active_clusters=None,
+        dynamic_tile_m=16,
+        dynamic_route_mode="direct",
     )
 
     with pytest.raises(ValueError, match="compact N64-tail"):

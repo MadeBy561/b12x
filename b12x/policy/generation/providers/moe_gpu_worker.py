@@ -771,7 +771,7 @@ def _candidates_for_geometry(
     else:
         dynamic_tile_ms = (16, 32, 64, 128)
     candidates = []
-    if recipe.quant_mode != "w6a8_mx" and not compact_n64_w4a8:
+    if recipe.quant_mode != "w6a8_mx":
         candidates.append(
             MoeCandidate.create(
                 {
