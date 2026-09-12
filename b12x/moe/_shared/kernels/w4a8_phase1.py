@@ -69,6 +69,7 @@ class W4A8MaterializedPhase1Kernel:
         deterministic_output: bool = False,
         num_topk: int = 1,
         activation: str = "silu",
+        swiglu_limit: float | None = None,
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
@@ -76,6 +77,8 @@ class W4A8MaterializedPhase1Kernel:
         n64_tail: bool = False,
     ):
         self.fast_math = bool(fast_math)
+        self.has_swiglu_limit = swiglu_limit is not None
+        self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
         if source_tile_m not in (16, 64, 128):
@@ -560,6 +563,10 @@ class W4A8MaterializedPhase1Kernel:
     ) -> cutlass.Float32:
         gate = alpha_value * gate
         up = alpha_value * up
+        if cutlass.const_expr(self.has_swiglu_limit):
+            limit = cutlass.Float32(self.swiglu_limit)
+            gate = cutlass.min(gate, limit)
+            up = cutlass.max(cutlass.min(up, limit), -limit)
         sigmoid = cute.arch.rcp_approx(
             cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
         )

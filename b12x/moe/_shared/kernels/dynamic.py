@@ -1044,6 +1044,7 @@ class MoEDynamicKernelBackend:
         else:
             self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
                 fast_math=self.fast_math,
+                swiglu_limit=swiglu_limit,
                 source_tile_m=materialized_source_tile_m,
                 deterministic_output=bool(deterministic_output),
                 num_topk=self.num_topk,

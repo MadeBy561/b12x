@@ -1192,3 +1192,92 @@ def test_compact_n64_micro_zero_and_tiny_blocks_use_common_mxfp8_scales() -> Non
     )
     assert torch.count_nonzero(activation_scales[:_TOPK]).item() == 0
     assert torch.count_nonzero(activation_scales[_TOPK:]).item() > 0
+
+
+def test_compact_n64_grouped_prefill_honors_swiglu_limit() -> None:
+    _skip_if_unavailable()
+    from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    n = 192
+    tokens = 16
+    weights = _weights(n=n, seed=211)
+    x, topk_ids, topk_weights = _routed_inputs(tokens, 212)
+    x = (x.float() * 32.0).to(torch.bfloat16)
+    clamped = moe_reference_w4a8_mx(
+        x.float(),
+        weights["w13_fp4"],
+        weights["w13_mx"],
+        None,
+        weights["alphas"],
+        weights["w2_fp4"],
+        weights["w2_mx"],
+        None,
+        weights["alphas"],
+        topk_ids,
+        topk_weights,
+        _E,
+        _K,
+        n,
+        activation="silu",
+        swiglu_limit=10.0,
+    )
+    unclamped = moe_reference_w4a8_mx(
+        x.float(),
+        weights["w13_fp4"],
+        weights["w13_mx"],
+        None,
+        weights["alphas"],
+        weights["w2_fp4"],
+        weights["w2_mx"],
+        None,
+        weights["alphas"],
+        topk_ids,
+        topk_weights,
+        _E,
+        _K,
+        n,
+        activation="silu",
+    )
+    assert not torch.allclose(clamped, unclamped, rtol=0.05, atol=0.05)
+
+    experts = _prepare(weights, n=n)
+    plan = fused_moe.plan(
+        fused_moe.Caps(
+            max_tokens=tokens,
+            num_topk=_TOPK,
+            device=device,
+            weight_plan=experts.plan,
+            quant_mode="w4a8_mx",
+            core_token_counts=(tokens,),
+            route_num_experts=0,
+            swiglu_limit=10.0,
+        )
+    )
+    assert plan.launch_plan.implementation == "dynamic"
+    scratch = tuple(
+        torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in plan.scratch_specs()
+    )
+    output = torch.empty(tokens, _K, dtype=torch.bfloat16, device=device)
+    binding = fused_moe.bind(
+        plan,
+        scratch=scratch,
+        a=x,
+        experts=experts,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        output=output,
+        input_scales_static=True,
+        fast_math=False,
+    )
+    actual = fused_moe.run(binding=binding)
+    torch.cuda.synchronize()
+
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(),
+        clamped.float().flatten(),
+        dim=0,
+    ).item()
+    assert cosine > 0.998, cosine
