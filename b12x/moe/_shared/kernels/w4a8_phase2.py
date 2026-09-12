@@ -80,11 +80,12 @@ class W4A8MaterializedPhase2Kernel:
     ):
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
-        if source_tile_m not in (64, 128):
+        if source_tile_m not in (16, 64, 128):
             raise ValueError(
-                f"materialized phase 2 source_tile_m must be 64 or 128, got {source_tile_m}"
+                "materialized phase 2 source_tile_m must be 16, 64, or 128, "
+                f"got {source_tile_m}"
             )
-        self.tile_m = type(self).tile_m
+        self.tile_m = 16 if source_tile_m == 16 else type(self).tile_m
         self.tile_n = type(self).tile_n
         self.stages = 2
         self.a_payload_bytes = self.tile_m * self.tile_k

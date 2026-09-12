@@ -1067,7 +1067,7 @@ def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
 
 
 @pytest.mark.parametrize("num_tokens", (1, 2, 8, 16, 64))
-def test_compact_n64_w4a8_uses_common_grouped_m64_pipeline(
+def test_compact_n64_w4a8_uses_common_grouped_m16_pipeline(
     num_tokens: int,
 ) -> None:
     query = fused_moe_impl.MoeDecodeQuery(
@@ -1088,7 +1088,7 @@ def test_compact_n64_w4a8_uses_common_grouped_m64_pipeline(
         backend="dynamic",
         route_planner="internal",
         max_active_clusters=None,
-        dynamic_tile_m=64,
+        dynamic_tile_m=16,
         dynamic_route_mode="grouped",
         w4a16_route_mode=None,
     )
@@ -1117,3 +1117,29 @@ def test_compact_n64_w4a8_rejects_incompatible_profile_config() -> None:
 
     with pytest.raises(ValueError, match="compact N64-tail"):
         validate_moe_decode_config(query, incompatible, None)
+
+
+def test_compact_n64_m16_uses_external_common_phase_kernels() -> None:
+    from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+
+    kernel = MoEDynamicKernelBackend(
+        32,
+        (16, 128),
+        activation="silu",
+        quant_recipe="w4a8_mx",
+        w4a8_repacked=True,
+        w4a8_n64_repacked=True,
+        w4a8_n64_tail=True,
+        materialize_intermediate=True,
+        share_input_across_experts=True,
+        num_topk=6,
+    )
+
+    assert kernel.w4a8_m16_materialized
+    assert kernel.w4a8_split_materialized
+    assert kernel.external_materialized_fc1
+    assert kernel.external_materialized_fc2
+    assert kernel.materialized_phase1_kernel.tile_m == 16
+    assert kernel.materialized_phase1_kernel.source_halves == 1
+    assert kernel.materialized_phase2_kernel.tile_m == 16
+    assert kernel.materialized_phase2_kernel.source_halves == 1

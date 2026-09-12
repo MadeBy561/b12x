@@ -78,11 +78,12 @@ class W4A8MaterializedPhase1Kernel:
         self.fast_math = bool(fast_math)
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
-        if source_tile_m not in (64, 128):
+        if source_tile_m not in (16, 64, 128):
             raise ValueError(
-                f"materialized phase 1 source_tile_m must be 64 or 128, got {source_tile_m}"
+                "materialized phase 1 source_tile_m must be 16, 64, or 128, "
+                f"got {source_tile_m}"
             )
-        self.tile_m = 64
+        self.tile_m = 16 if source_tile_m == 16 else 64
         self.tile_n = 128
         self.stages = 2
         # A retains a 128-byte row stride even though each stage advances K64.

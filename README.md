@@ -321,8 +321,8 @@ selection, and BF16 output boundary as V4.0. Checkpoint-specific dimensions,
 TP slicing, and scale layouts remain distinct. It reuses one fixed-capacity
 scratch plan across the requested token counts. Graph replay is checked
 against eager output; the default timing mode flushes L2 outside timed events.
-The compact N64-tail weight layout uses the common grouped M64 pipeline rather
-than the padded N256/K128 tiny-decode layout.
+The compact N64-tail weight layout uses the common split-materialized M16
+pipeline rather than the padded N256/K128 tiny-decode layout.
 This adds a benchmark preset and TP4 policy-generation coverage, not a newly
 tuned embedded GPU profile.
 

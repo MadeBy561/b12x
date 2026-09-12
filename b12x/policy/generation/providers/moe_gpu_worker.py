@@ -763,7 +763,7 @@ def _candidates_for_geometry(
     if recipe.quant_mode == "w6a8_mx":
         dynamic_tile_ms = (128,)
     elif compact_n64_w4a8:
-        dynamic_tile_ms = (64,)
+        dynamic_tile_ms = (16,)
     elif recipe.quant_mode == "nvfp4" and geometry.activation == "relu2":
         # The M16/M32 Relu2 kernels require 117760/121856 bytes of shared
         # memory, above the 101376-byte SM120/SM121 opt-in limit.

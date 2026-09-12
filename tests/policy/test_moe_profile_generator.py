@@ -697,7 +697,7 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
     assert all(config["w4a16_route_mode"] is None for config in configs)
 
 
-def test_compact_n64_w4a8_tuner_exposes_only_common_grouped_m64() -> None:
+def test_compact_n64_w4a8_tuner_exposes_only_common_grouped_m16() -> None:
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
@@ -717,7 +717,7 @@ def test_compact_n64_w4a8_tuner_exposes_only_common_grouped_m64() -> None:
         {
             "backend": "dynamic",
             "dynamic_route_mode": "grouped",
-            "dynamic_tile_m": 64,
+            "dynamic_tile_m": 16,
             "route_planner": "internal",
             "max_active_clusters": None,
             "w4a16_route_mode": None,

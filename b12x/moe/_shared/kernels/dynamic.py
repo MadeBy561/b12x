@@ -962,6 +962,12 @@ class MoEDynamicKernelBackend:
             and self.materialize_intermediate
             and mma_tiler_mn == (16, 128)
         )
+        self.w4a8_m16_materialized = bool(
+            self.w4a8_repacked
+            and self.w4a8_n64_repacked
+            and self.materialize_intermediate
+            and mma_tiler_mn == (16, 128)
+        )
         self.w4a8_m128_materialized = bool(
             self.w4a8_repacked
             and self.materialize_intermediate
@@ -973,7 +979,9 @@ class MoEDynamicKernelBackend:
             and mma_tiler_mn == (64, 128)
         )
         self.w4a8_split_materialized = bool(
-            self.w4a8_m64_materialized or self.w4a8_m128_materialized
+            self.w4a8_m16_materialized
+            or self.w4a8_m64_materialized
+            or self.w4a8_m128_materialized
         )
         # NVFP4 split-materialized (large-M prefill): the cooperative kernel
         # keeps only the routing/input-quantization front-end (it publishes

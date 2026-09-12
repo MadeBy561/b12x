@@ -2767,10 +2767,10 @@ def _heuristic_moe_decode_config(
             and query.intermediate_size % 128 == 64
         )
         if compact_n64_pipeline:
-            # Exact N64-tail weights are consumed by the split-materialized
-            # M64 kernels.  The monolithic M16/M32 kernels and tiny_decode use
-            # different padded weight layouts.
-            dynamic_tile_m = 64
+            # Exact N64-tail weights use the split-materialized kernels. Their
+            # M16 specialization consumes the compact layout directly while
+            # retaining the common BF16 activation and route-reduction contract.
+            dynamic_tile_m = 16
             dynamic_route_mode = "grouped"
         else:
             dynamic_n = _dynamic_kernel_intermediate_size(
@@ -11441,6 +11441,11 @@ def _launch_dynamic_flat(
             )
     if not multicta_enabled:
         effective_mac = 1
+    elif w4a8_n64_repacked and selected_tile_m == 16:
+        # The compact split-M16 front-end retains one cooperative participant
+        # per SM. Its standalone phase kernels launch their own two-wave grids,
+        # but those CTAs do not join the front-end's grid-wide barrier.
+        effective_mac = min(effective_mac, get_num_sm(torch.device("cuda")))
     elif w4a8_repacked and selected_tile_m <= 32:
         # The compact repacked-W4A8 storage specialization is deliberately
         # sized for two resident CTAs/SM (49.15 KiB and a two-block register
