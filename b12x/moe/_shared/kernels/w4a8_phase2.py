@@ -75,29 +75,20 @@ class W4A8MaterializedPhase2Kernel:
         deterministic_output: bool = False,
         trellis_bits: int | None = None,
         trellis_direct_lut: bool = False,
-        numerical_recipe: str = "default",
         n64_repacked: bool = False,
         n64_tail: bool = False,
-        direct_routes: bool = False,
     ):
-        self.deepseek_v41 = numerical_recipe == "deepseek_v41"
         self.n64_repacked = bool(n64_repacked)
         self.n64_tail = bool(n64_tail)
-        self.direct_routes = bool(direct_routes)
-        if self.direct_routes:
-            if not self.deepseek_v41 or source_tile_m != 1:
-                raise ValueError(
-                    "direct materialized phase 2 requires deepseek_v41 source_tile_m=1"
-                )
-        elif source_tile_m not in (64, 128):
+        if source_tile_m not in (64, 128):
             raise ValueError(
                 f"materialized phase 2 source_tile_m must be 64 or 128, got {source_tile_m}"
             )
-        self.tile_m = 16 if self.deepseek_v41 else type(self).tile_m
+        self.tile_m = type(self).tile_m
         self.tile_n = type(self).tile_n
-        self.stages = 4 if self.direct_routes else 2
-        self.a_payload_bytes = self.tile_k if self.direct_routes else self.tile_m * self.tile_k
-        self.a_scale_bytes = 128 if self.direct_routes else self.tile_m * 4
+        self.stages = 2
+        self.a_payload_bytes = self.tile_m * self.tile_k
+        self.a_scale_bytes = self.tile_m * 4
         self.a_stage_bytes = self.a_payload_bytes + self.a_scale_bytes
         self.a_storage_bytes = self.stages * self.a_stage_bytes
         self.b_storage_offset = ((self.a_storage_bytes + 1023) // 1024) * 1024
@@ -108,7 +99,7 @@ class W4A8MaterializedPhase2Kernel:
         self.shared_bytes = self.sfb_storage_offset + self.stages * self.sfb_stage_bytes
         self.shared_words = (self.shared_bytes + 3) // 4
         self.source_tile_m = int(source_tile_m)
-        self.source_halves = 1 if self.direct_routes else self.source_tile_m // self.tile_m
+        self.source_halves = self.source_tile_m // self.tile_m
         self.deterministic_output = bool(deterministic_output)
         if trellis_bits is not None and trellis_bits not in (2, 3, 4):
             raise ValueError(
@@ -143,14 +134,9 @@ class W4A8MaterializedPhase2Kernel:
         intermediate_tiles: cutlass.Int32,
         packed_output_tiles: cutlass.Int32,
         max_active_clusters: cutlass.Int32,
-        num_pairs: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        # Direct micro tasks are independent; grouped execution keeps its
-        # preplanned persistent grid.
         grid_z = max_active_clusters * Int32(2)
-        if cutlass.const_expr(self.direct_routes):
-            grid_z = num_pairs * packed_output_tiles * Int32(256 // self.tile_n)
         self.kernel(
             intermediate_u32,
             down_rp,
@@ -166,7 +152,6 @@ class W4A8MaterializedPhase2Kernel:
             trellis_lut,
             intermediate_tiles,
             packed_output_tiles,
-            num_pairs,
         ).launch(
             grid=(1, 1, grid_z),
             block=[self.threads_per_cta, 1, 1],
@@ -297,50 +282,31 @@ class W4A8MaterializedPhase2Kernel:
             self.tile_m
         )
 
-        if cutlass.const_expr(self.direct_routes):
-            # Broadcast the one real route row into the logical M16 operand.
-            if tid < Int32(8):
+        # Grouped source tiles retain the XOR row layout.
+        for i in cutlass.range_constexpr(
+            (self.tile_m * 8 + self.threads_per_cta - 1) // self.threads_per_cta
+        ):
+            idx = tid + Int32(i * self.threads_per_cta)
+            if idx < Int32(self.tile_m * 8):
+                row = idx >> Int32(3)
+                vec = idx & Int32(7)
+                physical_vec = vec ^ (row & Int32(7))
                 src_word = (
-                    Int64(physical_row_base) * Int64(words_per_row)
-                    + Int64(intermediate_slice) * Int64(32) + Int64(tid * 4)
+                    (physical_row_base + row) * words_per_row
+                    + intermediate_slice * Int32(32) + (vec << Int32(2))
                 )
                 cp_async4_shared_global(
-                    a_base + tid * Int32(16),
+                    a_base + row * Int32(self.tile_k) + (physical_vec << Int32(4)),
                     get_ptr_as_int64(intermediate_u32, src_word),
                 )
-            if tid == Int32(0):
-                sf_src = (
-                    Int64(rows_capacity) * Int64(words_per_row)
-                    + Int64(intermediate_slice) * Int64(rows_capacity)
-                    + Int64(physical_row_base)
-                )
-                cp_async_u32_shared_global(sfa_base, get_ptr_as_int64(intermediate_u32, sf_src))
-        else:
-            # Grouped source tiles retain the XOR row layout.
-            for i in cutlass.range_constexpr(
-                (self.tile_m * 8 + self.threads_per_cta - 1) // self.threads_per_cta
-            ):
-                idx = tid + Int32(i * self.threads_per_cta)
-                if idx < Int32(self.tile_m * 8):
-                    row = idx >> Int32(3)
-                    vec = idx & Int32(7)
-                    physical_vec = vec ^ (row & Int32(7))
-                    src_word = (
-                        (physical_row_base + row) * words_per_row
-                        + intermediate_slice * Int32(32) + (vec << Int32(2))
-                    )
-                    cp_async4_shared_global(
-                        a_base + row * Int32(self.tile_k) + (physical_vec << Int32(4)),
-                        get_ptr_as_int64(intermediate_u32, src_word),
-                    )
-            if tid < Int32(self.tile_m):
-                sf_src = (
-                    rows_capacity * words_per_row + intermediate_slice * rows_capacity
-                    + physical_row_base + tid
-                )
-                cp_async_u32_shared_global(
-                    sfa_base + (tid << Int32(2)), get_ptr_as_int64(intermediate_u32, sf_src),
-                )
+        if tid < Int32(self.tile_m):
+            sf_src = (
+                rows_capacity * words_per_row + intermediate_slice * rows_capacity
+                + physical_row_base + tid
+            )
+            cp_async_u32_shared_global(
+                sfa_base + (tid << Int32(2)), get_ptr_as_int64(intermediate_u32, sf_src),
+            )
 
         if cutlass.const_expr(self.w4a8_trellis):
             # Expert-major [E][K16][N16] trellis windows over the down
@@ -553,26 +519,19 @@ class W4A8MaterializedPhase2Kernel:
 
             asc = cute.make_rmem_tensor((m_blocks,), Uint32)
             for blk in cutlass.range_constexpr(m_blocks):
-                if cutlass.const_expr(self.direct_routes):
-                    asc[blk] = ld_shared_u32(sfa_base)
-                else:
-                    sf_row = Int32(blk * 16) + q + ((lane & Int32(1)) << Int32(3))
-                    asc[blk] = ld_shared_u32(sfa_base + (sf_row << Int32(2)))
+                sf_row = Int32(blk * 16) + q + ((lane & Int32(1)) << Int32(3))
+                asc[blk] = ld_shared_u32(sfa_base + (sf_row << Int32(2)))
 
             for kb in cutlass.range_constexpr(4):
                 u_phys = (Int32(kb * 2) + (c >> Int32(1))) ^ q
                 a_frag = cute.make_rmem_tensor((m_blocks, 4), Uint32)
                 for blk in cutlass.range_constexpr(m_blocks):
-                    if cutlass.const_expr(self.direct_routes):
-                        a0, a2 = ld_shared_v2_u32(a_base + Int32(kb * 32) + c * Int32(8))
-                        a1, a3 = a0, a2
-                    else:
-                        a_lo = (
-                            a_base + Int32(blk * 16 * self.tile_k) + (q << Int32(7))
-                            + (u_phys << Int32(4)) + ((c & Int32(1)) << Int32(3))
-                        )
-                        a0, a2 = ld_shared_v2_u32(a_lo)
-                        a1, a3 = ld_shared_v2_u32(a_lo + Int32(8 * self.tile_k))
+                    a_lo = (
+                        a_base + Int32(blk * 16 * self.tile_k) + (q << Int32(7))
+                        + (u_phys << Int32(4)) + ((c & Int32(1)) << Int32(3))
+                    )
+                    a0, a2 = ld_shared_v2_u32(a_lo)
+                    a1, a3 = ld_shared_v2_u32(a_lo + Int32(8 * self.tile_k))
                     a_frag[blk, 0] = a0
                     a_frag[blk, 1] = a1
                     a_frag[blk, 2] = a2
@@ -647,21 +606,6 @@ class W4A8MaterializedPhase2Kernel:
                                 bid_a=kb,
                                 bid_b=kb,
                             )
-                        elif cutlass.const_expr(self.deepseek_v41):
-                            # Match reference kernel.py:550-554: a fresh K32
-                            # contraction followed by FP32 accumulation.
-                            d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
-                                cutlass.Float32(0.0), cutlass.Float32(0.0),
-                                cutlass.Float32(0.0), cutlass.Float32(0.0),
-                                a_frag[blk, 0], a_frag[blk, 1],
-                                a_frag[blk, 2], a_frag[blk, 3],
-                                b0, b1, asc[blk], sfb_word,
-                                bid_a=kb, bid_b=kb,
-                            )
-                            d0 = fragment[0] + d0
-                            d1 = fragment[1] + d1
-                            d2 = fragment[2] + d2
-                            d3 = fragment[3] + d3
                         else:
                             d0, d1, d2, d3 = mxfp8_mma_m16n8k32_f32_e2m1(
                                 fragment[0],
@@ -709,12 +653,8 @@ class W4A8MaterializedPhase2Kernel:
                 row_hi = row_lo + Int32(8)
                 if row_lo < valid_rows:
                     physical_row = physical_row_base + row_lo
-                    tok = source_m_tile
-                    if cutlass.const_expr(not self.direct_routes):
-                        tok = token_map[physical_row].to(Int32)
-                    scale = down_scale
-                    if cutlass.const_expr(not self.deepseek_v41):
-                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
+                    tok = token_map[physical_row].to(Int32)
+                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         # The routing front-end stores the token-major pair
                         # index in token_map for deterministic specializations.
@@ -735,12 +675,8 @@ class W4A8MaterializedPhase2Kernel:
                         )
                 if row_hi < valid_rows:
                     physical_row = physical_row_base + row_hi
-                    tok = source_m_tile
-                    if cutlass.const_expr(not self.direct_routes):
-                        tok = token_map[physical_row].to(Int32)
-                    scale = down_scale
-                    if cutlass.const_expr(not self.deepseek_v41):
-                        scale = scale * token_weights[physical_row].to(cutlass.Float32)
+                    tok = token_map[physical_row].to(Int32)
+                    scale = down_scale * token_weights[physical_row].to(cutlass.Float32)
                     if cutlass.const_expr(self.deterministic_output):
                         st_global_u32(
                             get_ptr_as_int64(scatter_output, Int64(tok) * Int64(scatter_n) + Int64(col)),
@@ -776,7 +712,6 @@ class W4A8MaterializedPhase2Kernel:
         trellis_lut: cute.Tensor,
         intermediate_tiles: cutlass.Int32,
         packed_output_tiles: cutlass.Int32,
-        num_pairs: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         _, _, bidz = cute.arch.block_idx()
@@ -812,35 +747,22 @@ class W4A8MaterializedPhase2Kernel:
 
         rows_capacity = Int32(token_map.shape[0])
         output_tiles = packed_output_tiles * Int32(256 // self.tile_n)
-        if cutlass.const_expr(self.direct_routes):
-            task_tail = num_pairs * output_tiles
-        else:
-            num_experts = Int32(expert_tile_base.shape[0] - 1)
-            source_m_tiles = expert_tile_base[num_experts].to(Int32)
-            task_tail = source_m_tiles * Int32(self.source_halves) * output_tiles
+        num_experts = Int32(expert_tile_base.shape[0] - 1)
+        source_m_tiles = expert_tile_base[num_experts].to(Int32)
+        task_tail = source_m_tiles * Int32(self.source_halves) * output_tiles
         task_slot = Int32(bidz)
         while task_slot < task_tail:
             output_tile = task_slot % output_tiles
             source_half = task_slot // output_tiles
-            if cutlass.const_expr(self.direct_routes):
-                m_half = Int32(0)
-                source_m_tile = source_half
-                expert_idx = task_expert[source_m_tile].to(Int32)
-                valid_rows = Int32(1)
-                if expert_idx < Int32(0):
-                    valid_rows = Int32(0)
-                if expert_idx >= Int32(down_alpha.shape[0]):
-                    valid_rows = Int32(0)
-            else:
-                m_half = source_half % Int32(self.source_halves)
-                source_m_tile = source_half // Int32(self.source_halves)
-                phase1_meta = source_m_tile * intermediate_tiles
-                expert_idx = task_expert[phase1_meta].to(Int32)
-                valid_rows = task_valid_rows[phase1_meta].to(Int32) - m_half * Int32(
-                    self.tile_m
-                )
-                valid_rows = cutlass.min(valid_rows, Int32(self.tile_m))
-                valid_rows = cutlass.max(valid_rows, Int32(0))
+            m_half = source_half % Int32(self.source_halves)
+            source_m_tile = source_half // Int32(self.source_halves)
+            phase1_meta = source_m_tile * intermediate_tiles
+            expert_idx = task_expert[phase1_meta].to(Int32)
+            valid_rows = task_valid_rows[phase1_meta].to(Int32) - m_half * Int32(
+                self.tile_m
+            )
+            valid_rows = cutlass.min(valid_rows, Int32(self.tile_m))
+            valid_rows = cutlass.max(valid_rows, Int32(0))
             if valid_rows > Int32(0):
                 self._run_task(
                     intermediate_u32,
@@ -864,12 +786,6 @@ class W4A8MaterializedPhase2Kernel:
                     intermediate_tiles,
                     packed_output_tiles,
                 )
-            elif cutlass.const_expr(self.direct_routes):
-                if tid < Int32(self.tile_n):
-                    scatter_output[
-                        source_m_tile,
-                        output_tile * Int32(self.tile_n) + tid,
-                    ] = cutlass.BFloat16(0.0)
             task_slot += Int32(gdimz)
 
 

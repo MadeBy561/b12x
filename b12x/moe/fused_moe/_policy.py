@@ -11,6 +11,8 @@ from b12x.policy import (
     DeviceIdentity,
     FrozenMapping,
 )
+
+
 @dataclass(frozen=True)
 class MoeDecodeQuery:
     quant_mode: str
@@ -22,12 +24,10 @@ class MoeDecodeQuery:
     top_k: int
     num_tokens: int
     routed_rows: int
-    numerical_recipe: str = "default"
 
     def profile_fields(self) -> dict[str, object]:
         return {
             "activation": self.activation,
-            "numerical_recipe": self.numerical_recipe,
             "hidden_size": self.hidden_size,
             "intermediate_size": self.intermediate_size,
             "num_experts": self.num_experts,
@@ -99,45 +99,22 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
-    if query.numerical_recipe not in {"default", "deepseek_v41"}:
-        raise ValueError(f"unsupported numerical_recipe {query.numerical_recipe!r}")
-    if query.numerical_recipe == "deepseek_v41":
-        if query.quant_mode != "w4a8_mx" or query.source_format != "fp4_e8m0_k32" or query.activation != "silu":
-            raise ValueError("deepseek_v41 requires MXFP4 A8 SiLU")
-        dynamic_v41 = (
-            config.backend,
-            config.route_planner,
-            config.dynamic_tile_m,
-            config.dynamic_route_mode,
-        ) == ("dynamic", "internal", 64, "grouped")
-        micro_v41 = (
-            config.backend,
-            config.route_planner,
-            config.dynamic_tile_m,
-            config.dynamic_route_mode,
-        ) == ("micro", "internal", None, None)
-        if micro_v41:
-            if not 1 <= query.num_tokens <= 8:
-                raise ValueError(
-                    "deepseek_v41 micro execution requires capacity from 1 to 8"
-                )
-            if query.hidden_size % 256 or query.intermediate_size % 64:
-                raise ValueError(
-                    "deepseek_v41 micro execution requires K divisible by 256 "
-                    "and N divisible by 64"
-                )
-        elif not dynamic_v41:
-            raise ValueError(
-                "deepseek_v41 requires materialized M64 grouped dynamic "
-                "or eligible micro execution"
-            )
     if query.quant_mode == "nvfp4_auto":
         if query.source_format != "modelopt_nvfp4" or query.activation != "silu":
-            raise ValueError("automatic MoE precision requires ModelOpt NVFP4 weights and SiLU")
-        if config.backend == "w4a16" and config.w4a16_route_mode == "direct" and query.num_tokens > 8:
-            raise ValueError("source-native A16 direct decode requires capacity at most 8")
+            raise ValueError(
+                "automatic MoE precision requires ModelOpt NVFP4 weights and SiLU"
+            )
+        if (
+            config.backend == "w4a16"
+            and config.w4a16_route_mode == "direct"
+            and query.num_tokens > 8
+        ):
+            raise ValueError(
+                "source-native A16 direct decode requires capacity at most 8"
+            )
         query = replace(
-            query, quant_mode="w4a16" if config.backend == "w4a16" else "nvfp4",
+            query,
+            quant_mode="w4a16" if config.backend == "w4a16" else "nvfp4",
         )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
@@ -192,12 +169,11 @@ def make_moe_decode_policy(
 ) -> ComponentPolicy[MoeDecodeQuery, MoeDecodeConfig]:
     return ComponentPolicy(
         component_id=MOE_DECODE,
-        query_schema_version=5,
+        query_schema_version=6,
         config_schema_version=3,
         query_fields=frozenset(
             {
                 "activation",
-                "numerical_recipe",
                 "hidden_size",
                 "intermediate_size",
                 "num_experts",

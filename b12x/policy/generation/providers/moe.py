@@ -38,7 +38,6 @@ _QUERY_FIELDS = (
     "quant_mode",
     "source_format",
     "activation",
-    "numerical_recipe",
     "num_experts",
     "hidden_size",
     "intermediate_size",
@@ -53,7 +52,7 @@ _TRITON_ROUTE_MAX_ROWS = 256
 _PREFILL_CAPACITY_TOKENS = frozenset(COMMON_PREFILL_TOKEN_CAPACITIES)
 _QUALIFICATION_TOKENS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 32, 128})
 _QUALIFICATION_PATTERNS = frozenset({"balanced", "hot"})
-_MOE_CANDIDATE_CONTRACT_VERSION = 13
+_MOE_CANDIDATE_CONTRACT_VERSION = 14
 _MOE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
@@ -208,21 +207,15 @@ def _config_covers_query(
         top_k=top_k,
         num_tokens=num_tokens,
         routed_rows=routed_rows,
-        numerical_recipe=str(query.get("numerical_recipe", "default")),
     )
     try:
         parsed_config = MoeDecodeConfig.from_profile(FrozenMapping(config))
         validate_moe_decode_config(policy_query, parsed_config, None)
     except (TypeError, ValueError):
         return False
-    if config["backend"] == "micro" and not _impl._policy_micro_supported(
-        policy_query
-    ):
+    if config["backend"] == "micro" and not _impl._policy_micro_supported(policy_query):
         return False
-    if (
-        config["backend"] == "dynamic"
-        and config.get("dynamic_route_mode") == "direct"
-    ):
+    if config["backend"] == "dynamic" and config.get("dynamic_route_mode") == "direct":
         try:
             _impl._dynamic_direct_routing_selected(
                 route_mode="direct",
@@ -511,7 +504,7 @@ class MoeDecodeGenerator:
     """Generate a broad MoE planner from staged per-geometry GPU races."""
 
     component_id = MOE_DECODE
-    query_schema_version = 5
+    query_schema_version = 6
     config_schema_version = 3
 
     def __init__(
@@ -665,9 +658,7 @@ class MoeDecodeGenerator:
             cached_measurements = tuple(
                 MoeMeasurement.from_dict(item) for item in raw_measurements
             )
-            measured_ids = [
-                item.candidate.candidate_id for item in cached_measurements
-            ]
+            measured_ids = [item.candidate.candidate_id for item in cached_measurements]
             if measured_ids != cached_ids:
                 raise ValueError(
                     "MoE race checkpoint candidate IDs must match its measurements"
@@ -971,9 +962,14 @@ class MoeDecodeGenerator:
                 raise RuntimeError(
                     f"no route-robust MoE candidate for {_query_dict(case)}"
                 )
-            _, winner = min(robust, key=lambda item: (
-                item[0], item[1].config["backend"] != "w4a16", item[1].candidate_id,
-            ))
+            _, winner = min(
+                robust,
+                key=lambda item: (
+                    item[0],
+                    item[1].config["backend"] != "w4a16",
+                    item[1].candidate_id,
+                ),
+            )
             if grouped[0][0].geometry.recipe.quant_mode == "nvfp4_auto":
                 from .moe_precision import select_winner
 
@@ -1007,29 +1003,44 @@ class MoeDecodeGenerator:
         measured_records = tuple(records)
         token_values = {case.num_tokens for case in self._cases}
         precision_records = tuple(
-            record for record in measured_records if record.query["quant_mode"] == "nvfp4_auto"
+            record
+            for record in measured_records
+            if record.query["quant_mode"] == "nvfp4_auto"
         )
         fixed_precision_records = tuple(
-            record for record in measured_records if record.query["quant_mode"] != "nvfp4_auto"
+            record
+            for record in measured_records
+            if record.query["quant_mode"] != "nvfp4_auto"
         )
         records = list(precision_records)
         fixed_planner = None
         if fixed_precision_records:
             fixed_records = _synthesize_token_capacity_coverage(
-                fixed_precision_records, minimum=min(token_values), maximum=max(token_values),
+                fixed_precision_records,
+                minimum=min(token_values),
+                maximum=max(token_values),
             )
             records.extend(fixed_records)
             fixed_planner = build_axis_tree(
-                fixed_records, field_order=_QUERY_FIELDS,
+                fixed_records,
+                field_order=_QUERY_FIELDS,
                 range_fields=frozenset({"num_tokens"}),
-                nearest_range_bounds={"num_tokens": (min(token_values), max(token_values))},
+                nearest_range_bounds={
+                    "num_tokens": (min(token_values), max(token_values))
+                },
             )
         if precision_records:
             planner = ExactDecisionNode(
                 field="quant_mode",
-                branches=(("nvfp4_auto", build_axis_tree(
-                    precision_records, field_order=_QUERY_FIELDS,
-                )),),
+                branches=(
+                    (
+                        "nvfp4_auto",
+                        build_axis_tree(
+                            precision_records,
+                            field_order=_QUERY_FIELDS,
+                        ),
+                    ),
+                ),
                 default=fixed_planner,
             )
         else:

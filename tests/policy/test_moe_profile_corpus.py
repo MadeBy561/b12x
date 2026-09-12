@@ -46,23 +46,30 @@ def test_common_models_expand_declared_parallel_degrees() -> None:
                     assert (model.model_id, recipe.recipe_id, tp_size) in covered
 
 
-def test_deepseek_v41_flash_tp4_partitions_whole_experts() -> None:
-    ((geometry, alias),) = (
-        (geometry, alias)
+def test_deepseek_v41_tp4_shards_all_experts_and_pads_native_width() -> None:
+    aliases = {
+        alias.model_id: (geometry, alias)
         for geometry in expand_physical_geometries()
         for alias in geometry.aliases
-        if alias.model_id == "deepseek-v4.1-flash"
+        if alias.model_id in {"deepseek-v4.1-flash", "deepseek-v4.1-dspark"}
         and alias.tp_size == 4
-        and geometry.recipe.recipe_id == "deepseek-v41-mxfp4"
-    )
+        and geometry.recipe.recipe_id == "e8m0-w4a8"
+    }
 
-    assert geometry.num_experts == 96
-    assert geometry.hidden_size == 5120
-    assert geometry.intermediate_size == 2304
-    assert alias.logical_intermediate_sizes == (2304,)
-    assert alias.native_top_k == 6
-    assert geometry.recipe.quant_mode == "w4a8_mx"
-    assert geometry.recipe.numerical_recipe == "deepseek_v41"
+    for model_id, expert_count, native_top_k in (
+        ("deepseek-v4.1-flash", 384, 6),
+        ("deepseek-v4.1-dspark", 128, 3),
+    ):
+        geometry, alias = aliases[model_id]
+        assert geometry.num_experts == expert_count
+        assert geometry.hidden_size == 5120
+        assert geometry.intermediate_size == 640
+        assert alias.global_intermediate_size == 2304
+        assert alias.logical_intermediate_sizes == (576,)
+        assert alias.physical_intermediate_size == 640
+        assert alias.padding_per_tp_group == 256
+        assert alias.native_top_k == native_top_k
+        assert geometry.recipe.quant_mode == "w4a8_mx"
 
 
 def test_unaligned_three_wide_shard_is_padded_instead_of_rejected() -> None:

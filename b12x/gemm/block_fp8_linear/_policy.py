@@ -95,8 +95,8 @@ def _validate(
         raise ValueError("unsupported block-FP8 MMA tile")
     if query.output_dtype not in ("bfloat16", "float16"):
         raise ValueError(f"unsupported output dtype {query.output_dtype!r}")
-    if query.in_features % 128:
-        raise ValueError("block-FP8 in_features must be a multiple of 128")
+    if query.in_features <= 0 or query.in_features % 32:
+        raise ValueError("block-FP8 in_features must be a positive multiple of 32")
     if query.weight_block_size not in (32, 128):
         raise ValueError("block-FP8 weight_block_size must be 32 or 128")
 

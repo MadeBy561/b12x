@@ -44,13 +44,12 @@ def test_v41_tp_shards_keep_global_route_ids_and_unbiased_weights():
     x = torch.tensor([[1., 0.], [-1., 0.]])
     bias = torch.tensor([0., 10., 0., 0., 0., 0., 0., 0.])
     weights = SimpleNamespace(
-        spec=spec, numerical_recipe="deepseek_v41", gate_weight=gate,
-        gate_temperature=2., gate_score_func="sqrtsoftplus", gate_bias=bias,
+        spec=spec, gate_weight=gate, gate_score_func="sqrtsoftplus", gate_bias=bias,
         gate_tid2eid=None, gate_norm_topk_prob=True, gate_route_scale=1.5,
     )
-    unbiased = torch.nn.functional.softplus(x @ gate.T / 2.).sqrt()
+    original_scores = torch.nn.functional.softplus(x @ gate.T).sqrt()
     expected_ids = torch.tensor([[1, 7], [1, 0]])
-    expected_weights = unbiased.gather(1, expected_ids)
+    expected_weights = original_scores.gather(1, expected_ids)
     expected_weights *= 1.5 / expected_weights.sum(-1, keepdim=True)
     for rank in range(4):
         weights.spec = replace(spec, tp_rank=rank)

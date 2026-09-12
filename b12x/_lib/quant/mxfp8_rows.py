@@ -61,12 +61,13 @@ class _MXFP8RowsQuantLaunch:
         scale_rows_ptr: cute.Pointer,
         scale_mma_ptr: cute.Pointer,
         m: Int32,
+        source_k: Int32,
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
         source = cute.make_tensor(
             source_ptr,
-            cute.make_ordered_layout((m, self._k), order=(1, 0)),
+            cute.make_ordered_layout((m, source_k), order=(1, 0)),
         )
         values_u32 = cute.make_tensor(
             values_ptr,
@@ -80,7 +81,7 @@ class _MXFP8RowsQuantLaunch:
             scale_mma_ptr,
             cute.make_layout((max(512, ((self._groups_k + 3) // 4) * 512),)),
         )
-        self.kernel(source, values_u32, scale_rows, scale_mma, m).launch(
+        self.kernel(source, values_u32, scale_rows, scale_mma, m, source_k).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
             cluster=(1, 1, 1),
@@ -95,6 +96,7 @@ class _MXFP8RowsQuantLaunch:
         scale_rows: cute.Tensor,
         scale_mma: cute.Tensor,
         m: Int32,
+        source_k: Int32,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -116,8 +118,11 @@ class _MXFP8RowsQuantLaunch:
                     values = cute.make_rmem_tensor((8,), cutlass.Float32)
                     k0 = group * Int32(32) + lane8 * Int32(8)
                     for elem in cutlass.range_constexpr(8):
-                        values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
-
+                        values[elem] = cutlass.Float32(0.0)
+                        if k0 + Int32(elem) < source_k:
+                            values[elem] = cutlass.Float32(
+                                source[row, k0 + Int32(elem)]
+                            )
                     max_abs = fabs_f32(values[0])
                     for elem in cutlass.range_constexpr(1, 8):
                         max_abs = fmax_f32(max_abs, fabs_f32(values[elem]))
@@ -129,6 +134,8 @@ class _MXFP8RowsQuantLaunch:
 
                     if cutlass.const_expr(self._min_amax > 0.0):
                         max_abs = fmax_f32(max_abs, cutlass.Float32(self._min_amax))
+                    if k0 >= source_k:
+                        max_abs = cutlass.Float32(0.0)
                     _, scale_byte = pow2_ceil_ue8m0(
                         max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
@@ -188,16 +195,26 @@ class _MXFP8RowsQuantLaunch:
                             )
                             tile = Int32(16)
                         base = k0 + tile + (r << Int32(1))
-                        values[0] = cutlass.Float32(source[row, base])
-                        values[1] = cutlass.Float32(source[row, base + Int32(1)])
-                        values[2] = cutlass.Float32(source[row, base + Int32(8)])
-                        values[3] = cutlass.Float32(source[row, base + Int32(9)])
+                        values[0] = cutlass.Float32(0.0)
+                        values[1] = cutlass.Float32(0.0)
+                        values[2] = cutlass.Float32(0.0)
+                        values[3] = cutlass.Float32(0.0)
+                        if base < source_k:
+                            values[0] = cutlass.Float32(source[row, base])
+                        if base + Int32(1) < source_k:
+                            values[1] = cutlass.Float32(source[row, base + Int32(1)])
+                        if base + Int32(8) < source_k:
+                            values[2] = cutlass.Float32(source[row, base + Int32(8)])
+                        if base + Int32(9) < source_k:
+                            values[3] = cutlass.Float32(source[row, base + Int32(9)])
                     else:
                         k0 += lane4 * Int32(4)
                         for elem in cutlass.range_constexpr(4):
-                            values[elem] = cutlass.Float32(
-                                source[row, k0 + Int32(elem)]
-                            )
+                            values[elem] = cutlass.Float32(0.0)
+                            if k0 + Int32(elem) < source_k:
+                                values[elem] = cutlass.Float32(
+                                    source[row, k0 + Int32(elem)]
+                                )
 
                     max_abs = fabs_f32(values[0])
                     for elem in cutlass.range_constexpr(1, 4):
@@ -210,6 +227,8 @@ class _MXFP8RowsQuantLaunch:
 
                     if cutlass.const_expr(self._min_amax > 0.0):
                         max_abs = fmax_f32(max_abs, cutlass.Float32(self._min_amax))
+                    if k0 >= source_k:
+                        max_abs = cutlass.Float32(0.0)
                     _, scale_byte = pow2_ceil_ue8m0(
                         max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
@@ -233,17 +252,18 @@ class _MXFP8RowsQuantLaunch:
             while block < total_blocks:
                 row = block // Int32(self._groups_k)
                 group = block % Int32(self._groups_k)
-                values = cute.make_rmem_tensor((32,), cutlass.Float32)
                 k0 = group * Int32(32)
+                values = cute.make_rmem_tensor((32,), cutlass.Float32)
                 for elem in cutlass.range_constexpr(32):
-                    values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
-
+                    values[elem] = cutlass.Float32(0.0)
+                    if k0 + Int32(elem) < source_k:
+                        values[elem] = cutlass.Float32(source[row, k0 + Int32(elem)])
                 max_abs = max_abs_32(values)
                 if cutlass.const_expr(self._min_amax > 0.0):
                     max_abs = fmax_f32(max_abs, cutlass.Float32(self._min_amax))
+                if k0 >= source_k:
+                    max_abs = cutlass.Float32(0.0)
                 payload, scale_byte = quantize_block_fp8_mx(values, max_abs)
-                if max_abs == cutlass.Float32(0.0):
-                    scale_byte = Uint32(127)
 
                 word0 = group * Int32(8)
                 for word in cutlass.range_constexpr(8):
@@ -347,6 +367,7 @@ def _get_compiled_mxfp8_rows_quant(
         make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         1,
         1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "gemm.mxfp8_quant_cute",
@@ -401,6 +422,7 @@ def _get_compiled_mxfp8_rows_quant(
                 assumed_align=16,
             ),
             int(source.shape[0]),
+            int(source.shape[1]),
             grid_x,
             current_cuda_stream(),
         )
@@ -417,6 +439,7 @@ def quantize_mxfp8_rows_cute(
     value_order: str = "linear",
     expected_m: int | None = None,
     min_amax: float = 0.0,
+    physical_k: int | None = None,
 ) -> None:
     """Quantize contiguous BF16 rows into dense-GEMM MXFP8 layouts.
 
@@ -443,8 +466,14 @@ def quantize_mxfp8_rows_cute(
         threads = 128
     else:
         subgroup_width = _WARP_SUBGROUP_WIDTH
+    physical_k = int(source.shape[1]) if physical_k is None else int(physical_k)
+    if physical_k < int(source.shape[1]) or physical_k % 32:
+        raise ValueError(
+            "MXFP8 CuTe quantizer physical K must be a multiple of 32 no smaller "
+            f"than source K, got physical={physical_k}, source={int(source.shape[1])}"
+        )
     _get_compiled_mxfp8_rows_quant(
-        int(source.shape[1]),
+        physical_k,
         source.dtype,
         subgroup_width,
         threads,

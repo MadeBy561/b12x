@@ -165,15 +165,14 @@ def _nvfp4_materialized_env_refresh() -> None:
     Called once at import and again by tests that change the environment
     variable at runtime.
     """
-    global _NVFP4_MATERIALIZED_ENV_RAW, _NVFP4_MATERIALIZED_ENV_EXPLICIT, _NVFP4_MATERIALIZED_ENV_IS_TRUE
-    _NVFP4_MATERIALIZED_ENV_RAW = raw = os.environ.get(
-        _DYNAMIC_NVFP4_MATERIALIZED_ENV
-    )
+    global \
+        _NVFP4_MATERIALIZED_ENV_RAW, \
+        _NVFP4_MATERIALIZED_ENV_EXPLICIT, \
+        _NVFP4_MATERIALIZED_ENV_IS_TRUE
+    _NVFP4_MATERIALIZED_ENV_RAW = raw = os.environ.get(_DYNAMIC_NVFP4_MATERIALIZED_ENV)
     _NVFP4_MATERIALIZED_ENV_EXPLICIT = raw is not None
     _NVFP4_MATERIALIZED_ENV_IS_TRUE = (
-        raw not in ("", "0", "false", "False")
-        if raw is not None
-        else False
+        raw not in ("", "0", "false", "False") if raw is not None else False
     )
 
 
@@ -610,11 +609,9 @@ class B12XFP4ExpertWeights:
             scales = self.a1_gscale.detach().reshape(-1)
             if scales.numel() > 1:
                 uniform = bool(
-                    (
-                        torch.isfinite(scales)
-                        & (scales > 0)
-                        & (scales == scales[0])
-                    ).all().item()
+                    (torch.isfinite(scales) & (scales > 0) & (scales == scales[0]))
+                    .all()
+                    .item()
                 )
                 object.__setattr__(self, "_uniform_a1_scale", uniform)
                 if not torch.is_inference(self.a1_gscale):
@@ -835,7 +832,6 @@ class TPMoEPlan:
     swiglu_limit: float | None = None
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
-    numerical_recipe: str = "default"
     state_E: int
     weight_E: int
     routed_rows: int
@@ -876,10 +872,6 @@ class TPMoEScratchCaps:
     policy_context: PolicyContext | None = None
     frozen: bool = True
 
-    @property
-    def numerical_recipe(self) -> str:
-        return self.weight_plan.numerical_recipe
-
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
@@ -900,13 +892,6 @@ class TPMoEScratchCaps:
                 f"quant_mode={quant_mode!r} is absent from the weight plan"
             )
         object.__setattr__(self, "quant_mode", quant_mode)
-        if self.numerical_recipe == "deepseek_v41":
-            if self.apply_router_weight_on_input or self.deterministic_output is False:
-                raise ValueError("deepseek_v41 weights routes before FC2 and requires FP32 route reduction")
-            if self.swiglu_limit not in (None, 10.0):
-                raise ValueError("deepseek_v41 requires swiglu_limit=10")
-            object.__setattr__(self, "swiglu_limit", 10.0)
-            object.__setattr__(self, "deterministic_output", True)
         if self.core_token_counts is not None:
             object.__setattr__(
                 self,
@@ -1205,14 +1190,6 @@ class TPMoEFP4Binding:
     topk_sum_launch: object | None = None
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            self.execution_plan is not None
-            and self.execution_plan.numerical_recipe == "deepseek_v41"
-            and self.topk_weights.dtype != torch.float32
-        ):
-            raise TypeError("DeepSeek V4.1 requires FP32 topk_weights")
 
     def run(self) -> torch.Tensor:
         return b12x_moe_fp4(binding=self)
@@ -2266,7 +2243,6 @@ def clear_tp_moe_caches() -> None:
     from b12x.moe._shared.kernels.w4a16.kernel import (
         clear_w4a16_kernel_cache,
     )
-    from b12x.moe._shared.kernels.w4a8_v41_micro import _compiled_direct_v41
 
     global _LAST_WEIGHTS
     global _LAST_KERNEL
@@ -2276,7 +2252,6 @@ def clear_tp_moe_caches() -> None:
     global _DYNAMIC_SWAP_AB_OVERRIDE
     _WEIGHT_CACHE.clear()
     clear_w4a16_kernel_cache()
-    _compiled_direct_v41.cache_clear()
     _MICRO_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
     _MAC_CACHE.clear()
@@ -2545,14 +2520,8 @@ def _w4a8_mx_micro_supported(
     weight_E: int,
     activation: str,
     source_format: str,
-    numerical_recipe: str = "default",
 ) -> bool:
     source_format = _canonical_moe_policy_source_format(source_format)
-    if numerical_recipe == "deepseek_v41":
-        return (
-            1 <= num_tokens <= 8 and k % 256 == 0 and n % 64 == 0
-            and activation == "silu" and source_format == "fp4_e8m0_k32"
-        )
     if source_format == "b12x_trellis":
         return bool(
             num_tokens <= _MICRO_MAX_TOKENS
@@ -2585,7 +2554,6 @@ def _w4a8_mx_micro_preferred(
         weight_E=query.num_experts,
         activation=query.activation,
         source_format=query.source_format,
-        numerical_recipe=query.numerical_recipe,
     ):
         return False
     capability = (
@@ -2616,7 +2584,6 @@ def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
             weight_E=query.num_experts,
             activation=query.activation,
             source_format=query.source_format,
-            numerical_recipe=query.numerical_recipe,
         )
     return _band_runs_direct_micro(
         num_tokens=query.num_tokens,
@@ -2662,9 +2629,11 @@ def _heuristic_dynamic_route_mode(
 
 def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
     weight_layout = (
-        "modelopt" if query.quant_mode == "nvfp4_auto"
+        "modelopt"
+        if query.quant_mode == "nvfp4_auto"
         else _w4a16_weight_layout_for_source(
-            query.source_format, intermediate_size=query.intermediate_size,
+            query.source_format,
+            intermediate_size=query.intermediate_size,
         )
     )
     if weight_layout == "trellis_t256":
@@ -2726,11 +2695,7 @@ def _heuristic_w4a16_route_mode(
     if query.num_tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
         return "direct"
     assert query.num_tokens <= _TC_DECODE_MAX_M
-    sms = (
-        device.sm_count
-        if device is not None
-        else get_num_sm(torch.device("cuda"))
-    )
+    sms = device.sm_count if device is not None else get_num_sm(torch.device("cuda"))
     return (
         "direct"
         if _w4a16_tc_decode_preferred(
@@ -2747,15 +2712,6 @@ def _heuristic_moe_decode_config(
     query: MoeDecodeQuery,
     device: DeviceIdentity | None,
 ) -> MoeDecodeConfig:
-    if query.numerical_recipe == "deepseek_v41":
-        if _policy_micro_supported(query):
-            return MoeDecodeConfig(
-                backend="micro", route_planner="internal", max_active_clusters=None,
-            )
-        return MoeDecodeConfig(
-            backend="dynamic", route_planner="internal", max_active_clusters=None,
-            dynamic_tile_m=64, dynamic_route_mode="grouped",
-        )
     if query.quant_mode == "nvfp4_auto":
         if (
             device is not None
@@ -2764,8 +2720,10 @@ def _heuristic_moe_decode_config(
             and _w4a16_direct_routing_supported(query)
         ):
             return MoeDecodeConfig(
-                backend="w4a16", route_planner="internal",
-                max_active_clusters=None, w4a16_route_mode="direct",
+                backend="w4a16",
+                route_planner="internal",
+                max_active_clusters=None,
+                w4a16_route_mode="direct",
             )
         return _heuristic_moe_decode_config(replace(query, quant_mode="nvfp4"), device)
     if query.quant_mode == "w4a16":
@@ -2780,11 +2738,7 @@ def _heuristic_moe_decode_config(
     if query.quant_mode == "w6a8_mx":
         backend = "dynamic"
     elif query.quant_mode == "w4a8_mx":
-        backend = (
-            "micro"
-            if _w4a8_mx_micro_preferred(query, device)
-            else "dynamic"
-        )
+        backend = "micro" if _w4a8_mx_micro_preferred(query, device) else "dynamic"
     else:
         backend = select_tp_moe_backend(
             num_tokens=query.num_tokens,
@@ -2844,7 +2798,6 @@ def _resolve_moe_decode_policy(
     quant_mode: str,
     source_format: str = "modelopt_nvfp4",
     context: PolicyContext | None = None,
-    numerical_recipe: str = "default",
 ) -> PolicyResolution[MoeDecodeConfig]:
     query = MoeDecodeQuery(
         quant_mode=_normalize_quant_mode(quant_mode),
@@ -2856,7 +2809,6 @@ def _resolve_moe_decode_policy(
         top_k=int(num_topk),
         num_tokens=int(num_tokens),
         routed_rows=int(num_tokens) * int(num_topk),
-        numerical_recipe=numerical_recipe,
     )
     context = context or _current_moe_policy_context()
     if "B12X_MICRO_DYNAMIC_CUTOVER_PAIRS" in os.environ:
@@ -2897,7 +2849,9 @@ def _resolve_moe_decode_policy(
         and resolution.config.w4a16_route_mode == "direct"
         and not _w4a16_direct_routing_supported(query)
     ):
-        message = "MoE decode policy selected W4A16 direct routing for an unsupported query"
+        message = (
+            "MoE decode policy selected W4A16 direct routing for an unsupported query"
+        )
         if resolution.source is PolicySource.PREPLANNED:
             raise InvalidPreplannedPolicyError(message)
         raise ValueError(message)
@@ -3062,12 +3016,6 @@ def _build_tp_moe_fp4_binding_from_views(
             f"scratch plan quant_mode={plan.quant_mode!r} cannot bind "
             f"quant_mode={quant_mode!r}"
         )
-    if experts.plan.numerical_recipe != execution_plan.numerical_recipe:
-        raise ValueError("expert and execution numerical recipes differ")
-    if execution_plan.numerical_recipe == "deepseek_v41":
-        if apply_router_weight_on_input:
-            raise ValueError("deepseek_v41 applies route weights before FC2, not FC1")
-        swiglu_limit = 10.0
     plan_activation = activation
     if quant_mode != "w4a16":
         plan_activation = _get_activation_kernel_spec(
@@ -3269,11 +3217,13 @@ def _build_tp_moe_fp4_binding_from_views(
         # caller's scratch by the run-time refresh before their consumer.
         input_gs = (
             experts.a1_gscale.view(plan.weight_E)
-            if direct_scales else tensors["input_gs"]
+            if direct_scales
+            else tensors["input_gs"]
         )
         down_input_scale = (
             experts.a2_gscale.view(plan.weight_E)
-            if direct_scales else tensors["down_input_scale"]
+            if direct_scales
+            else tensors["down_input_scale"]
         )
         view_kwargs = _packed_input_binding_views(
             packed_input=tensors["packed_input"],
@@ -3368,7 +3318,6 @@ def _plan_core_workspace(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
-    numerical_recipe: str = "default",
 ) -> _TPCoreWorkspacePlan:
     source_format = _normalize_fp4_source_format(source_format)
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
@@ -3837,13 +3786,6 @@ def _plan_core_workspace(
                     direct_micro_tokens * num_topk * (n // 2)
                     + direct_micro_tokens * num_topk * (n // 128) * 257,
                 )
-            if numerical_recipe == "deepseek_v41":
-                from b12x.moe._shared.kernels.w4a8_v41_micro import micro_scratch_nbytes
-
-                micro_intermediate_elements = max(
-                    micro_intermediate_elements,
-                    (micro_scratch_nbytes(direct_micro_tokens, k, n, num_topk) + 3) // 4,
-                )
         if direct_micro_candidate:
             fc2_n_chunks = (n // 2 + 127) // 128
             micro_intermediate_elements = max(
@@ -3991,19 +3933,23 @@ def _plan_core_workspace(
                 n=dynamic_kernel_n,
             ),
         )
-    elif quant_mode == "nvfp4" and _nvfp4_dynamic_dense_candidate(
-        quant_mode=quant_mode,
-        activation=activation,
-        routed_rows=routed_rows,
-        num_experts=weight_E,
-        k=k,
-        n=n,
-        deterministic_output=deterministic_output,
-        planned_tile_m=dynamic_tile_m,
-    ) and (
-        _NVFP4_MATERIALIZED_ENV_IS_TRUE
-        if _NVFP4_MATERIALIZED_ENV_EXPLICIT
-        else True
+    elif (
+        quant_mode == "nvfp4"
+        and _nvfp4_dynamic_dense_candidate(
+            quant_mode=quant_mode,
+            activation=activation,
+            routed_rows=routed_rows,
+            num_experts=weight_E,
+            k=k,
+            n=n,
+            deterministic_output=deterministic_output,
+            planned_tile_m=dynamic_tile_m,
+        )
+        and (
+            _NVFP4_MATERIALIZED_ENV_IS_TRUE
+            if _NVFP4_MATERIALIZED_ENV_EXPLICIT
+            else True
+        )
     ):
         materialized_intermediate_bytes = max(
             16,
@@ -4371,7 +4317,6 @@ def _alloc_workspace(
     input_scales_static: bool,
     deterministic_output: bool = False,
     activation: str = "silu",
-    numerical_recipe: str = "default",
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
@@ -4397,7 +4342,6 @@ def _alloc_workspace(
         max_rows=max_rows,
         deterministic_output=deterministic_output,
         activation=activation,
-        numerical_recipe=numerical_recipe,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -4480,9 +4424,9 @@ def _split_gated_nvfp4_scale_views(
         logical_half = logical_u8[
             :, row_begin : row_begin + n, :cols_blocks
         ].contiguous()
-        storage = swizzle_block_scale(
-            logical_half.view(torch.float8_e4m3fn)
-        ).view(torch.uint8)
+        storage = swizzle_block_scale(logical_half.view(torch.float8_e4m3fn)).view(
+            torch.uint8
+        )
         return as_grouped_scale_view(storage, n, k)
 
     return make_view(0), make_view(n)
@@ -4528,9 +4472,9 @@ def _pad_nvfp4_down_for_tma(
         (logical_scale.shape[0], k, n_padded // _NVFP4_BLOCK_SIZE)
     )
     padded_scale[:, :, : n // _NVFP4_BLOCK_SIZE].copy_(logical_scale)
-    scale_storage = swizzle_block_scale(
-        padded_scale.view(torch.float8_e4m3fn)
-    ).view(torch.uint8)
+    scale_storage = swizzle_block_scale(padded_scale.view(torch.float8_e4m3fn)).view(
+        torch.uint8
+    )
     return (
         padded_weight.permute(1, 2, 0),
         as_grouped_scale_view(scale_storage, k, n_padded),
@@ -4810,6 +4754,7 @@ def _e8m0_scale_to_grid_kernel(
         mask=mask,
     )
 
+
 @triton.jit
 def _qweight_to_w4a8_n64_kernel(
     q,
@@ -4944,6 +4889,7 @@ def _grid_to_w4a8_n64_sfb_kernel(
         other=0,
     )
     tl.store(dst + idx, value, mask=mask)
+
 
 @triton.jit
 def _grid_to_w4a8_sfb_kernel(
@@ -5276,12 +5222,7 @@ def _logical_weight_to_w4a8_n64_inplace(
     size_k = int(size_k)
     size_n = int(size_n)
     group_rows = size_n if group_rows is None else int(group_rows)
-    if (
-        size_n % 64
-        or size_k % 64
-        or group_rows % 64
-        or size_n % group_rows
-    ):
+    if size_n % 64 or size_k % 64 or group_rows % 64 or size_n % group_rows:
         raise ValueError(
             "exact W4A8 repack requires N, K, and group rows divisible by 64 "
             f"with whole row groups; got N={size_n}, K={size_k}, "
@@ -5653,12 +5594,7 @@ def _e8m0_scale_to_w4a8_n64_sfb_inplace(
     rows = int(rows)
     k_dim = int(k_dim)
     group_rows = rows if group_rows is None else int(group_rows)
-    if (
-        rows % 64
-        or k_dim % 64
-        or group_rows % 64
-        or rows % group_rows
-    ):
+    if rows % 64 or k_dim % 64 or group_rows % 64 or rows % group_rows:
         raise ValueError(
             "exact W4A8 scale repack requires N, K, and group rows divisible "
             f"by 64 with whole row groups; got N={rows}, K={k_dim}, "
@@ -5673,7 +5609,9 @@ def _e8m0_scale_to_w4a8_n64_sfb_inplace(
         k_dim=k_dim,
     )
     if not scale.is_cuda:
-        raise NotImplementedError("exact W4A8 scale repack currently requires CUDA scales")
+        raise NotImplementedError(
+            "exact W4A8 scale repack currently requires CUDA scales"
+        )
     rows_pad = rows if is_logical else int(scale_u8.shape[2])
     if rows_pad != rows:
         raise ValueError(
@@ -6501,7 +6439,6 @@ def plan_b12x_fp4_moe_weights(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
-    numerical_recipe: str = "default",
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
 
@@ -6534,7 +6471,6 @@ def plan_b12x_fp4_moe_weights(
         trellis_rate_granularity=trellis_rate_granularity,
         trellis_pair_kinds=trellis_pair_kinds,
         coupled_hadamard_blocks=coupled_hadamard_blocks,
-        numerical_recipe=numerical_recipe,
     )
 
 
@@ -6786,10 +6722,7 @@ def prepare_b12x_fp4_moe_weights(
             params_dtype=params_dtype,
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
-            n64_repack=(
-                plan.numerical_recipe == "deepseek_v41"
-                and plan.intermediate_size % 128 == 64
-            ),
+            n64_repack=plan.intermediate_size % 128 == 64,
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a8_mx",
@@ -7155,16 +7088,6 @@ def plan_tp_moe_execution(
     source_format = weight_plan.source_format
     activation = weight_plan.activation
     w13_layout = weight_plan.w13_layout
-    numerical_recipe = weight_plan.numerical_recipe
-    if numerical_recipe == "deepseek_v41":
-        if apply_router_weight_on_input or deterministic_output is False:
-            raise ValueError("deepseek_v41 requires pre-FC2 routing weights and FP32 route reduction")
-        if swiglu_limit not in (None, 10.0) or swiglu_alpha not in (None, 1.0) or swiglu_beta not in (None, 0.0):
-            raise ValueError("deepseek_v41 fixes clamp=10, alpha=1 and beta=0")
-        swiglu_limit = 10.0
-        deterministic_output = True
-        if _dynamic_work_source() == "ready_queue":
-            raise ValueError("deepseek_v41 requires a materialized work source")
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
         swiglu_limit,
@@ -7189,7 +7112,6 @@ def plan_tp_moe_execution(
         quant_mode=quant_mode,
         source_format=source_format,
         context=policy_context,
-        numerical_recipe=numerical_recipe,
     )
     implementation, state_E, max_rows = _resolve_workspace_layout(
         num_tokens=num_tokens,
@@ -7307,14 +7229,6 @@ def plan_tp_moe_execution(
         scheduler=execution_scheduler,
         required_weight_layout=weight_plan.required_weight_layout(quant_mode),
     )
-    if implementation == "micro" and numerical_recipe == "deepseek_v41":
-        execution = replace(
-            execution,
-            gemm_engine=GemmEngine.MXFP8_QMMA,
-            reduction=OutputReduction.ROUTE_BUFFER_TOPK_SUM,
-            tile_m=16,
-            tile_n=128,
-        )
     if not weight_plan.supports(
         quant_mode=quant_mode,
         execution=execution,
@@ -7329,7 +7243,6 @@ def plan_tp_moe_execution(
         implementation=implementation,
         quant_mode=quant_mode,
         activation=activation,
-        numerical_recipe=numerical_recipe,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -7386,14 +7299,6 @@ def _validate_workspace(
             f"expected {(plan.implementation, plan.quant_mode, plan.weight_E, plan.k, plan.n, plan.num_topk, plan.device, plan.dtype)}, "
             f"got {actual}"
         )
-    if plan.implementation == "micro" and plan.numerical_recipe == "deepseek_v41":
-        from b12x.moe._shared.kernels.w4a8_v41_micro import micro_scratch_nbytes
-
-        required = micro_scratch_nbytes(
-            plan.max_rows // plan.num_topk, plan.k, plan.n, plan.num_topk,
-        )
-        if workspace.micro_intermediate.nbytes < required:
-            raise ValueError("V4.1 micro workspace is smaller than its planned capacity")
     if plan.implementation == "w4a16":
         if not isinstance(workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -7817,7 +7722,6 @@ def _resolve_workspace(
             input_scales_static=input_scales_static,
             deterministic_output=plan.deterministic_output,
             activation=plan.activation,
-            numerical_recipe=plan.numerical_recipe,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
             dynamic_tile_m=plan.execution.tile_m,
@@ -7856,12 +7760,6 @@ def _resolve_workspace(
             and resolved.route_output.numel() < plan.routed_rows * plan.k
         )
     )
-    if plan.implementation == "micro" and plan.numerical_recipe == "deepseek_v41":
-        from b12x.moe._shared.kernels.w4a8_v41_micro import micro_scratch_nbytes
-
-        needs_growth = needs_growth or resolved.micro_intermediate.nbytes < micro_scratch_nbytes(
-            plan.max_rows // plan.num_topk, plan.k, plan.n, plan.num_topk,
-        )
     if needs_growth:
         if workspace.frozen:
             raise RuntimeError(
@@ -7898,7 +7796,6 @@ def _resolve_workspace(
             input_scales_static=input_scales_static,
             deterministic_output=plan.deterministic_output,
             activation=plan.activation,
-            numerical_recipe=plan.numerical_recipe,
             dynamic_physical_tiles=dynamic_tiles,
             dynamic_task_capacity=dynamic_tasks,
             dynamic_tile_m=plan.execution.tile_m,
@@ -8037,7 +7934,6 @@ def plan_tp_moe_arena_layout(
             routed_rows=plan.routed_rows,
             max_rows=plan.max_rows,
             activation=plan.activation,
-            numerical_recipe=plan.numerical_recipe,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
             dynamic_tile_m=plan.execution.tile_m,
@@ -8756,14 +8652,11 @@ def plan_tp_moe_scratch(
         routed_rows=launch_plan.routed_rows,
         max_rows=launch_plan.max_rows,
         activation=launch_plan.activation,
-        numerical_recipe=launch_plan.numerical_recipe,
         dynamic_physical_tiles=launch_plan.dynamic_physical_tiles,
         dynamic_task_capacity=launch_plan.dynamic_task_capacity,
         dynamic_tile_m=launch_plan.execution.tile_m,
         dynamic_tile_n=launch_plan.execution.tile_n,
-        dynamic_route_mode=(
-            launch_plan.policy_resolution.config.dynamic_route_mode
-        ),
+        dynamic_route_mode=(launch_plan.policy_resolution.config.dynamic_route_mode),
         source_format=caps.source_format,
         w13_layout=caps.w13_layout,
         w4a16_weight_layout=caps.w4a16_weight_layout,
@@ -9322,7 +9215,6 @@ def materialize_tp_moe_arena_workspaces(
             routed_rows=plan.routed_rows,
             max_rows=plan.max_rows,
             activation=plan.activation,
-            numerical_recipe=plan.numerical_recipe,
             dynamic_physical_tiles=plan.dynamic_physical_tiles,
             dynamic_task_capacity=plan.dynamic_task_capacity,
             dynamic_tile_m=plan.execution.tile_m,
@@ -10605,11 +10497,7 @@ class _DynamicMoEW4A8Launch:
         intermediate_u32 = cute.make_tensor(
             intermediate_ptr,
             layout=cute.make_layout(
-                (
-                    rows_padded
-                    * (materialized_n + materialized_n // 32)
-                    // 4,
-                ),
+                (rows_padded * (materialized_n + materialized_n // 32) // 4,),
                 stride=(1,),
             ),
         )
@@ -10878,7 +10766,6 @@ def _get_dynamic_kernel(
     trellis_bits: int = 0,
     trellis_coupled: bool = False,
     planned_tile_m: int | None = None,
-    numerical_recipe: str = "default",
 ):
     quant_mode = _normalize_quant_mode(quant_mode)
     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
@@ -10917,47 +10804,38 @@ def _get_dynamic_kernel(
         activation=activation_spec.activation,
         planned_tile_m=planned_tile_m,
     )
-    materialize_intermediate = (
-        _w4a8_dynamic_materialized_enabled(
-            quant_mode=quant_mode,
-            activation=activation_spec.activation,
-            num_tokens=m,
-            routed_rows=m * num_topk,
-            num_experts=E,
-            k=k,
-            n=n,
-            w4a8_repacked=w4a8_repacked,
-            share_input_across_experts=share_input_across_experts,
-            deterministic_output=deterministic_output,
-            planned_tile_m=planned_tile_m,
-        )
-        or _nvfp4_dynamic_materialized_enabled(
-            quant_mode=quant_mode,
-            activation=activation_spec.activation,
-            routed_rows=m * num_topk,
-            num_experts=E,
-            k=k,
-            n=n,
-            share_input_across_experts=share_input_across_experts,
-            deterministic_output=deterministic_output,
-            planned_tile_m=planned_tile_m,
-        )
+    materialize_intermediate = _w4a8_dynamic_materialized_enabled(
+        quant_mode=quant_mode,
+        activation=activation_spec.activation,
+        num_tokens=m,
+        routed_rows=m * num_topk,
+        num_experts=E,
+        k=k,
+        n=n,
+        w4a8_repacked=w4a8_repacked,
+        share_input_across_experts=share_input_across_experts,
+        deterministic_output=deterministic_output,
+        planned_tile_m=planned_tile_m,
+    ) or _nvfp4_dynamic_materialized_enabled(
+        quant_mode=quant_mode,
+        activation=activation_spec.activation,
+        routed_rows=m * num_topk,
+        num_experts=E,
+        k=k,
+        n=n,
+        share_input_across_experts=share_input_across_experts,
+        deterministic_output=deterministic_output,
+        planned_tile_m=planned_tile_m,
     )
-    if w4a8_n64_repacked and (
-        numerical_recipe != "deepseek_v41" or not w4a8_repacked
-    ):
-        raise ValueError(
-            "w4a8_n64_repacked requires the deepseek_v41 repacked W4A8 recipe"
-        )
+    if w4a8_n64_repacked and not w4a8_repacked:
+        raise ValueError("w4a8_n64_repacked requires repacked W4A8 weights")
     if w4a8_n64_repacked and n % 64 != 0:
         raise ValueError("w4a8_n64_repacked requires N divisible by 64")
-    if numerical_recipe == "deepseek_v41" and w4a8_repacked:
+    if w4a8_n64_repacked:
         materialize_intermediate = True
         share_input_across_experts = True
     separate_w13_halves = bool(
-        quant_mode == "nvfp4"
-        and activation_spec.is_gated
-        and int(n) % 32 == 16
+        quant_mode == "nvfp4" and activation_spec.is_gated and int(n) % 32 == 16
     )
     # Gated FC1 swap_ab handles 32-aligned, non-128 shards. The 16-mod-32
     # boundary uses independent zero-copy up/gate descriptors instead.
@@ -10975,16 +10853,11 @@ def _get_dynamic_kernel(
         swap_ab = False
     if separate_w13_halves:
         swap_ab = False
-    dynamic_down_n = (
-        align_up(n, 32)
-        if quant_mode == "nvfp4" and n % 32 == 16
-        else n
-    )
+    dynamic_down_n = align_up(n, 32) if quant_mode == "nvfp4" and n % 32 == 16 else n
 
     global _LAST_KERNEL
     cache_key = (
         quant_mode,
-        numerical_recipe,
         "dynamic",
         E,
         k,
@@ -11049,8 +10922,6 @@ def _get_dynamic_kernel(
         dynamic_down_scale=dynamic_down_scale,
     )
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
-    if numerical_recipe != "default":
-        kernel_kwargs["numerical_recipe"] = numerical_recipe
     kernel_kwargs["deterministic_output"] = bool(deterministic_output)
     kernel_kwargs["num_topk"] = int(num_topk)
     kernel_kwargs["swap_ab"] = swap_ab
@@ -11071,11 +10942,8 @@ def _get_dynamic_kernel(
     elif is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
-        if numerical_recipe == "deepseek_v41":
-            kernel_kwargs["w4a8_n64_repacked"] = w4a8_n64_repacked
-            kernel_kwargs["w4a8_n64_tail"] = bool(
-                w4a8_n64_repacked and n % 128
-            )
+        kernel_kwargs["w4a8_n64_repacked"] = w4a8_n64_repacked
+        kernel_kwargs["w4a8_n64_tail"] = bool(w4a8_n64_repacked and n % 128)
     elif is_w6a8:
         # mxfp6_fmt_a/mxfp6_fmt_b stay at the ctor defaults ("e4m3" MXFP8
         # activations against "e2m3" FP6 weights).
@@ -11342,7 +11210,7 @@ def _get_dynamic_kernel(
         ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
-            8,
+            9,
             cache_key,
         ),
         dsl_compile_options=dsl_compile_options,
@@ -11424,7 +11292,6 @@ def _launch_dynamic_flat(
     volatile_launch_state: bool,
     planned_tile_m: int,
     planned_direct_routing: bool,
-    numerical_recipe: str = "default",
 ) -> None:
     quant_mode = _normalize_quant_mode(quant_mode)
     # Output rows follow the reduction contract, never an independent caller
@@ -11500,31 +11367,28 @@ def _launch_dynamic_flat(
         activation=activation,
         planned_tile_m=planned_tile_m,
     )[0]
-    materialize_intermediate = (
-        _w4a8_dynamic_materialized_enabled(
-            quant_mode=quant_mode,
-            activation=activation,
-            num_tokens=m,
-            routed_rows=routed_rows,
-            num_experts=E,
-            k=k,
-            n=n,
-            w4a8_repacked=w4a8_repacked,
-            share_input_across_experts=share_input_across_experts,
-            deterministic_output=deterministic_output,
-            planned_tile_m=planned_tile_m,
-        )
-        or _nvfp4_dynamic_materialized_enabled(
-            quant_mode=quant_mode,
-            activation=activation,
-            routed_rows=routed_rows,
-            num_experts=E,
-            k=k,
-            n=n,
-            share_input_across_experts=share_input_across_experts,
-            deterministic_output=deterministic_output,
-            planned_tile_m=planned_tile_m,
-        )
+    materialize_intermediate = _w4a8_dynamic_materialized_enabled(
+        quant_mode=quant_mode,
+        activation=activation,
+        num_tokens=m,
+        routed_rows=routed_rows,
+        num_experts=E,
+        k=k,
+        n=n,
+        w4a8_repacked=w4a8_repacked,
+        share_input_across_experts=share_input_across_experts,
+        deterministic_output=deterministic_output,
+        planned_tile_m=planned_tile_m,
+    ) or _nvfp4_dynamic_materialized_enabled(
+        quant_mode=quant_mode,
+        activation=activation,
+        routed_rows=routed_rows,
+        num_experts=E,
+        k=k,
+        n=n,
+        share_input_across_experts=share_input_across_experts,
+        deterministic_output=deterministic_output,
+        planned_tile_m=planned_tile_m,
     )
     external_route_plan_supported = _dynamic_external_route_plan_supported(
         quant_mode=quant_mode,
@@ -11632,7 +11496,6 @@ def _launch_dynamic_flat(
         trellis_bits=trellis_bits,
         trellis_coupled=trellis_coupled,
         planned_tile_m=planned_tile_m,
-        numerical_recipe=numerical_recipe,
     )
     if volatile_launch_state:
         barrier_count.zero_()
@@ -11889,7 +11752,6 @@ def _tp_moe_dynamic_launch_op(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
-    numerical_recipe: str = "default",
 ) -> None:
     (
         volatile_launch_state,
@@ -11968,7 +11830,6 @@ def _tp_moe_dynamic_launch_op(
         volatile_launch_state=volatile_launch_state,
         planned_tile_m=planned_tile_m,
         planned_direct_routing=planned_direct_routing,
-        numerical_recipe=numerical_recipe,
     )
 
 
@@ -12037,7 +11898,6 @@ def _tp_moe_dynamic_launch_fake(
     swiglu_alpha: float,
     swiglu_beta: float,
     launch_policy: int,
-    numerical_recipe: str = "default",
 ) -> None:
     del launch_policy
     return None
@@ -12074,7 +11934,6 @@ def _launch_dynamic(
     policy_max_active_clusters: int = -1,
     planned_tile_m: int = 128,
     dynamic_route_mode: str = "grouped",
-    numerical_recipe: str = "default",
 ) -> None:
     del stream
     if dynamic_route_mode not in {"direct", "grouped"}:
@@ -12100,14 +11959,10 @@ def _launch_dynamic(
     down_rp = w4a8_prepared["w2_rp"] if w4a8_repacked else workspace.row_counts
     down_sfb_rp = w4a8_prepared["w2_sfb"] if w4a8_repacked else workspace.row_counts
     dynamic_w13_sf = (
-        weights.w13_up_sf
-        if weights.w13_up_sf is not None
-        else weights.w13_sf
+        weights.w13_up_sf if weights.w13_up_sf is not None else weights.w13_sf
     )
     dynamic_w13_gate_sf = (
-        weights.w13_gate_sf
-        if weights.w13_gate_sf is not None
-        else weights.sfb_w13_mx
+        weights.w13_gate_sf if weights.w13_gate_sf is not None else weights.sfb_w13_mx
     )
     dynamic_down_fp4 = (
         weights.dynamic_down_fp4
@@ -12191,7 +12046,6 @@ def _launch_dynamic(
         float(swiglu_alpha),
         float(swiglu_beta),
         launch_policy,
-        numerical_recipe,
     )
 
 
@@ -13266,13 +13120,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 quant_mode=quant_mode,
                 w13_layout=w13_layout,
             )
-        if plan.numerical_recipe == "deepseek_v41":
-            # Native micro kernels broadcast scalar scales in-register.
-            input_gs = a1_gscale
-            down_input_scale = a2_gscale
-        else:
-            input_gs = _prepare_expert_scale(a1_gscale, weight_E)
-            down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
+        input_gs = _prepare_expert_scale(a1_gscale, weight_E)
+        down_input_scale = _prepare_expert_scale(a2_gscale, weight_E)
     else:
         assert isinstance(s, TPDynamicWorkspace)
         if quant_mode == "w6a8_mx":
@@ -13339,9 +13188,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         raise ValueError(
             f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
         )
-    if scatter_output.dtype != a.dtype and not (
-        plan.numerical_recipe == "deepseek_v41" and scatter_output.dtype == torch.float32
-    ):
+    if scatter_output.dtype != a.dtype:
         raise ValueError(
             f"output must have dtype {a.dtype}, got {scatter_output.dtype}"
         )
@@ -13351,31 +13198,6 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
     if not scatter_output.is_contiguous():
         raise ValueError("output must be contiguous")
-
-    if impl == "micro" and plan.numerical_recipe == "deepseek_v41":
-        from b12x.moe._shared.kernels.w4a8_v41_micro import launch_v41_micro
-
-        route_output = launch_v41_micro(
-            scratch=s.micro_intermediate,
-            a=a,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            w13=wv.w1_storage,
-            w13_scales=wv.w1_scale_storage,
-            w2=wv.w2_storage,
-            w2_scales=wv.w2_scale_storage,
-            alpha1=wv.w1_alpha,
-            alpha2=wv.w2_alpha,
-            input_scale=input_gs,
-            down_scale=down_input_scale,
-            max_tokens=plan.max_rows // num_topk,
-            num_topk=num_topk,
-        )
-        _launch_dynamic_topk_sum(
-            route_output=route_output, output=scatter_output, m=m,
-            num_topk=num_topk, k=k, stream=stream,
-        )
-        return scatter_output
 
     if impl == "dynamic":
         deterministic_output = plan.deterministic_output
@@ -13437,11 +13259,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             stream=stream,
             activation=activation,
             quant_mode=quant_mode,
-            numerical_recipe=plan.numerical_recipe,
             w4a8_prepared=dynamic_w4a8_prepared,
-            w4a8_n64_repacked=bool(
-                getattr(prepared_payload, "n64_repack", False)
-            ),
+            w4a8_n64_repacked=bool(getattr(prepared_payload, "n64_repack", False)),
             deterministic_output=deterministic_output,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
@@ -13883,7 +13702,9 @@ def _select_experts_reference(
     if score_func == "sqrtsoftplus":
         topk_weights = scores.gather(1, topk_ids)
         if renormalize and top_k > 1:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+            topk_weights = topk_weights / (
+                topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+            )
     else:
         topk_logits = logits_f32.gather(1, topk_ids)
         topk_weights = topk_logits.softmax(dim=-1) if renormalize else topk_logits

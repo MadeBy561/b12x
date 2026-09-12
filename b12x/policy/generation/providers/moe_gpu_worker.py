@@ -140,7 +140,8 @@ def _packed_weights(
         format=fused_moe.PackedSourceFormat(source_format),
         w13_layout=(
             fused_moe.W13Layout.W31
-            if source_format == "modelopt_nvfp4" and geometry.recipe.quant_mode != "nvfp4_auto"
+            if source_format == "modelopt_nvfp4"
+            and geometry.recipe.quant_mode != "nvfp4_auto"
             else fused_moe.W13Layout.W13
         ),
     )
@@ -150,7 +151,6 @@ def _packed_weights(
             mode=_activation_mode(geometry.recipe.quant_mode),
             nonlinearity=geometry.activation,
             io_dtype=torch.bfloat16,
-            numerical_recipe=geometry.recipe.numerical_recipe,
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=geometry.num_experts,
@@ -219,8 +219,12 @@ def _packed_weights(
         w2_block_scales=w2_scales,
         w13_global_scales=weight_global,
         w2_global_scales=weight_global,
-        input_scale=(activation_global if geometry.recipe.quant_mode != "w4a16" else None),
-        intermediate_scale=(activation_global if geometry.recipe.quant_mode != "w4a16" else None),
+        input_scale=(
+            activation_global if geometry.recipe.quant_mode != "w4a16" else None
+        ),
+        intermediate_scale=(
+            activation_global if geometry.recipe.quant_mode != "w4a16" else None
+        ),
     )
     return fused_moe.prepare_weights(plan=weight_plan, weights=packed)
 
@@ -558,17 +562,6 @@ def _uniform_w4a8_mx_reference(
         checkpoint_input[..., 0::2].sum(dim=-1)
         - checkpoint_input[..., 1::2].sum(dim=-1)
     ) * effective_weight
-    if geometry.recipe.numerical_recipe == "deepseek_v41":
-        fc1 = fc1.to(torch.bfloat16).float()
-        gate = fc1.clamp(max=10.0)
-        up = fc1.clamp(-10.0, 10.0)
-        intermediate = (torch.nn.functional.silu(gate) * up)[:, None] * topk_weights.float()
-        intermediate = intermediate.to(torch.bfloat16).float()
-        scale = torch.exp2(torch.ceil(torch.log2(intermediate.abs().clamp_min(1.0e-4) / 448.0)))
-        intermediate = (intermediate / scale).to(torch.float8_e4m3fn).float() * scale
-        down = (intermediate * geometry.intermediate_size * effective_weight).to(torch.bfloat16).float()
-        down = torch.where((topk_ids >= 0) & (topk_ids < geometry.num_experts), down, 0.0)
-        return down.sum(dim=-1)[:, None].expand(-1, geometry.hidden_size).to(torch.bfloat16).contiguous()
     if is_gated_moe_activation(activation):
         intermediate = _apply_gated_activation(
             fc1,
@@ -732,29 +725,15 @@ def _candidates_for_geometry(
     sm_count: int,
 ) -> tuple[MoeCandidate, ...]:
     recipe = geometry.recipe
-    if recipe.numerical_recipe == "deepseek_v41":
-        dynamic_candidate = MoeCandidate.create({
-            "backend": "dynamic", "dynamic_route_mode": "grouped",
-            "dynamic_tile_m": 64, "route_planner": "internal",
-            "max_active_clusters": None, "w4a16_route_mode": None,
-        })
-        if geometry.hidden_size % 256 or geometry.intermediate_size % 64:
-            return (dynamic_candidate,)
-        return (
-            MoeCandidate.create({
-                "backend": "micro", "dynamic_route_mode": None,
-                "dynamic_tile_m": None, "route_planner": "internal",
-                "max_active_clusters": None, "w4a16_route_mode": None,
-            }),
-            dynamic_candidate,
-        )
     if recipe.quant_mode == "nvfp4_auto":
         from dataclasses import replace
+
         return tuple(
             candidate
             for mode in ("nvfp4", "w4a16")
             for candidate in _candidates_for_geometry(
-                replace(geometry, recipe=replace(recipe, quant_mode=mode)), sm_count=sm_count,
+                replace(geometry, recipe=replace(recipe, quant_mode=mode)),
+                sm_count=sm_count,
             )
         )
     if recipe.quant_mode == "w4a16":
@@ -878,8 +857,11 @@ def _w4a16_direct_path(
         return None
     weight_layout = _w4a16_weight_layout(geometry)
     query = _impl.MoeDecodeQuery(
-        quant_mode=("nvfp4_auto" if geometry.recipe.recipe_id == "modelopt-nvfp4-auto"
-                    else geometry.recipe.quant_mode),
+        quant_mode=(
+            "nvfp4_auto"
+            if geometry.recipe.recipe_id == "modelopt-nvfp4-auto"
+            else geometry.recipe.quant_mode
+        ),
         source_format=geometry.recipe.source_format,
         activation=geometry.activation,
         num_experts=geometry.num_experts,
@@ -895,9 +877,8 @@ def _w4a16_direct_path(
         return "w4a16.small_m_direct" if case.num_tokens <= 8 else None
     if weight_layout != "packed":
         return None
-    if (
-        case.num_tokens <= _TC_DECODE_MAX_M
-        and is_gated_moe_activation(geometry.activation)
+    if case.num_tokens <= _TC_DECODE_MAX_M and is_gated_moe_activation(
+        geometry.activation
     ):
         return "w4a16.tc_decode"
     if case.num_tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
@@ -914,9 +895,12 @@ def _eligible_candidates_for_case(
 
     if geometry.recipe.quant_mode == "nvfp4_auto":
         return tuple(
-            candidate for candidate in candidates
+            candidate
+            for candidate in candidates
             if _eligible_candidates_for_case(
-                _precision_candidate_geometry(geometry, candidate), case, (candidate,),
+                _precision_candidate_geometry(geometry, candidate),
+                case,
+                (candidate,),
             )
         )
     eligible = []
@@ -947,46 +931,22 @@ def _eligible_candidates_for_case(
                 deterministic_output=False,
             ):
                 continue
-        if candidate.config["backend"] == "micro":
-            if geometry.recipe.numerical_recipe == "deepseek_v41":
-                from b12x.moe.fused_moe._policy import validate_moe_decode_config
-
-                query = _impl.MoeDecodeQuery(
-                    quant_mode=geometry.recipe.quant_mode,
-                    source_format=geometry.recipe.source_format,
-                    activation=geometry.activation,
-                    num_experts=geometry.num_experts,
-                    hidden_size=geometry.hidden_size,
-                    intermediate_size=geometry.intermediate_size,
-                    top_k=case.top_k,
-                    num_tokens=case.num_tokens,
-                    routed_rows=case.routed_rows,
-                    numerical_recipe=geometry.recipe.numerical_recipe,
-                )
-                try:
-                    validate_moe_decode_config(
-                        query,
-                        _impl.MoeDecodeConfig.from_profile(candidate.config),
-                        None,
-                    )
-                except (TypeError, ValueError):
-                    continue
-            elif not _impl._policy_micro_supported(
-                _impl.MoeDecodeQuery(
-                    quant_mode=geometry.recipe.quant_mode,
-                    source_format=_impl._canonical_moe_policy_source_format(
-                        geometry.recipe.source_format
-                    ),
-                    activation=geometry.activation,
-                    num_experts=geometry.num_experts,
-                    hidden_size=geometry.hidden_size,
-                    intermediate_size=geometry.intermediate_size,
-                    top_k=case.top_k,
-                    num_tokens=case.num_tokens,
-                    routed_rows=case.routed_rows,
-                )
-            ):
-                continue
+        if candidate.config["backend"] == "micro" and not _impl._policy_micro_supported(
+            _impl.MoeDecodeQuery(
+                quant_mode=geometry.recipe.quant_mode,
+                source_format=_impl._canonical_moe_policy_source_format(
+                    geometry.recipe.source_format
+                ),
+                activation=geometry.activation,
+                num_experts=geometry.num_experts,
+                hidden_size=geometry.hidden_size,
+                intermediate_size=geometry.intermediate_size,
+                top_k=case.top_k,
+                num_tokens=case.num_tokens,
+                routed_rows=case.routed_rows,
+            )
+        ):
+            continue
         if (
             candidate.config["backend"] == "w4a16"
             and candidate.config["w4a16_route_mode"] == "direct"
@@ -1020,6 +980,7 @@ def _eligible_candidates_for_case(
 
 def _precision_candidate_geometry(geometry, candidate):
     from dataclasses import replace
+
     if geometry.recipe.quant_mode != "nvfp4_auto":
         return geometry
     mode = "w4a16" if candidate.config["backend"] == "w4a16" else "nvfp4"
@@ -1095,8 +1056,7 @@ def _concrete_candidate_path(
 
     if bound_implementation != expected_implementation:
         raise _CandidateContractError(
-            f"candidate {expected_implementation!r} bound "
-            f"{bound_implementation!r}"
+            f"candidate {expected_implementation!r} bound {bound_implementation!r}"
         )
 
     if expected_implementation == "micro":
@@ -1339,7 +1299,9 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
             for spec in plan.scratch_specs()
         }
         candidate_geometry = _precision_candidate_geometry(self._geometry, candidate)
-        payload = self._experts._impl.representation_for(candidate_geometry.recipe.quant_mode)
+        payload = self._experts._impl.representation_for(
+            candidate_geometry.recipe.quant_mode
+        )
         output_dtype = (
             torch.float32
             if getattr(payload, "weight_layout", "") == "trellis_t256"
@@ -1403,6 +1365,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
         graph = torch.cuda.CUDAGraph()
         if self._geometry.recipe.quant_mode == "nvfp4_auto":
             import b12x
+
             b12x.freeze_kernel_resolution("MoE precision candidate graph capture")
             try:
                 with torch.cuda.graph(graph):
@@ -1571,10 +1534,10 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
     ):
         recipe = self._geometry.recipe
         weights = self._experts._impl
-        if (
-            recipe.quant_mode == "w4a16"
-            and recipe.source_format not in {"btx", "b12x_trellis"}
-        ):
+        if recipe.quant_mode == "w4a16" and recipe.source_format not in {
+            "btx",
+            "b12x_trellis",
+        }:
             return _uniform_w4a16_reference(
                 self._geometry,
                 x=x,
@@ -1665,6 +1628,7 @@ class _MoeGeometrySession(AbstractContextManager["_MoeGeometrySession"]):
     ) -> tuple[MoeMeasurement, ...]:
         if self._geometry.recipe.quant_mode == "nvfp4_auto":
             from .moe_precision import measure_precision
+
             return measure_precision(self, case, candidates)
         if any(candidate not in self._candidates for candidate in candidates):
             raise ValueError("MoE worker received an unknown candidate")
@@ -1984,9 +1948,7 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
             return self._request(
                 "measure",
                 case=case,
-                candidate_ids=tuple(
-                    candidate.candidate_id for candidate in requested
-                ),
+                candidate_ids=tuple(candidate.candidate_id for candidate in requested),
                 correctness=correctness,
             )
 
@@ -2038,9 +2000,7 @@ class _MoeProcessSession(AbstractContextManager["_MoeProcessSession"]):
         measurements = []
         for candidate in candidates:
             try:
-                (measurement,) = parse_measurements(
-                    request_measurement((candidate,))
-                )
+                (measurement,) = parse_measurements(request_measurement((candidate,)))
             except _MoeRemoteWorkerError as exc:
                 if not exc.retryable or exc.operation == "startup":
                     raise

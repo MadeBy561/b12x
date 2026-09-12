@@ -63,6 +63,22 @@ class BlockFP8LinearWeight:
     block_size: tuple[int, int]
 
 
+def _physical_mxfp8_k(logical_k: int) -> int:
+    logical_k = int(logical_k)
+    if logical_k <= 0 or logical_k % MXFP8_SCALE_VEC_SIZE:
+        raise ValueError(
+            "block FP8 linear logical K must be a positive multiple of "
+            f"{MXFP8_SCALE_VEC_SIZE}, got {logical_k}"
+        )
+    return _align_up(logical_k, 128)
+
+
+def _packed_physical_mxfp8_k(packed_weight: BlockFP8LinearWeight) -> int:
+    physical_k = int(packed_weight.weight.values.shape[1])
+    _check_mxfp8_k(physical_k)
+    return physical_k
+
+
 @dataclass(frozen=True, kw_only=True)
 class BlockFP8LinearBinding:
     source: torch.Tensor
@@ -96,7 +112,7 @@ class BlockFP8LinearScratchCaps:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "in_features", max(int(self.in_features), 1))
         object.__setattr__(self, "out_features", max(int(self.out_features), 1))
-        _check_mxfp8_k(self.in_features)
+        _physical_mxfp8_k(self.in_features)
         object.__setattr__(self, "block_size", _check_block_size(self.block_size))
         if self.output_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"output_dtype must be bf16/fp16, got {self.output_dtype}")
@@ -226,25 +242,25 @@ def _block_fp8_linear_scratch_layout(
     tokens = max(int(tokens), 1)
     in_features = max(int(in_features), 1)
     del out_features
-    _check_mxfp8_k(in_features)
+    physical_in_features = _physical_mxfp8_k(in_features)
     _c_dtype_name(output_dtype)
 
     offset = 0
     offset = _align_up(offset, _SCRATCH_ALIGN_BYTES)
     x_values_offset_bytes = offset
-    offset += tokens * in_features * _dtype_nbytes(torch.float8_e4m3fn)
+    offset += tokens * physical_in_features * _dtype_nbytes(torch.float8_e4m3fn)
 
     offset = _align_up(offset, _SCRATCH_ALIGN_BYTES)
     x_scale_rows_offset_bytes = offset
     offset += (
         tokens
-        * (in_features // MXFP8_SCALE_VEC_SIZE)
+        * (physical_in_features // MXFP8_SCALE_VEC_SIZE)
         * _dtype_nbytes(torch.float8_e8m0fnu)
     )
 
     offset = _align_up(offset, _SCRATCH_ALIGN_BYTES)
     x_scale_mma_offset_bytes = offset
-    sf_k = in_features // MXFP8_SCALE_VEC_SIZE
+    sf_k = physical_in_features // MXFP8_SCALE_VEC_SIZE
     x_scale_mma_physical_shape = (
         1,
         math.ceil(tokens / MXFP8_SCALE_ROW_TILE),
@@ -304,13 +320,17 @@ def _block_fp8_linear_x_q_from_scratch(
     x_values = _scratch_view(
         scratch,
         offset_bytes=layout.x_values_offset_bytes,
-        shape=(int(tokens), int(in_features)),
+        shape=(int(tokens), _physical_mxfp8_k(in_features)),
         dtype=torch.float8_e4m3fn,
     )
     x_scale_rows_u8 = _scratch_view(
         scratch,
         offset_bytes=layout.x_scale_rows_offset_bytes,
-        shape=(1, int(tokens), int(in_features) // MXFP8_SCALE_VEC_SIZE),
+        shape=(
+            1,
+            int(tokens),
+            _physical_mxfp8_k(in_features) // MXFP8_SCALE_VEC_SIZE,
+        ),
         dtype=torch.uint8,
     )
     x_scale_mma_u8 = _scratch_view(
@@ -353,7 +373,7 @@ def _check_block_fp8_linear_tensors(
     _check_mxfp8_rows_storage(
         x_q,
         m=tokens,
-        k=packed_weight.in_features,
+        k=_packed_physical_mxfp8_k(packed_weight),
         num_groups=1,
     )
     if output.shape != (tokens, packed_weight.out_features, 1):
@@ -464,15 +484,41 @@ def pack_block_fp8_linear_weight_mxfp8(
     block_size = _check_block_size(block_size)
     if weight.ndim != 2:
         raise ValueError(f"weight must have shape [N,K], got {tuple(weight.shape)}")
-    out_features, in_features = weight.shape
-    _check_mxfp8_k(in_features)
+    out_features, in_features = map(int, weight.shape)
+    physical_in_features = _physical_mxfp8_k(in_features)
     if out_features <= 0:
         raise ValueError("out_features must be positive")
+    packed_weight = weight.detach()
+    packed_scale = weight_scale.detach()
+    if physical_in_features != in_features:
+        padded_weight = torch.zeros(
+            (out_features, physical_in_features),
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        padded_weight[:, :in_features] = packed_weight
+        packed_weight = padded_weight
+        logical_scale_tiles = math.ceil(in_features / block_size[1])
+        physical_scale_tiles = math.ceil(physical_in_features / block_size[1])
+        if (
+            packed_scale.ndim > 0
+            and int(packed_scale.shape[-1]) == logical_scale_tiles
+            and physical_scale_tiles != logical_scale_tiles
+        ):
+            neutral_scale = 127 if packed_scale.dtype == torch.uint8 else 1.0
+            padded_scale = torch.full(
+                (*packed_scale.shape[:-1], physical_scale_tiles),
+                neutral_scale,
+                dtype=packed_scale.dtype,
+                device=packed_scale.device,
+            )
+            padded_scale[..., :logical_scale_tiles] = packed_scale
+            packed_scale = padded_scale
     packed = pack_fp8_block_scaled_weight_mxfp8(
-        weight.detach(),
-        weight_scale.detach(),
+        packed_weight,
+        packed_scale,
         m=out_features,
-        k=in_features,
+        k=physical_in_features,
         num_groups=1,
         block_size=block_size,
     )
@@ -503,6 +549,7 @@ def _run_block_fp8_quant_kernel(
         out_scale_mma,
         expected_m=expected_m,
         min_amax=min_amax,
+        physical_k=int(out_values.shape[1]),
     )
 
 
@@ -513,7 +560,8 @@ def _run_block_fp8_quant_kernel(
 def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
     source_tk: torch.Tensor,
     tokens: int,
-    in_features: int,
+    logical_in_features: int,
+    physical_in_features: int,
     min_amax: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Functional (allocate + return) quantizer: the raw CuTe kernel writes the
@@ -523,18 +571,23 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
     # downstream subgraph (which trips AOT merge_view_inputs). Used on the no-`out`
     # (compile) path.
     values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
-        tokens, in_features, num_groups=1, device=source_tk.device
+        tokens, physical_in_features, num_groups=1, device=source_tk.device
     )
     out = mxfp8_rows_from_bases(
         values_base,
         scale_rows_base,
         scale_physical_base,
         tokens,
-        in_features,
+        physical_in_features,
         num_groups=1,
     )
     _run_block_fp8_quant_kernel(
-        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features,
+        source_tk,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        logical_in_features,
         min_amax=min_amax,
     )
     return values_base, scale_rows_base, scale_physical_base
@@ -544,11 +597,12 @@ def _quantize_block_fp8_linear_input_mxfp8_alloc_op(
 def _quantize_block_fp8_linear_input_mxfp8_alloc_fake(
     source_tk: torch.Tensor,
     tokens: int,
-    in_features: int,
+    logical_in_features: int,
+    physical_in_features: int,
     min_amax: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return empty_mxfp8_rows_bases(
-        tokens, in_features, num_groups=1, device=source_tk.device
+        tokens, physical_in_features, num_groups=1, device=source_tk.device
     )
 
 
@@ -571,14 +625,18 @@ def quantize_block_fp8_linear_input_mxfp8(
         raise ValueError(
             f"source_tk must have shape [tokens,K], got {tuple(source_tk.shape)}"
         )
-    tokens, in_features = source_tk.shape
+    tokens, in_features = map(int, source_tk.shape)
     if tokens <= 0:
         raise ValueError("tokens must be positive")
-    _check_mxfp8_k(in_features)
+    physical_in_features = _physical_mxfp8_k(in_features)
     if out is None:
         values_base, scale_rows_base, scale_physical_base = (
             torch.ops.b12x.quantize_block_fp8_linear_input_mxfp8_alloc(
-                source_tk, tokens, in_features, min_amax
+                source_tk,
+                tokens,
+                in_features,
+                physical_in_features,
+                min_amax,
             )
         )
         return mxfp8_rows_from_bases(
@@ -586,13 +644,20 @@ def quantize_block_fp8_linear_input_mxfp8(
             scale_rows_base,
             scale_physical_base,
             tokens,
-            in_features,
+            physical_in_features,
             num_groups=1,
         )
 
-    _check_mxfp8_rows_storage(out, m=tokens, k=in_features, num_groups=1)
+    _check_mxfp8_rows_storage(
+        out, m=tokens, k=physical_in_features, num_groups=1
+    )
     _run_block_fp8_quant_kernel(
-        source_tk, out.values, out.scale_rows, out.scale_mma, tokens, in_features,
+        source_tk,
+        out.values,
+        out.scale_rows,
+        out.scale_mma,
+        tokens,
+        in_features,
         min_amax=min_amax,
     )
     return out
@@ -612,10 +677,11 @@ def _quantize_block_fp8_linear_input_for_immediate_gemm(
     ``quantize_block_fp8_linear_input_mxfp8`` allocation API.
     """
 
-    tokens, in_features = source_tk.shape
+    tokens, in_features = map(int, source_tk.shape)
+    physical_in_features = _physical_mxfp8_k(in_features)
     values_base, scale_rows_base, scale_physical_base = empty_mxfp8_rows_bases(
         tokens,
-        in_features,
+        physical_in_features,
         num_groups=1,
         device=source_tk.device,
         initialize_scales=False,
@@ -625,7 +691,7 @@ def _quantize_block_fp8_linear_input_for_immediate_gemm(
         scale_rows_base,
         scale_physical_base,
         tokens,
-        in_features,
+        physical_in_features,
         num_groups=1,
     )
     _run_block_fp8_quant_kernel(
@@ -650,8 +716,8 @@ def _block_fp8_linear_mxfp8_fused_op(
     weight_values: torch.Tensor,
     weight_scale_rows: torch.Tensor,
     weight_scale_mma: torch.Tensor,
-    in_features: int,
-    out_features: int,
+    logical_in_features: int,
+    physical_in_features: int,
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
@@ -663,11 +729,17 @@ def _block_fp8_linear_mxfp8_fused_op(
     # shapes). The weight views passed in are static-shaped, so they don't hit
     # that path. Returns a contiguous [tokens, out_features] base.
     tokens = int(source_2d.shape[0])
+    out_features = weight_values.shape[0]
     planned_tokens = expected_m if expected_m > 0 else tokens
-    if sfb_k_replicated and planned_tokens <= 8 and source_2d.dtype == torch.bfloat16:
+    if (
+        logical_in_features == physical_in_features
+        and sfb_k_replicated
+        and planned_tokens <= 8
+        and source_2d.dtype == torch.bfloat16
+    ):
         return dense_gemm_fused_quant_a(
             source_2d,
-            weight_values.reshape(out_features, in_features, 1),
+            weight_values.reshape(out_features, physical_in_features, 1),
             weight_scale_mma,
             expected_m=None if expected_m == 0 else expected_m,
             sfb_k_replicated=sfb_k_replicated,
@@ -678,8 +750,11 @@ def _block_fp8_linear_mxfp8_fused_op(
         min_amax=0.0 if sfb_k_replicated else 1e-4,
     )
     return dense_gemm(
-        (x_q.values.reshape(tokens, in_features, 1), x_q.scale_mma),
-        (weight_values.reshape(out_features, in_features, 1), weight_scale_mma),
+        (x_q.values.reshape(tokens, physical_in_features, 1), x_q.scale_mma),
+        (
+            weight_values.reshape(out_features, physical_in_features, 1),
+            weight_scale_mma,
+        ),
         ab_dtype="float8_e4m3fn",
         sf_dtype="float8_e8m0fnu",
         c_dtype=_c_dtype_name(source_2d.dtype),
@@ -697,15 +772,15 @@ def _block_fp8_linear_mxfp8_fused_fake(
     weight_values: torch.Tensor,
     weight_scale_rows: torch.Tensor,
     weight_scale_mma: torch.Tensor,
-    in_features: int,
-    out_features: int,
+    logical_in_features: int,
+    physical_in_features: int,
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
 ) -> torch.Tensor:
     del stream_int
     return torch.empty(
-        (source_2d.shape[0], out_features),
+        (source_2d.shape[0], weight_values.shape[0]),
         dtype=source_2d.dtype,
         device=source_2d.device,
     )
@@ -781,7 +856,7 @@ def block_fp8_linear_mxfp8(
             packed_weight.weight.scale_rows,
             packed_weight.weight.scale_mma,
             packed_weight.in_features,
-            packed_weight.out_features,
+            _packed_physical_mxfp8_k(packed_weight),
             int(expected_m) if expected_m is not None else 0,
             packed_weight.block_size[1] == 128,
             stream_int,
@@ -806,8 +881,10 @@ def block_fp8_linear_mxfp8(
     assert output_storage is not None
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
     planned_tokens = expected_m if expected_m is not None else tokens
+    physical_in_features = _packed_physical_mxfp8_k(packed_weight)
     if (
-        packed_weight.block_size == (128, 128)
+        physical_in_features == packed_weight.in_features
+        and packed_weight.block_size == (128, 128)
         and planned_tokens <= 8
         and source_2d.dtype == torch.bfloat16
     ):
@@ -815,7 +892,7 @@ def block_fp8_linear_mxfp8(
             source_2d,
             packed_weight.weight.values.reshape(
                 packed_weight.out_features,
-                packed_weight.in_features,
+                physical_in_features,
                 1,
             ),
             packed_weight.weight.scale_mma,
@@ -838,11 +915,11 @@ def block_fp8_linear_mxfp8(
     )
     t_quant = time.perf_counter() if _B12X_TIMING else 0.0
     output = dense_gemm(
-        (x_q.values.reshape(tokens, packed_weight.in_features, 1), x_q.scale_mma),
+        (x_q.values.reshape(tokens, physical_in_features, 1), x_q.scale_mma),
         (
             packed_weight.weight.values.reshape(
                 packed_weight.out_features,
-                packed_weight.in_features,
+                physical_in_features,
                 1,
             ),
             packed_weight.weight.scale_mma,

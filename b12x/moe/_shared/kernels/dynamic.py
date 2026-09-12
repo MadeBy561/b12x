@@ -816,25 +816,8 @@ class MoEDynamicKernelBackend:
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
-        numerical_recipe: str = "default",
     ):
         activation = normalize_moe_activation(activation)
-        self.deepseek_v41 = numerical_recipe == "deepseek_v41"
-        if self.deepseek_v41:
-            materialized_pipeline = (
-                quant_recipe == "w4a8_mx"
-                and activation == "silu"
-                and w4a8_repacked
-                and materialize_intermediate
-                and deterministic_output
-                and mma_tiler_mn == (64, 128)
-                and share_input_across_experts
-                and not direct_routing
-            )
-            if not materialized_pipeline:
-                raise ValueError(
-                    "deepseek_v41 requires the materialized M64 W4A8 pipeline"
-                )
         if quant_recipe not in {
             "nvfp4",
             "w4a8_mx",
@@ -1053,7 +1036,6 @@ class MoEDynamicKernelBackend:
         else:
             self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
                 fast_math=self.fast_math,
-                numerical_recipe=numerical_recipe,
                 source_tile_m=materialized_source_tile_m,
                 deterministic_output=bool(deterministic_output),
                 num_topk=self.num_topk,
@@ -1081,7 +1063,6 @@ class MoEDynamicKernelBackend:
             )
             self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
                 source_tile_m=materialized_source_tile_m,
-                numerical_recipe=numerical_recipe,
                 deterministic_output=bool(deterministic_output),
                 n64_repacked=self.w4a8_n64_repacked,
                 n64_tail=self.w4a8_n64_tail,
@@ -1735,8 +1716,6 @@ class MoEDynamicKernelBackend:
 
     @cute.jit
     def _quantize_mx(self, values: cute.Tensor, max_abs: cutlass.Float32):
-        if cutlass.const_expr(self.deepseek_v41):
-            max_abs = cutlass.max(max_abs, cutlass.Float32(1.0e-4))
         return quantize_block_fp8_mx(values, max_abs)
 
     @cute.jit
@@ -2873,7 +2852,6 @@ class MoEDynamicKernelBackend:
                     gate_tile_cnt,
                     Int32(b_down.shape[0]) // Int32(256),
                     max_active_clusters,
-                    Int32(0),
                     stream,
                 )
 
@@ -3294,7 +3272,7 @@ class MoEDynamicKernelBackend:
         # routed scratch therefore needs no 4x-output clear; poison/replay
         # coverage verifies that phase 2 really overwrites the full domain.
         if cutlass.const_expr(
-            self.deepseek_v41 or not (self.deterministic_output and self.external_materialized_fc2)
+            not (self.deterministic_output and self.external_materialized_fc2)
         ):
             scatter_rows = Int32(scatter_output.shape[0])
             scatter_total_u32 = scatter_rows * cols_u32

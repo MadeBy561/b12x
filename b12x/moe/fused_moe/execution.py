@@ -281,8 +281,8 @@ def prewarm(plan: ExecutionPlan) -> None:
     plan._impl = warmed
     if (
         plan.experts.plan.activation.mode is ActivationMode.AUTO
-        or plan.experts.plan.activation.numerical_recipe == "deepseek_v41"
-    ) and plan.experts.device.type == "cuda":
+        and plan.experts.device.type == "cuda"
+    ):
         from .api import run
 
         scratch = {
@@ -305,16 +305,6 @@ def prewarm(plan: ExecutionPlan) -> None:
                     unit_scale_contract=plan.activation_mode is ActivationMode.A16,
                 )
                 run(binding=binding)
-                if plan.experts.plan.activation.numerical_recipe == "deepseek_v41":
-                    # Warm both final BF16 and FP32 collective/shared-expert
-                    # composition outputs against the same BF16 route buffer.
-                    fp32_binding = plan._impl.bind(
-                        scratch=scratch, experts=plan.experts._impl, a=x,
-                        output=torch.empty_like(x, dtype=torch.float32),
-                        topk_ids=ids.to(dtype), topk_weights=weights,
-                        input_scales_static=True,
-                    )
-                    run(binding=fp32_binding)
         torch.cuda.synchronize(plan.experts.device)
     plan._prewarmed = True
 

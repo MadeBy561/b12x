@@ -75,13 +75,13 @@ _DEVICE = DeviceIdentity(
 )
 
 
-def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
-) -> None:
+def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries() -> None:
     from b12x.policy import PolicyContext, PolicySource
     from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
 
     cases = tuple(
-        case for case in expand_sweep_cases()
+        case
+        for case in expand_sweep_cases()
         if case.geometry.recipe.quant_mode != "nvfp4_auto"
     )
     queries = {tuple(sorted(case.query().items())): case.query() for case in cases}
@@ -94,9 +94,7 @@ def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
     for base_query in base_queries.values():
         top_k = int(base_query["top_k"])
         direct_limit = fused_moe_impl._DIRECT_ROUTING_MAX_ROUTED_ROWS // top_k
-        triton_limit = (
-            fused_moe_impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS // top_k
-        )
+        triton_limit = fused_moe_impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS // top_k
         for num_tokens in (9, direct_limit, direct_limit + 1, triton_limit + 1):
             if not 1 <= num_tokens <= 8_192:
                 continue
@@ -113,11 +111,15 @@ def test_embedded_moe_profiles_and_heuristics_cover_corpus_queries(
         context = PolicyContext.for_identity(profile.targets[0])
         for query in queries.values():
             hit = component.lookup(query)
-            if query["quant_mode"] == "w4a16" and query["source_format"] == "modelopt_nvfp4":
+            if (
+                query["quant_mode"] == "w4a16"
+                and query["source_format"] == "modelopt_nvfp4"
+            ):
                 # Native-layout measurements cannot qualify uniform MMA-packed A16.
                 assert hit is None, (profile.profile_id, query)
             resolution = context.resolve(
-                MOE_DECODE_POLICY, MoeDecodeQuery(**query),
+                MOE_DECODE_POLICY,
+                MoeDecodeQuery(**query),
             )
             if hit is None:
                 assert resolution.source is PolicySource.HEURISTIC
@@ -216,7 +218,6 @@ def test_profile_coverage_rejects_cross_family_backends(
 ) -> None:
     query = {
         "quant_mode": quant_mode,
-        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 256,
@@ -275,40 +276,62 @@ def test_uniform_w4a16_profile_fixture_has_stable_positive_projections() -> None
 
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 def test_uniform_w4a8_profile_reference_models_checkpoint_semantics(
-    monkeypatch, activation,
+    monkeypatch,
+    activation,
 ) -> None:
     from b12x.moe import fused_moe
     from b12x.moe._shared.kernels.reference import moe_reference_w4a8_mx
 
     recipe = next(
-        geometry.recipe for geometry in expand_physical_geometries()
+        geometry.recipe
+        for geometry in expand_physical_geometries()
         if geometry.recipe.recipe_id == "e8m0-w4a8"
     )
     model = MoeModelGeometry(
-        model_id="oracle-test", hidden_size=256, intermediate_size=128,
-        num_experts=3, native_top_k=2, activation=activation,
-        recipe_families=(recipe.family_id,), source="test", tp_sizes=(1,),
+        model_id="oracle-test",
+        hidden_size=256,
+        intermediate_size=128,
+        num_experts=3,
+        native_top_k=2,
+        activation=activation,
+        recipe_families=(recipe.family_id,),
+        source="test",
+        tp_sizes=(1,),
     )
     (geometry,) = expand_physical_geometries(models=(model,), recipes=(recipe,))
     monkeypatch.setattr(fused_moe, "prepare_weights", lambda *, plan, weights: weights)
     weights = _packed_weights(geometry, device="cpu")
     generator = torch.Generator().manual_seed(29)
     x = _condition_benchmark_inputs(
-        geometry, torch.randn((4, 256), generator=generator),
+        geometry,
+        torch.randn((4, 256), generator=generator),
     )
     # Include duplicate routes and both negative and out-of-range expert IDs.
     topk_ids = torch.tensor([[0, 1], [2, -1], [1, 1], [3, -1]], dtype=torch.int32)
     topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4], [0.2, 0.3], [0.4, 0.6]])
     output = _uniform_w4a8_mx_reference(
-        geometry, x=x, topk_ids=topk_ids, topk_weights=topk_weights,
+        geometry,
+        x=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
     )
     checkpoint = moe_reference_w4a8_mx(
-        x, weights.w13, weights.w13_block_scales.view(torch.uint8), None,
+        x,
+        weights.w13,
+        weights.w13_block_scales.view(torch.uint8),
+        None,
         weights.w13_global_scales,
-        weights.w2, weights.w2_block_scales.view(torch.uint8), None,
-        weights.w2_global_scales, topk_ids, topk_weights,
-        geometry.num_experts, geometry.hidden_size, geometry.intermediate_size,
-        activation=activation, w13_layout="w13",
+        weights.w2,
+        weights.w2_block_scales.view(torch.uint8),
+        None,
+        weights.w2_global_scales,
+        topk_ids,
+        topk_weights,
+        geometry.num_experts,
+        geometry.hidden_size,
+        geometry.intermediate_size,
+        activation=activation,
+        w13_layout="w13",
     )
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output[:3]) > 0
@@ -422,23 +445,16 @@ def test_w4a16_tuner_models_native_and_packed_route_kernels() -> None:
     )
 
     assert _w4a16_weight_layout(glm_decode.geometry) == "packed"
-    assert (
-        _w4a16_direct_path(glm_decode.geometry, glm_decode)
-        == "w4a16.tc_decode"
-    )
+    assert _w4a16_direct_path(glm_decode.geometry, glm_decode) == "w4a16.tc_decode"
     assert _w4a16_weight_layout(e8m0_decode.geometry) == "packed"
-    assert (
-        _w4a16_direct_path(e8m0_decode.geometry, e8m0_decode)
-        == "w4a16.tc_decode"
-    )
+    assert _w4a16_direct_path(e8m0_decode.geometry, e8m0_decode) == "w4a16.tc_decode"
     assert _w4a16_weight_layout(compressed_direct.geometry) == "packed"
     assert (
         _w4a16_direct_path(compressed_direct.geometry, compressed_direct)
         == "w4a16.direct_topk"
     )
     assert (
-        _w4a16_direct_path(relu2_direct.geometry, relu2_direct)
-        == "w4a16.direct_topk"
+        _w4a16_direct_path(relu2_direct.geometry, relu2_direct) == "w4a16.direct_topk"
     )
     assert _w4a16_direct_path(relu2_packed_only.geometry, relu2_packed_only) is None
 
@@ -479,9 +495,10 @@ def test_w4a16_tuner_layout_matches_canonical_weight_planning() -> None:
             ),
         )
 
-        assert _w4a16_weight_layout(geometry) == expected_layout[
-            plan.prepared_format.packing
-        ]
+        assert (
+            _w4a16_weight_layout(geometry)
+            == expected_layout[plan.prepared_format.packing]
+        )
 
 
 def test_concrete_candidate_path_reads_the_exact_execution_variant() -> None:
@@ -606,8 +623,7 @@ def test_concrete_candidate_path_reports_w4a8_specializations(
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
-        if geometry.recipe.recipe_id == recipe_id
-        and geometry.activation == "silu"
+        if geometry.recipe.recipe_id == recipe_id and geometry.activation == "silu"
     )
     case = next(
         case
@@ -661,7 +677,6 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
         geometry
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
-        and geometry.recipe.numerical_recipe == "default"
     )
 
     configs = tuple(
@@ -681,87 +696,13 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
     assert all(config["w4a16_route_mode"] is None for config in configs)
 
 
-def test_deepseek_v41_micro_policy_requires_small_aligned_geometry() -> None:
-    from b12x.moe.fused_moe._policy import (
-        MoeDecodeConfig,
-        MoeDecodeQuery,
-        validate_moe_decode_config,
-    )
-
-    config = MoeDecodeConfig(
-        backend="micro",
-        route_planner="internal",
-        max_active_clusters=None,
-    )
-    query = MoeDecodeQuery(
-        quant_mode="w4a8_mx",
-        source_format="fp4_e8m0_k32",
-        activation="silu",
-        num_experts=8,
-        hidden_size=256,
-        intermediate_size=192,
-        top_k=2,
-        num_tokens=8,
-        routed_rows=16,
-        numerical_recipe="deepseek_v41",
-    )
-
-    validate_moe_decode_config(query, config, None)
-    with pytest.raises(ValueError, match="capacity from 1 to 8"):
-        validate_moe_decode_config(
-            replace(query, num_tokens=9, routed_rows=18), config, None
-        )
-    with pytest.raises(ValueError, match="K divisible by 256"):
-        validate_moe_decode_config(
-            replace(query, hidden_size=384), config, None
-        )
-    with pytest.raises(ValueError, match="N divisible by 64"):
-        validate_moe_decode_config(
-            replace(query, intermediate_size=160), config, None
-        )
-
-    geometry = next(
-        geometry
-        for geometry in expand_physical_geometries()
-        if geometry.recipe.numerical_recipe == "deepseek_v41"
-    )
-    candidates = _candidates_for_geometry(geometry, sm_count=48)
-    assert {candidate.config["backend"] for candidate in candidates} == {
-        "dynamic",
-        "micro",
-    }
-    case = next(
-        case
-        for case in expand_sweep_cases(geometries=(geometry,))
-        if case.num_tokens == 8 and case.route_pattern == "balanced"
-    )
-    assert any(
-        candidate.config["backend"] == "micro"
-        for candidate in moe_gpu_worker._eligible_candidates_for_case(
-            geometry, case, candidates
-        )
-    )
-    assert not any(
-        candidate.config["backend"] == "micro"
-        for candidate in moe_gpu_worker._eligible_candidates_for_case(
-            geometry, replace(case, num_tokens=9), candidates
-        )
-    )
-    assert {
-        candidate.config["backend"]
-        for candidate in _candidates_for_geometry(
-            replace(geometry, hidden_size=geometry.hidden_size + 128),
-            sm_count=48,
-        )
-    } == {"dynamic"}
 
 
 def test_nvfp4_triton_route_candidates_only_use_the_supported_tile() -> None:
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
-        if geometry.recipe.quant_mode == "nvfp4"
-        and geometry.activation == "silu"
+        if geometry.recipe.quant_mode == "nvfp4" and geometry.activation == "silu"
     )
 
     configs = tuple(
@@ -810,7 +751,6 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         geometry
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
-        and geometry.recipe.numerical_recipe == "default"
         and geometry.activation == "silu"
     )
     cases = expand_sweep_cases(geometries=(geometry,))
@@ -864,8 +804,7 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         is expect_dynamic_direct
     )
     assert not any(
-        config["backend"] == "dynamic"
-        and config["dynamic_route_mode"] == "direct"
+        config["backend"] == "dynamic" and config["dynamic_route_mode"] == "direct"
         for config in large_configs
     )
     if quant_mode == "w4a8_nvfp4":
@@ -876,8 +815,7 @@ def test_nvfp4_relu2_tuner_excludes_oversized_dynamic_tiles() -> None:
     geometry = next(
         geometry
         for geometry in expand_physical_geometries()
-        if geometry.recipe.quant_mode == "nvfp4"
-        and geometry.activation == "relu2"
+        if geometry.recipe.quant_mode == "nvfp4" and geometry.activation == "relu2"
     )
 
     candidates = _candidates_for_geometry(geometry, sm_count=48)
@@ -956,9 +894,7 @@ class _Session(AbstractContextManager["_Session"]):
             configs = (
                 {
                     "backend": backend,
-                    "dynamic_route_mode": (
-                        "grouped" if backend == "dynamic" else None
-                    ),
+                    "dynamic_route_mode": ("grouped" if backend == "dynamic" else None),
                     "dynamic_tile_m": 128 if backend == "dynamic" else None,
                     "route_planner": "internal",
                     "max_active_clusters": None,
@@ -1161,7 +1097,6 @@ def test_staged_moe_generator_keeps_regional_winners_and_resumes(tmp_path) -> No
     assert component is not None
     base_query = {
         "quant_mode": "nvfp4",
-        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 16,
@@ -1250,7 +1185,6 @@ def test_correctness_screen_uses_an_eligible_anchor_per_candidate(tmp_path) -> N
         component.lookup(
             {
                 "quant_mode": "nvfp4",
-                "numerical_recipe": "default",
                 "source_format": "modelopt_nvfp4",
                 "activation": "silu",
                 "num_experts": 16,
@@ -1338,7 +1272,6 @@ def test_prefill_capacities_are_measured_for_each_top_k(
             hit = component.lookup(
                 {
                     "quant_mode": "nvfp4",
-                    "numerical_recipe": "default",
                     "source_format": "modelopt_nvfp4",
                     "activation": "silu",
                     "num_experts": 16,
@@ -1356,7 +1289,6 @@ def test_prefill_capacities_are_measured_for_each_top_k(
 def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> None:
     base_query = {
         "quant_mode": "nvfp4",
-        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 16,
@@ -1444,7 +1376,7 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
                 "components": [
                     {
                         "component_id": "moe.decode",
-                        "query_schema_version": 5,
+                        "query_schema_version": 6,
                         "config_schema_version": 3,
                         "planner": decision_node_to_dict(planner),
                     }
@@ -1469,7 +1401,6 @@ def test_sparse_token_capacity_coverage_matches_dense_reference(top_k: int) -> N
 def test_sparse_token_coverage_preserves_dynamic_direct_boundary(top_k: int) -> None:
     base_query = {
         "quant_mode": "nvfp4",
-        "numerical_recipe": "default",
         "source_format": "modelopt_nvfp4",
         "activation": "silu",
         "num_experts": 256,
@@ -2119,8 +2050,12 @@ def test_production_moe_resume_does_not_start_a_gpu_worker(tmp_path) -> None:
         assert session._process is None
 
 
-@pytest.mark.parametrize("ratio,expected", [(1.0, True), (0.999, True), (0.97, True), (1.001, False)])
-def test_moe_precision_prefers_measured_parity_without_a_five_percent_margin(ratio, expected):
+@pytest.mark.parametrize(
+    "ratio,expected", [(1.0, True), (0.999, True), (0.97, True), (1.001, False)]
+)
+def test_moe_precision_prefers_measured_parity_without_a_five_percent_margin(
+    ratio, expected
+):
     from b12x.policy.generation.providers.moe_precision import qualifies
 
     pairs = [{"a4": 10.0, "a16": 10.0 * ratio} for _ in range(20)]
@@ -2128,7 +2063,9 @@ def test_moe_precision_prefers_measured_parity_without_a_five_percent_margin(rat
 
 
 @pytest.mark.parametrize("confirmed,backend", [(True, "w4a16"), (False, "micro")])
-def test_precision_reduction_confirms_aggregate_without_per_route_veto(confirmed, backend):
+def test_precision_reduction_confirms_aggregate_without_per_route_veto(
+    confirmed, backend
+):
     from b12x.policy.generation.providers.moe_precision import select_winner
 
     a4 = _Session([], quant_mode="nvfp4").candidates[0]
@@ -2136,12 +2073,31 @@ def test_precision_reduction_confirms_aggregate_without_per_route_veto(confirmed
     grouped = []
     for initial in (10.005, 8.0):
         confirmation = initial if confirmed else 12.0
-        grouped.append((None, (
-            MoeMeasurement(candidate=a4, latency_us=10.0, cosine=1.0,
-                           metrics={"initial_latency_us": 10.0, "confirmation_latency_us": 10.0}),
-            MoeMeasurement(candidate=a16, latency_us=confirmation, cosine=1.0,
-                           metrics={"initial_latency_us": initial, "confirmation_latency_us": confirmation}),
-        )))
+        grouped.append(
+            (
+                None,
+                (
+                    MoeMeasurement(
+                        candidate=a4,
+                        latency_us=10.0,
+                        cosine=1.0,
+                        metrics={
+                            "initial_latency_us": 10.0,
+                            "confirmation_latency_us": 10.0,
+                        },
+                    ),
+                    MoeMeasurement(
+                        candidate=a16,
+                        latency_us=confirmation,
+                        cosine=1.0,
+                        metrics={
+                            "initial_latency_us": initial,
+                            "confirmation_latency_us": confirmation,
+                        },
+                    ),
+                ),
+            )
+        )
     assert select_winner(grouped, 0.999).config["backend"] == backend
 
 
@@ -2150,32 +2106,58 @@ def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_pa
     from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery
 
     calls = []
+
     class Session(_Session):
         def __init__(self):
             super().__init__(calls, quant_mode="nvfp4")
-            self._candidates = (self._candidates[0], _Session([], quant_mode="w4a16").candidates[1])
+            self._candidates = (
+                self._candidates[0],
+                _Session([], quant_mode="w4a16").candidates[1],
+            )
 
         def measure(self, case, candidates, *, correctness=False):
             assert not correctness
             calls.append(case.case_id)
-            return tuple(MoeMeasurement(
-                candidate=candidate, latency_us=10.0, cosine=1.0,
-                metrics={field: (11.0 if case.num_tokens == 1 and candidate.config["backend"] == "w4a16" else 10.0)
-                         for field in ("initial_latency_us", "confirmation_latency_us")},
-            ) for candidate in candidates)
+            return tuple(
+                MoeMeasurement(
+                    candidate=candidate,
+                    latency_us=10.0,
+                    cosine=1.0,
+                    metrics={
+                        field: (
+                            11.0
+                            if case.num_tokens == 1
+                            and candidate.config["backend"] == "w4a16"
+                            else 10.0
+                        )
+                        for field in ("initial_latency_us", "confirmation_latency_us")
+                    },
+                )
+                for candidate in candidates
+            )
 
     generator = _generator(calls, quant_mode="nvfp4_auto")
     generator._benchmark_factory = lambda geometry, context: Session()
     context = _context(tmp_path)
     checkpoints = CheckpointStore(tmp_path / "checkpoints")
-    result = generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    result = generator.generate(
+        context, progress=NullProgressReporter(), checkpoints=checkpoints
+    )
     assert len(calls) == 4
-    profile = profile_from_dict({
-        "profile_id": "nvidia.synthetic.48sm",
-        "targets": [{"vendor": "nvidia", "compute_capability": [12, 1], "sm_count": 48,
-                     "product_name": "Synthetic GPU"}],
-        "components": [result.component],
-    })
+    profile = profile_from_dict(
+        {
+            "profile_id": "nvidia.synthetic.48sm",
+            "targets": [
+                {
+                    "vendor": "nvidia",
+                    "compute_capability": [12, 1],
+                    "sm_count": 48,
+                    "product_name": "Synthetic GPU",
+                }
+            ],
+            "components": [result.component],
+        }
+    )
     component = profile.component("moe.decode")
     query = generator._cases[0].query()
     for count, backend in ((1, "micro"), (4, "w4a16")):
@@ -2185,53 +2167,94 @@ def test_auto_precision_qualifies_each_capacity_and_preserves_exact_holes(tmp_pa
     registry = ProfileRegistry()
     registry.register(profile)
     policy = PolicyContext.for_identity(_DEVICE, registry=registry)
-    resolved = policy.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**{**query, "num_tokens": 4, "routed_rows": 8}))
+    resolved = policy.resolve(
+        MOE_DECODE_POLICY,
+        MoeDecodeQuery(**{**query, "num_tokens": 4, "routed_rows": 8}),
+    )
     assert resolved.source is PolicySource.PREPLANNED
     assert resolved.config.backend == "w4a16"
-    miss = policy.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**{**query, "num_tokens": 2, "routed_rows": 4}))
+    miss = policy.resolve(
+        MOE_DECODE_POLICY,
+        MoeDecodeQuery(**{**query, "num_tokens": 2, "routed_rows": 4}),
+    )
     assert miss.source is PolicySource.HEURISTIC
     assert miss.config.backend == "w4a16"
     measured_a4 = policy.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**query))
     assert measured_a4.source is PolicySource.PREPLANNED
     assert measured_a4.config.backend == "micro"
-    heuristic = PolicyContext.for_identity(_DEVICE, mode=PolicyMode.HEURISTIC_ONLY, registry=registry)
-    assert heuristic.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**query)).source is PolicySource.HEURISTIC
-    generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    heuristic = PolicyContext.for_identity(
+        _DEVICE, mode=PolicyMode.HEURISTIC_ONLY, registry=registry
+    )
+    assert (
+        heuristic.resolve(MOE_DECODE_POLICY, MoeDecodeQuery(**query)).source
+        is PolicySource.HEURISTIC
+    )
+    generator.generate(
+        context, progress=NullProgressReporter(), checkpoints=checkpoints
+    )
     assert len(calls) == 4
     generator._precision_identity = "different-source-or-toolchain"
-    generator.generate(context, progress=NullProgressReporter(), checkpoints=checkpoints)
+    generator.generate(
+        context, progress=NullProgressReporter(), checkpoints=checkpoints
+    )
     assert len(calls) == 8
 
 
-@pytest.mark.parametrize("profile_id,route", [
-    ("nvidia.gb10.48sm", "packed"),
-    ("nvidia.rtx.pro.6000.blackwell.max-q", "direct"),
-])
-def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(profile_id, route):
+@pytest.mark.parametrize(
+    "profile_id,route",
+    [
+        ("nvidia.gb10.48sm", "packed"),
+        ("nvidia.rtx.pro.6000.blackwell.max-q", "direct"),
+    ],
+)
+def test_embedded_auto_precision_retains_overrides_and_exact_capacity_coverage(
+    profile_id, route
+):
     from dataclasses import replace
     from b12x.policy import MOE_DECODE, PolicyContext, PolicyMode, PolicySource
-    from b12x.moe.fused_moe._policy import MOE_DECODE_POLICY, MoeDecodeQuery, MoeDecodeConfig
+    from b12x.moe.fused_moe._policy import (
+        MOE_DECODE_POLICY,
+        MoeDecodeQuery,
+        MoeDecodeConfig,
+    )
 
     profile = EMBEDDED_REGISTRY.get(profile_id)
-    context = PolicyContext.for_identity(profile.targets[0], mode=PolicyMode.PREPLANNED_ONLY)
+    context = PolicyContext.for_identity(
+        profile.targets[0], mode=PolicyMode.PREPLANNED_ONLY
+    )
     query = MoeDecodeQuery(
-        quant_mode="nvfp4_auto", source_format="modelopt_nvfp4", activation="silu",
-        num_experts=256, hidden_size=6144, intermediate_size=256, top_k=8, num_tokens=1, routed_rows=8,
+        quant_mode="nvfp4_auto",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=256,
+        top_k=8,
+        num_tokens=1,
+        routed_rows=8,
     )
     for count in range(1, 9):
-        resolution = context.resolve(MOE_DECODE_POLICY, replace(query, num_tokens=count, routed_rows=count * 8))
+        resolution = context.resolve(
+            MOE_DECODE_POLICY, replace(query, num_tokens=count, routed_rows=count * 8)
+        )
         assert resolution.source is PolicySource.PREPLANNED
         assert resolution.config.backend == "w4a16"
         assert resolution.config.w4a16_route_mode == route
     automatic = PolicyContext.for_identity(profile.targets[0])
-    miss = automatic.resolve(MOE_DECODE_POLICY, replace(query, num_tokens=9, routed_rows=72))
+    miss = automatic.resolve(
+        MOE_DECODE_POLICY, replace(query, num_tokens=9, routed_rows=72)
+    )
     assert miss.source is PolicySource.HEURISTIC
     assert miss.config.backend != "w4a16"
-    a4 = MoeDecodeConfig(backend="micro", route_planner="internal", max_active_clusters=None)
+    a4 = MoeDecodeConfig(
+        backend="micro", route_planner="internal", max_active_clusters=None
+    )
     override = automatic.with_override(MOE_DECODE, a4).resolve(MOE_DECODE_POLICY, query)
     assert override.source is PolicySource.OVERRIDE
     assert override.config == a4
-    unknown = PolicyContext.for_identity(replace(profile.targets[0], product_name="Unmeasured GPU"))
+    unknown = PolicyContext.for_identity(
+        replace(profile.targets[0], product_name="Unmeasured GPU")
+    )
     assert unknown.resolve(MOE_DECODE_POLICY, query).source is PolicySource.HEURISTIC
     assert unknown.resolve(MOE_DECODE_POLICY, query).config.backend == "w4a16"
 
@@ -2246,9 +2269,15 @@ def test_auto_precision_heuristic_promotes_supported_decode(capability, capacity
     device = replace(_DEVICE, compute_capability=capability)
     policy = PolicyContext.for_identity(device, mode=PolicyMode.HEURISTIC_ONLY)
     query = MoeDecodeQuery(
-        quant_mode="nvfp4_auto", source_format="modelopt_nvfp4", activation="silu",
-        num_experts=256, hidden_size=6144, intermediate_size=256, top_k=8,
-        num_tokens=capacity, routed_rows=capacity * 8,
+        quant_mode="nvfp4_auto",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=256,
+        top_k=8,
+        num_tokens=capacity,
+        routed_rows=capacity * 8,
     )
     resolution = policy.resolve(MOE_DECODE_POLICY, query)
     assert resolution.source is PolicySource.HEURISTIC

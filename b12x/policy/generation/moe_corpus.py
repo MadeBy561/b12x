@@ -33,7 +33,6 @@ class MoeRecipe:
     minimum_intermediate_size: int
     compatible_activations: tuple[str, ...]
     trellis_variant: str | None = None
-    numerical_recipe: str = "default"
 
     def __post_init__(self) -> None:
         if (
@@ -81,8 +80,8 @@ class MoeModelGeometry:
     recipe_families: tuple[str, ...]
     source: str
     tp_sizes: tuple[int, ...] = COMMON_TP_SIZES
-    expert_parallel: bool = False
 
+    physical_intermediate_alignment: int | None = None
     def __post_init__(self) -> None:
         if not self.model_id or not self.activation or not self.source:
             raise ValueError("model geometry labels must be non-empty")
@@ -102,6 +101,10 @@ class MoeModelGeometry:
         if len(self.tp_sizes) != len(set(self.tp_sizes)):
             raise ValueError("tp_sizes must be unique")
 
+        if self.physical_intermediate_alignment is not None and (
+            self.physical_intermediate_alignment <= 0
+        ):
+            raise ValueError("physical_intermediate_alignment must be positive when set")
 
 @dataclass(frozen=True, kw_only=True)
 class MoeBenchmarkPreset:
@@ -172,7 +175,6 @@ class MoeSweepCase:
     def query(self) -> dict[str, object]:
         return {
             "activation": self.geometry.activation,
-            "numerical_recipe": self.geometry.recipe.numerical_recipe,
             "hidden_size": self.geometry.hidden_size,
             "intermediate_size": self.geometry.intermediate_size,
             "num_experts": self.geometry.num_experts,
@@ -185,16 +187,6 @@ class MoeSweepCase:
 
 
 MOE_RECIPES = (
-    MoeRecipe(
-        recipe_id="deepseek-v41-mxfp4",
-        family_id="deepseek-v41",
-        quant_mode="w4a8_mx",
-        source_format="fp4_e8m0_k32",
-        intermediate_alignment=128,
-        minimum_intermediate_size=128,
-        compatible_activations=("silu",),
-        numerical_recipe="deepseek_v41",
-    ),
     MoeRecipe(
         recipe_id="modelopt-nvfp4-auto",
         family_id="modelopt-nvfp4",
@@ -284,17 +276,27 @@ MOE_RECIPES = (
 COMMON_MOE_MODELS = (
     MoeModelGeometry(
         model_id="deepseek-v4.1-flash",
-        hidden_size=5120, intermediate_size=2304, num_experts=384,
-        native_top_k=6, activation="silu", recipe_families=("deepseek-v41",),
+        hidden_size=5120,
+        intermediate_size=2304,
+        num_experts=384,
+        native_top_k=6,
+        activation="silu",
+        recipe_families=("fp4-e8m0-k32",),
+        physical_intermediate_alignment=128,
         source="DeepSeek-V4.1-Flash inference/model.py:830-904",
-        tp_sizes=(1, 4, 8), expert_parallel=True,
+        tp_sizes=(1, 4, 8),
     ),
     MoeModelGeometry(
         model_id="deepseek-v4.1-dspark",
-        hidden_size=5120, intermediate_size=2304, num_experts=128,
-        native_top_k=3, activation="silu", recipe_families=("deepseek-v41",),
+        hidden_size=5120,
+        intermediate_size=2304,
+        num_experts=128,
+        native_top_k=3,
+        activation="silu",
+        recipe_families=("fp4-e8m0-k32",),
+        physical_intermediate_alignment=128,
         source="DeepSeek-V4.1-Flash inference/model.py:830-904 DSpark expert geometry",
-        tp_sizes=(1, 8), expert_parallel=True,
+        tp_sizes=(1, 4, 8),
     ),
     MoeModelGeometry(
         model_id="qwen3.5-35b-a3b",
@@ -529,7 +531,7 @@ MOE_BENCHMARK_PRESETS = (
     MoeBenchmarkPreset(
         preset_id="deepseek-v4.1-flash",
         model_id="deepseek-v4.1-flash",
-        recipe_id="deepseek-v41-mxfp4",
+        recipe_id="e8m0-w4a8",
         tp_size=4,
     ),
     MoeBenchmarkPreset(
@@ -617,20 +619,21 @@ def expand_physical_geometries(
                 )
             for recipe in compatible_recipes:
                 for tp_size in model.tp_sizes:
-                    if model.expert_parallel:
-                        if model.num_experts % tp_size:
-                            continue
-                        logical_sizes = (model.intermediate_size,)
-                        local_experts = model.num_experts // tp_size
-                    else:
-                        logical_sizes = _logical_shard_sizes(
-                            model.intermediate_size, tp_size,
-                        )
-                        local_experts = model.num_experts
+                    logical_sizes = _logical_shard_sizes(
+                        model.intermediate_size, tp_size,
+                    )
+                    local_experts = model.num_experts
                     if not logical_sizes:
                         continue
                     logical_max = max(logical_sizes)
-                    physical_size = recipe.physical_intermediate_size(logical_max)
+                    physical_alignment = (
+                        model.physical_intermediate_alignment
+                        or recipe.intermediate_alignment
+                    )
+                    physical_size = align_up(
+                        max(logical_max, recipe.minimum_intermediate_size),
+                        physical_alignment,
+                    )
                     key = (
                         recipe.recipe_id,
                         model.activation,
@@ -646,9 +649,7 @@ def expand_physical_geometries(
                             global_intermediate_size=model.intermediate_size,
                             logical_intermediate_sizes=logical_sizes,
                             physical_intermediate_size=physical_size,
-                            padding_per_tp_group=(
-                                0 if model.expert_parallel else physical_size * tp_size - model.intermediate_size
-                            ),
+                            padding_per_tp_group=physical_size * tp_size - model.intermediate_size,
                             native_top_k=model.native_top_k,
                             source=model.source,
                         )
@@ -736,7 +737,7 @@ def expand_sweep_cases(
 
 def corpus_manifest() -> dict[str, object]:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tp_sizes": list(COMMON_TP_SIZES),
         "top_k": list(COMMON_TOP_K),
         "decode_tokens": list(COMMON_DECODE_TOKENS),
