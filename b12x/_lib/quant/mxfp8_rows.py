@@ -232,8 +232,6 @@ class _MXFP8RowsQuantLaunch:
                     _, scale_byte = pow2_ceil_ue8m0(
                         max_abs * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
-                    if max_abs == cutlass.Float32(0.0):
-                        scale_byte = Uint32(127)
                     inv_scale = ue8m0_to_output_scale(scale_byte)
                     payload = cvt_f32x4_to_e4m3x4(
                         values[0] * inv_scale,

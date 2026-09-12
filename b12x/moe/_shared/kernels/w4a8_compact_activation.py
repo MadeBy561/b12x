@@ -122,7 +122,6 @@ class W4A8CompactMicroActivationKernel:
                             amax,
                             cute.arch.shuffle_sync_bfly(amax, offset=1 << shift),
                         )
-                    amax = fmax_f32(amax, cutlass.Float32(1.0e-4))
                     _, scale_byte = pow2_ceil_ue8m0(
                         amax * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )

@@ -380,9 +380,7 @@ def launch_w4a8_compact_micro(
     intermediate = region("intermediate")
     projections = region("projections")
     route = region("route_output").view(torch.bfloat16).view(cap * num_topk, k)
-    quantize_mxfp8_rows_cute(
-        a, values, scale_rows, scale_mma, expected_m=cap, min_amax=1.0e-4
-    )
+    quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
 
     compiled = _compiled_direct_w4a8_compact(
         int(a.device.index or 0),

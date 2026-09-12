@@ -1089,3 +1089,106 @@ def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
                 assert cosine > 0.998, (rows, cosine)
     finally:
         unfreeze_kernel_resolution()
+
+
+def test_compact_n64_micro_zero_and_tiny_blocks_use_common_mxfp8_scales() -> None:
+    _skip_if_unavailable()
+    from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
+    from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
+    from b12x.moe._shared.kernels.w4a8_compact_micro import (
+        _layout,
+        launch_w4a8_compact_micro,
+        micro_scratch_nbytes,
+    )
+
+    n = 192
+    capacity = 2
+    weights = _weights(n=n, seed=191)
+    _, topk_ids, topk_weights = _routed_inputs(capacity, 192)
+    x = torch.zeros(capacity, _K, dtype=torch.bfloat16, device="cuda")
+    x[1] = (
+        torch.linspace(-1.0, 1.0, _K, dtype=torch.float32, device="cuda")
+        * (2.0**-8)
+    ).to(torch.bfloat16)
+    experts = _prepare(weights, n=n)
+    runtime = experts.representation_for("w4a8_mx")
+    scratch = torch.empty(
+        micro_scratch_nbytes(capacity, _K, n, _TOPK),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    launch_w4a8_compact_micro(
+        scratch=scratch,
+        a=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        w13=runtime.w13_rp,
+        w13_scales=runtime.w13_sfb,
+        w2=runtime.w2_rp,
+        w2_scales=runtime.w2_sfb,
+        alpha1=weights["alphas"],
+        alpha2=weights["alphas"],
+        input_scale=weights["input_scale"],
+        down_scale=weights["input_scale"],
+        max_tokens=capacity,
+        num_topk=_TOPK,
+        swiglu_limit=10.0,
+        fast_math=False,
+    )
+    torch.cuda.synchronize()
+
+    layout = _layout(capacity, _TOPK, _K, n)
+
+    def region(name: str) -> torch.Tensor:
+        offset, size = layout[name]
+        return scratch.narrow(0, offset, size)
+
+    input_scales = region("a_scales").view(capacity, _K // 32)
+    assert torch.count_nonzero(input_scales[0]).item() == 0
+    assert torch.count_nonzero(input_scales[1]).item() > 0
+
+    pairs = capacity * _TOPK
+    n_tiles = (n + 127) // 128
+    n_padded = n_tiles * 128
+    projections = region("projections").view(torch.bfloat16).view(pairs, 2 * n)
+    gate = projections[:, :n].float().clamp(max=10.0)
+    up = projections[:, n:].float().clamp(min=-10.0, max=10.0)
+    activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+    activated_padded = torch.zeros(
+        pairs,
+        n_padded,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    activated_padded[:, :n] = activated
+    expected = empty_mxfp8_rows_for_dense_gemm(
+        pairs,
+        n_padded,
+        device="cuda",
+    )
+    quantize_mxfp8_rows_cute(
+        activated_padded,
+        expected.values,
+        expected.scale_rows,
+        expected.scale_mma,
+        expected_m=pairs,
+    )
+    torch.cuda.synchronize()
+
+    intermediate = region("intermediate")
+    payload_bytes = pairs * n_padded
+    activation_scales = (
+        intermediate[payload_bytes:]
+        .view(n_tiles, pairs, 4)
+        .permute(1, 0, 2)
+        .reshape(pairs, n_padded // 32)
+    )
+    torch.testing.assert_close(
+        activation_scales,
+        expected.scale_rows.view(torch.uint8).reshape(pairs, n_padded // 32),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.count_nonzero(activation_scales[:_TOPK]).item() == 0
+    assert torch.count_nonzero(activation_scales[_TOPK:]).item() > 0
