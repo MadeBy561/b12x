@@ -959,7 +959,18 @@ def test_w4a8_mx_dynamic_glm_shard_geometry() -> None:
     assert 0.8 < n_out / n_ref < 1.25, (n_out, n_ref)
 
 
-def test_compact_n64_plan_rebind_and_graph_replay_are_serving_stable() -> None:
+@pytest.mark.parametrize(
+    ("max_tokens", "unseen_counts", "expected_implementation"),
+    (
+        pytest.param(8, (1, 2, 7), "micro", id="micro-capacity"),
+        pytest.param(64, (1, 2, 8, 16), "dynamic", id="dynamic-capacity"),
+    ),
+)
+def test_compact_n64_capacity_plan_reuses_one_callable_for_live_counts(
+    max_tokens: int,
+    unseen_counts: tuple[int, ...],
+    expected_implementation: str,
+) -> None:
     _skip_if_unavailable()
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
     from b12x.moe import fused_moe
@@ -967,12 +978,11 @@ def test_compact_n64_plan_rebind_and_graph_replay_are_serving_stable() -> None:
 
     device = torch.device("cuda", torch.cuda.current_device())
     n = 192
-    max_tokens = 64
-    live_counts = (1, 2, 8, 16, 64)
-    weights = _weights(n=n, seed=117)
-    x, topk_ids, topk_weights = _routed_inputs(max_tokens, 118)
+    replay_counts = (*unseen_counts, max_tokens)
+    weights = _weights(n=n, seed=117 + max_tokens)
+    x, topk_ids, topk_weights = _routed_inputs(max_tokens, 118 + max_tokens)
     references = {}
-    for rows in live_counts:
+    for rows in replay_counts:
         references[rows] = moe_reference_w4a8_mx(
             x[:rows].float(),
             weights["w13_fp4"],
@@ -1000,11 +1010,12 @@ def test_compact_n64_plan_rebind_and_graph_replay_are_serving_stable() -> None:
             device=device,
             weight_plan=experts.plan,
             quant_mode="w4a8_mx",
-            core_token_counts=live_counts,
+            core_token_counts=(max_tokens,),
             route_num_experts=0,
         )
     )
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert plan.launch_plan.implementation == expected_implementation
     assert plan.launch_plan.execution.tile_m == 16
 
     scratch = tuple(
@@ -1026,15 +1037,18 @@ def test_compact_n64_plan_rebind_and_graph_replay_are_serving_stable() -> None:
             fast_math=False,
         )
 
-    for rows in live_counts:
-        fused_moe.run(binding=bind(rows))
+    # Compile and warm only the planned capacity. Every smaller count below is
+    # unseen when kernel resolution freezes and must reuse this exact callable.
+    fused_moe.run(binding=bind(max_tokens))
     torch.cuda.synchronize()
     storage = (*scratch, output, x, topk_ids, topk_weights)
     addresses = tuple(tensor.data_ptr() for tensor in storage)
 
-    freeze_kernel_resolution("compact N64 graph replay uses warmed micro and M16 plans")
+    freeze_kernel_resolution(
+        f"compact N64 {expected_implementation} reuses its capacity callable"
+    )
     try:
-        for rows in live_counts:
+        for rows in replay_counts:
             allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
             binding = bind(rows)
             actual = fused_moe.run(binding=binding)
