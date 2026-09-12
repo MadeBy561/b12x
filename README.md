@@ -106,11 +106,11 @@ caller-owned output, with Int32/Int64 IDs and Int64 table offsets. Its
 live row counts and table extents do not select compiler-cache entries.
 
 The V4.1 serving adapter retains checkpoint-native BF16 weights and activations.
-Model-required accumulation, normalization, routing scores, and ratio-two
-softmax-pooling state remain FP32. Routed MoE contributions are reduced and
-combined with the shared expert in FP32 before the final BF16 cast. Speculative
-rejection preserves per-token compressor partials in request-owned bounded
-rings rather than overwriting one terminal carry state.
+Internal accumulation, normalization, routing scores, and ratio-two
+softmax-pooling state remain FP32 where used by the common implementations.
+MoE output, shared-expert combination, and TP reductions use the same BF16
+boundary as V4.0. Speculative rejection preserves per-token compressor partials
+in request-owned bounded rings rather than overwriting one terminal carry state.
 
 The adapter binds mHC and sparse-attention/indexer plan scratch to vLLM's shared
 workspace. Outputs remain separate, live-row-sized allocations rather than
@@ -302,24 +302,27 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/benchmark_moe.py \
 ```
 
 Use `--model-path` to select a local V4.1 checkpoint and `--tp-rank` to select
-the rank slice (default 0). V4.1 partitions whole experts: TP4 has 96 local
-experts, hidden size 5120, full intermediate width 2304, and global top-k 6.
-Text routing uses the checkpoint gate and selection-only bias; nonlocal routes
-are masked without renormalizing local weights. The timed output is the FP32
-local routed sum, excluding the shared expert and all-reduce.
-V4.1 bindings require FP32 routing weights; lower-precision tensors are rejected
-at bind rather than converted during execution.
+the rank slice (default 0). V4.1 uses tensor parallelism over each expert's
+intermediate channels: TP4 retains all 384 target experts on every rank, with
+hidden size 5120 and logical/physical intermediate width 576. DSpark similarly
+retains all 128 draft experts per rank.
+Text routing uses the checkpoint gate and selection-only bias; expert IDs stay
+global without rank-local masking or renormalization. The timed output is the
+BF16 rank-local routed result, excluding the shared expert and TP all-reduce.
 
-The profile uses V4.1's K32/BF16 rounding and pre-FC2 router-weight placement,
-checks its numerical oracle before timing, and reuses one fixed-capacity
+Serving reuses DSV4's existing MoE module and the shared vLLM b12x backend,
+including TP-sharded shared experts. Earlier whole-expert-sharding measurements
+are historical evidence, not measurements of this TP-only path.
+The vLLM integration reserves shared and routed scratch together with one
+`get_simultaneous` call, then supplies disjoint views while preserving overlap.
+
+The profile uses the same MoE arithmetic, routing-weight placement, kernel
+selection, and BF16 output boundary as V4.0. Checkpoint-specific dimensions,
+TP slicing, and scale layouts remain distinct. It reuses one fixed-capacity
 scratch plan across the requested token counts. Graph replay is checked
-against eager output. The default timing mode flushes L2 outside timed events.
-Decode capacities up to eight tokens use native micro kernels with independent
-gate/up projections, one-row activation broadcasts, and compact routed
-intermediates. Larger capacities retain grouped execution with M16 compute
-chunks inside the existing M64 source layout. Both paths preserve the same
-V4.1 quantization and rounding boundaries; micro does not reuse V4.0's
-BF16-input tiny-decode approximation.
+against eager output; the default timing mode flushes L2 outside timed events.
+The compact N64-tail weight layout uses the common grouped M64 pipeline rather
+than the padded N256/K128 tiny-decode layout.
 This adds a benchmark preset and TP4 policy-generation coverage, not a newly
 tuned embedded GPU profile.
 

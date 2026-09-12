@@ -677,6 +677,7 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
         geometry
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
+        and geometry.intermediate_size % 128 != 64
     )
 
     configs = tuple(
@@ -694,6 +695,34 @@ def test_w4a8_tuner_enumerates_micro_and_dynamic_tiles(
         if config["backend"] == "dynamic"
     } == route_modes
     assert all(config["w4a16_route_mode"] is None for config in configs)
+
+
+def test_compact_n64_w4a8_tuner_exposes_only_common_grouped_m64() -> None:
+    geometry = next(
+        geometry
+        for geometry in expand_physical_geometries()
+        if geometry.recipe.quant_mode == "w4a8_mx"
+        and geometry.recipe.source_format == "fp4_e8m0_k32"
+        and geometry.num_experts == 384
+        and geometry.hidden_size == 5120
+        and geometry.intermediate_size == 576
+    )
+
+    configs = tuple(
+        candidate.config.to_dict()
+        for candidate in _candidates_for_geometry(geometry, sm_count=188)
+    )
+
+    assert configs == (
+        {
+            "backend": "dynamic",
+            "dynamic_route_mode": "grouped",
+            "dynamic_tile_m": 64,
+            "route_planner": "internal",
+            "max_active_clusters": None,
+            "w4a16_route_mode": None,
+        },
+    )
 
 
 
@@ -752,6 +781,7 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         for geometry in expand_physical_geometries()
         if geometry.recipe.quant_mode == quant_mode
         and geometry.activation == "silu"
+        and geometry.intermediate_size % 128 != 64
     )
     cases = expand_sweep_cases(geometries=(geometry,))
     small = next(
@@ -765,7 +795,7 @@ def test_w4a8_tuner_filters_dynamic_specializations_by_real_support(
         case
         for case in cases
         if case.is_model_native_top_k
-        and case.num_tokens == 8
+        and case.num_tokens == 16
         and case.route_pattern == "balanced"
     )
     candidates = _candidates_for_geometry(geometry, sm_count=48)

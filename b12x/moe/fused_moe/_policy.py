@@ -150,6 +150,21 @@ def validate_moe_decode_config(
         raise ValueError("max_active_clusters must be positive when set")
     if config.route_planner != "triton" and config.max_active_clusters is not None:
         raise ValueError("max_active_clusters requires the Triton route planner")
+    compact_n64_w4a8 = bool(
+        query.quant_mode == "w4a8_mx"
+        and query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 64
+    )
+    if compact_n64_w4a8 and (
+        config.backend != "dynamic"
+        or config.route_planner != "internal"
+        or config.dynamic_tile_m != 64
+        or config.dynamic_route_mode != "grouped"
+    ):
+        raise ValueError(
+            "compact N64-tail W4A8 weights require the internal grouped "
+            "dynamic M64 pipeline"
+        )
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:
             raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")

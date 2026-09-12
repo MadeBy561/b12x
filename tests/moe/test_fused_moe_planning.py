@@ -1064,3 +1064,56 @@ def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
     assert resolution.source is PolicySource.HEURISTIC
     assert resolution.config.backend == "w4a16"
     assert resolution.config.w4a16_route_mode == route_mode
+
+
+@pytest.mark.parametrize("num_tokens", (1, 2, 8, 16, 64))
+def test_compact_n64_w4a8_uses_common_grouped_m64_pipeline(
+    num_tokens: int,
+) -> None:
+    query = fused_moe_impl.MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        num_experts=384,
+        hidden_size=5120,
+        intermediate_size=576,
+        top_k=6,
+        num_tokens=num_tokens,
+        routed_rows=num_tokens * 6,
+    )
+
+    config = fused_moe_impl._heuristic_moe_decode_config(query, None)
+
+    assert config == fused_moe_impl.MoeDecodeConfig(
+        backend="dynamic",
+        route_planner="internal",
+        max_active_clusters=None,
+        dynamic_tile_m=64,
+        dynamic_route_mode="grouped",
+        w4a16_route_mode=None,
+    )
+    assert not fused_moe_impl._policy_micro_supported(query)
+
+
+def test_compact_n64_w4a8_rejects_incompatible_profile_config() -> None:
+    from b12x.moe.fused_moe._policy import validate_moe_decode_config
+
+    query = fused_moe_impl.MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        num_experts=384,
+        hidden_size=5120,
+        intermediate_size=576,
+        top_k=6,
+        num_tokens=1,
+        routed_rows=6,
+    )
+    incompatible = fused_moe_impl.MoeDecodeConfig(
+        backend="micro",
+        route_planner="internal",
+        max_active_clusters=None,
+    )
+
+    with pytest.raises(ValueError, match="compact N64-tail"):
+        validate_moe_decode_config(query, incompatible, None)

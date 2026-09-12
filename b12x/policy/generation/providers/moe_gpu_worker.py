@@ -755,8 +755,15 @@ def _candidates_for_geometry(
             )
             for route_mode in route_modes
         )
+    compact_n64_w4a8 = bool(
+        recipe.quant_mode == "w4a8_mx"
+        and recipe.source_format == "fp4_e8m0_k32"
+        and geometry.intermediate_size % 128 == 64
+    )
     if recipe.quant_mode == "w6a8_mx":
         dynamic_tile_ms = (128,)
+    elif compact_n64_w4a8:
+        dynamic_tile_ms = (64,)
     elif recipe.quant_mode == "nvfp4" and geometry.activation == "relu2":
         # The M16/M32 Relu2 kernels require 117760/121856 bytes of shared
         # memory, above the 101376-byte SM120/SM121 opt-in limit.
@@ -764,7 +771,7 @@ def _candidates_for_geometry(
     else:
         dynamic_tile_ms = (16, 32, 64, 128)
     candidates = []
-    if recipe.quant_mode != "w6a8_mx":
+    if recipe.quant_mode != "w6a8_mx" and not compact_n64_w4a8:
         candidates.append(
             MoeCandidate.create(
                 {
@@ -778,9 +785,13 @@ def _candidates_for_geometry(
             )
         )
     dynamic_route_modes = (
-        ("grouped", "direct")
-        if recipe.quant_mode in {"nvfp4", "w4a8_mx"}
-        else ("grouped",)
+        ("grouped",)
+        if compact_n64_w4a8
+        else (
+            ("grouped", "direct")
+            if recipe.quant_mode in {"nvfp4", "w4a8_mx"}
+            else ("grouped",)
+        )
     )
     candidates.extend(
         MoeCandidate.create(

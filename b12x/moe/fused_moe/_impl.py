@@ -2534,6 +2534,11 @@ def _w4a8_mx_micro_supported(
                 weight_E=weight_E,
             )
         )
+    # Exact N64-tail preparation stores compact N128/N64 tiles rather than
+    # tiny_decode's padded N256/K128 layout.  Dispatching that payload to
+    # tiny_decode reads across tile and expert boundaries.
+    if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+        return False
     return _tiny_decode_enabled() and _tiny_decode_supports(
         num_tokens=num_tokens,
         k=k,
@@ -2756,23 +2761,35 @@ def _heuristic_moe_decode_config(
     dynamic_tile_m = None
     dynamic_route_mode = None
     if backend == "dynamic":
-        dynamic_n = _dynamic_kernel_intermediate_size(
-            query.intermediate_size,
-            query.quant_mode,
+        compact_n64_pipeline = bool(
+            query.quant_mode == "w4a8_mx"
+            and query.source_format == "fp4_e8m0_k32"
+            and query.intermediate_size % 128 == 64
         )
-        dynamic_tile_m = _select_dynamic_tile_mn(
-            query.routed_rows,
-            dynamic_n,
-            query.quant_mode,
-            num_experts=query.num_experts,
-            activation=query.activation,
-            compute_capability=(None if device is None else device.compute_capability),
-        )[0]
-        dynamic_route_mode = _heuristic_dynamic_route_mode(
-            query,
-            device,
-            planned_tile_m=dynamic_tile_m,
-        )
+        if compact_n64_pipeline:
+            # Exact N64-tail weights are consumed by the split-materialized
+            # M64 kernels.  The monolithic M16/M32 kernels and tiny_decode use
+            # different padded weight layouts.
+            dynamic_tile_m = 64
+            dynamic_route_mode = "grouped"
+        else:
+            dynamic_n = _dynamic_kernel_intermediate_size(
+                query.intermediate_size,
+                query.quant_mode,
+            )
+            dynamic_tile_m = _select_dynamic_tile_mn(
+                query.routed_rows,
+                dynamic_n,
+                query.quant_mode,
+                num_experts=query.num_experts,
+                activation=query.activation,
+                compute_capability=(None if device is None else device.compute_capability),
+            )[0]
+            dynamic_route_mode = _heuristic_dynamic_route_mode(
+                query,
+                device,
+                planned_tile_m=dynamic_tile_m,
+            )
     return MoeDecodeConfig(
         backend=backend,
         route_planner="internal",

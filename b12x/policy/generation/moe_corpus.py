@@ -282,7 +282,7 @@ COMMON_MOE_MODELS = (
         native_top_k=6,
         activation="silu",
         recipe_families=("fp4-e8m0-k32",),
-        physical_intermediate_alignment=128,
+        physical_intermediate_alignment=32,
         source="DeepSeek-V4.1-Flash inference/model.py:830-904",
         tp_sizes=(1, 4, 8),
     ),
@@ -294,7 +294,7 @@ COMMON_MOE_MODELS = (
         native_top_k=3,
         activation="silu",
         recipe_families=("fp4-e8m0-k32",),
-        physical_intermediate_alignment=128,
+        physical_intermediate_alignment=32,
         source="DeepSeek-V4.1-Flash inference/model.py:830-904 DSpark expert geometry",
         tp_sizes=(1, 4, 8),
     ),
@@ -737,7 +737,7 @@ def expand_sweep_cases(
 
 def corpus_manifest() -> dict[str, object]:
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "tp_sizes": list(COMMON_TP_SIZES),
         "top_k": list(COMMON_TOP_K),
         "decode_tokens": list(COMMON_DECODE_TOKENS),

@@ -46,7 +46,7 @@ def test_common_models_expand_declared_parallel_degrees() -> None:
                     assert (model.model_id, recipe.recipe_id, tp_size) in covered
 
 
-def test_deepseek_v41_tp4_shards_all_experts_and_pads_native_width() -> None:
+def test_deepseek_v41_tp4_shards_all_experts_at_native_width() -> None:
     aliases = {
         alias.model_id: (geometry, alias)
         for geometry in expand_physical_geometries()
@@ -63,11 +63,11 @@ def test_deepseek_v41_tp4_shards_all_experts_and_pads_native_width() -> None:
         geometry, alias = aliases[model_id]
         assert geometry.num_experts == expert_count
         assert geometry.hidden_size == 5120
-        assert geometry.intermediate_size == 640
+        assert geometry.intermediate_size == 576
         assert alias.global_intermediate_size == 2304
         assert alias.logical_intermediate_sizes == (576,)
-        assert alias.physical_intermediate_size == 640
-        assert alias.padding_per_tp_group == 256
+        assert alias.physical_intermediate_size == 576
+        assert alias.padding_per_tp_group == 0
         assert alias.native_top_k == native_top_k
         assert geometry.recipe.quant_mode == "w4a8_mx"
 
