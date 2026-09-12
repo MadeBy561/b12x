@@ -99,6 +99,18 @@ outputs outside `torch.compile` and CUDA graph capture. The V4.1 vLLM adapter
 selects this path with `--engram-config '{"table_memory":"disk"}'` and prepares
 both Engram layers before each target forward, including speculative
 verification. DSpark's own draft/Markov graph has no Engram disk reads.
+The reader registers immutable file descriptors, retires completions in batches,
+and radix-sorts large requests using its existing job allocation as scratch.
+Small requests retain the in-place sorter. Engram defaults to a fixed queue
+depth of 128 (8 MB of native I/O buffers per table); PLE retains 64. No table
+payload is cached between transactions, and live counts do not resize storage.
+
+`benchmarks/benchmark_ngram_ssd.py --models engram --capacities 4096
+--tokens 4096 --seqs 1 --max-seqs 8 --engram-token-bound` measures checkpoint
+prefill transactions; use `--tokens 8 --seqs 8` for batch-eight decode.
+`--reader-library PATH` selects an exact cached native object for diagnostic A/B
+comparisons, independently recording its hash and the current source hashes.
+These are hash/D2H/disk/GPU-decode timings, not full-model or TP-collective timings.
 
 `sequence.embedding` provides exact unquantized BF16/FP32 row lookup into
 caller-owned output, with Int32/Int64 IDs and Int64 table offsets. Its

@@ -59,10 +59,12 @@ struct ple_reader {
     failure_t failure;
     uint64_t lookups, requested_bytes, read_bytes, read_calls;
     uint64_t unique_blocks, coalesced_reads, submit_calls;
-    double execution_seconds;
+    double execution_seconds, planning_seconds;
 #ifdef B12X_HAVE_LIBURING
     struct io_uring ring;
     bool ring_ready;
+    bool files_registered;
+    int *registered_fds;
     struct iovec *iovecs;
     unsigned *free_slots;
 #endif
@@ -103,6 +105,7 @@ static void ple_release(ple_reader_t *reader) {
     if (reader->ring_ready) io_uring_queue_exit(&reader->ring);
     free(reader->iovecs);
     free(reader->free_slots);
+    free(reader->registered_fds);
     for (size_t i = 0; i < reader->file_count; i++) close(reader->files[i].fd);
     free(reader->files);
     free(reader->sources);
@@ -208,6 +211,26 @@ static int ple_source_compare(const void *left, const void *right) {
     return (int)a->scale - (int)b->scale;
 }
 
+static int ple_register_files(ple_reader_t *reader) {
+#ifdef B12X_HAVE_LIBURING
+    int *fds = realloc(reader->registered_fds, reader->file_count * sizeof(*fds));
+    if (!fds) return -ENOMEM;
+    reader->registered_fds = fds;
+    for (size_t i = 0; i < reader->file_count; i++) fds[i] = reader->files[i].fd;
+    if (reader->files_registered) {
+        int error = io_uring_unregister_files(&reader->ring);
+        if (error < 0) return error;
+        reader->files_registered = false;
+    }
+    int error = io_uring_register_files(&reader->ring, fds, (unsigned)reader->file_count);
+    if (!error) reader->files_registered = true;
+    return error;
+#else
+    (void)reader;
+    return 0;
+#endif
+}
+
 static PyObject *py_ple_reader_add(PyObject *self, PyObject *args) {
     (void)self;
     PyObject *capsule;
@@ -258,6 +281,12 @@ static PyObject *py_ple_reader_add(PyObject *self, PyObject *args) {
                         reader->files[file] = (ple_file_t){fd, status.st_dev, status.st_ino, status.st_size};
                         reader->file_count++;
                         fd = -1;
+                        int error = ple_register_files(reader);
+                        if (error < 0) {
+                            reader->poisoned = true;
+                            snprintf(failure.message, sizeof(failure.message),
+                                     "io_uring file registration failed: %s", strerror(-error));
+                        }
                     }
                 } else if (reader->files[file].bytes != status.st_size) {
                     snprintf(failure.message, sizeof(failure.message), "PLE source file size changed during registration");
@@ -297,14 +326,57 @@ static void ple_sift(ple_fragment_t *items, size_t root, size_t count) {
     items[root] = value;
 }
 
-static void ple_sort(ple_fragment_t *items, size_t count) {
-    for (size_t i = count / 2; i > 0; i--) ple_sift(items, i - 1, count);
-    for (size_t end = count; end > 1; end--) {
-        ple_fragment_t value = items[end - 1];
-        items[end - 1] = items[0];
-        items[0] = value;
-        ple_sift(items, 0, end - 1);
+static void ple_sort(ple_reader_t *reader) {
+    ple_fragment_t *items = reader->fragments;
+    size_t count = reader->fragment_count;
+    if (count < 1024) {
+        for (size_t i = count / 2; i > 0; i--) ple_sift(items, i - 1, count);
+        for (size_t end = count; end > 1; end--) {
+            ple_fragment_t value = items[end - 1];
+            items[end - 1] = items[0];
+            items[0] = value;
+            ple_sift(items, 0, end - 1);
+        }
+        return;
     }
+    /* Jobs are built only after sorting. Reuse that fixed-capacity allocation
+     * as radix scratch instead of allocating another prefill-sized buffer. */
+    _Static_assert(sizeof(ple_job_t) >= sizeof(ple_fragment_t),
+                   "job allocation must cover fragment sort scratch");
+    ple_fragment_t *scratch = (ple_fragment_t *)reader->jobs;
+    ple_fragment_t *source = items, *target = scratch;
+    uint64_t offset_variation = 0, file_variation = 0;
+    for (size_t i = 1; i < count; i++) {
+        offset_variation |= (uint64_t)(items[i].offset ^ items[0].offset);
+        file_variation |= (uint64_t)(items[i].file ^ items[0].file);
+    }
+    /* Stable LSD passes sort offset first, then the primary file key. Skip
+     * constant bytes, including the file key for a single-container table. */
+    for (int file = 0; file < 2; file++) {
+        uint64_t variation = file ? file_variation : offset_variation;
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+            if (((variation >> shift) & 255) == 0) continue;
+            size_t positions[256] = {0};
+            for (size_t i = 0; i < count; i++) {
+                uint64_t key = file ? (uint64_t)source[i].file : (uint64_t)source[i].offset;
+                positions[(key >> shift) & 255]++;
+            }
+            size_t prefix = 0;
+            for (unsigned i = 0; i < 256; i++) {
+                size_t size = positions[i];
+                positions[i] = prefix;
+                prefix += size;
+            }
+            for (size_t i = 0; i < count; i++) {
+                uint64_t key = file ? (uint64_t)source[i].file : (uint64_t)source[i].offset;
+                target[positions[(key >> shift) & 255]++] = source[i];
+            }
+            ple_fragment_t *swap = source;
+            source = target;
+            target = swap;
+        }
+    }
+    if (source != items) memcpy(items, source, count * sizeof(*items));
 }
 
 static bool ple_plan(ple_reader_t *reader, const char *ids, char *weights, char *scales, size_t count) {
@@ -341,7 +413,7 @@ static bool ple_plan(ple_reader_t *reader, const char *ids, char *weights, char 
             }
         }
     }
-    ple_sort(reader->fragments, reader->fragment_count);
+    ple_sort(reader);
     size_t cursor = 0;
     while (cursor < reader->fragment_count) {
         size_t begin = cursor;
@@ -387,9 +459,10 @@ static void ple_submit_wave(ple_reader_t *reader, unsigned free_count,
         }
         ple_job_t *job = &reader->jobs[*next];
         reader->slots[slot].job = (*next)++;
-        io_uring_prep_read_fixed(sqe, reader->files[job->file].fd,
+        io_uring_prep_read_fixed(sqe, (int)job->file,
                                 reader->slots[slot].buffer, job->length,
                                 job->offset, (int)slot);
+        sqe->flags |= IOSQE_FIXED_FILE;
         io_uring_sqe_set_data64(sqe, slot);
     }
     unsigned pending = count;
@@ -423,24 +496,16 @@ static void ple_uring_run(ple_reader_t *reader) {
             }
             continue;
         }
-        unsigned free_count = 0;
-        for (;;) {
+        unsigned free_count = 0, head;
+        io_uring_for_each_cqe(&reader->ring, head, cqe) {
             unsigned slot = (unsigned)io_uring_cqe_get_data64(cqe);
             int status = cqe->res;
-            io_uring_cqe_seen(&reader->ring, cqe);
             outstanding--;
             ple_scatter(reader, reader->slots[slot].job, reader->slots[slot].buffer, status);
             reader->free_slots[free_count++] = slot;
             if (!outstanding) break;
-            result = io_uring_peek_cqe(&reader->ring, &cqe);
-            if (result < 0) {
-                if (result != -EAGAIN && result != -EINTR) {
-                    ple_error(reader, "io_uring completion peek", -result);
-                    reader->poisoned = true;
-                }
-                break;
-            }
         }
+        io_uring_cq_advance(&reader->ring, free_count);
         /* Do not prepare refill SQEs until every collected completion has been
          * checked. An I/O error therefore leaves no speculative refill entries. */
         if (!reader->failure.message[0] && next < reader->job_count)
@@ -493,17 +558,24 @@ static PyObject *py_ple_reader_run(PyObject *self, PyObject *args) {
     failure_t failure = {{0}};
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&reader->api_mutex);
-    struct timespec start, end;
+    struct timespec start, planned_at, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     reader->failure.message[0] = 0;
     reader->lookups = count;
     reader->requested_bytes = reader->read_bytes = reader->read_calls = 0;
     reader->unique_blocks = reader->coalesced_reads = reader->submit_calls = 0;
+    reader->planning_seconds = 0;
     if (reader->poisoned)
         snprintf(reader->failure.message, sizeof(reader->failure.message), "PLE io_uring reader is unusable after a submission/completion failure; create a new reader");
-    else if (ple_plan(reader, ids.buf, weights.buf, scales.buf, count) && reader->job_count) {
+    else {
+        bool planned = ple_plan(reader, ids.buf, weights.buf, scales.buf, count);
+        clock_gettime(CLOCK_MONOTONIC, &planned_at);
+        reader->planning_seconds = (double)(planned_at.tv_sec - start.tv_sec) +
+            (double)(planned_at.tv_nsec - start.tv_nsec) * 1e-9;
 #ifdef B12X_HAVE_LIBURING
-        ple_uring_run(reader);
+        if (planned && reader->job_count) ple_uring_run(reader);
+#else
+        (void)planned;
 #endif
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -528,7 +600,7 @@ static PyObject *py_ple_reader_stats(PyObject *self, PyObject *capsule) {
     ple_reader_t *reader = PyCapsule_GetPointer(capsule, PLE_CAPSULE);
     if (!reader) return NULL;
     uint64_t lookups, requested, bytes, calls, blocks, coalesced, submits, staging, metadata;
-    double seconds;
+    double seconds, planning;
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&reader->api_mutex);
     lookups = reader->lookups;
@@ -539,12 +611,14 @@ static PyObject *py_ple_reader_stats(PyObject *self, PyObject *capsule) {
     coalesced = reader->coalesced_reads;
     submits = reader->submit_calls;
     seconds = reader->execution_seconds;
+    planning = reader->planning_seconds;
     staging = (uint64_t)reader->slots_count * PLE_READ_MAX;
     metadata = sizeof(*reader) + reader->capacity * (sizeof(*reader->fragments) + sizeof(*reader->jobs)) +
         reader->slots_count * sizeof(*reader->slots) + reader->source_count * sizeof(*reader->sources) +
         reader->file_count * sizeof(*reader->files);
 #ifdef B12X_HAVE_LIBURING
     metadata += reader->slots_count * (sizeof(*reader->iovecs) + sizeof(*reader->free_slots));
+    metadata += reader->file_count * sizeof(*reader->registered_fds);
     if (reader->ring_ready) {
         metadata += reader->ring.sq.ring_sz;
         if (reader->ring.cq.ring_ptr != reader->ring.sq.ring_ptr) metadata += reader->ring.cq.ring_sz;
@@ -553,11 +627,11 @@ static PyObject *py_ple_reader_stats(PyObject *self, PyObject *capsule) {
 #endif
     pthread_mutex_unlock(&reader->api_mutex);
     Py_END_ALLOW_THREADS
-    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d}",
+    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:d,s:d}",
         "lookups", (unsigned long long)lookups, "requested_bytes", (unsigned long long)requested,
         "read_bytes", (unsigned long long)bytes, "read_calls", (unsigned long long)calls,
         "unique_blocks", (unsigned long long)blocks, "coalesced_reads", (unsigned long long)coalesced,
         "submit_calls", (unsigned long long)submits,
         "staging_bytes", (unsigned long long)staging, "metadata_bytes", (unsigned long long)metadata,
-        "execution_seconds", seconds);
+        "execution_seconds", seconds, "planning_seconds", planning);
 }

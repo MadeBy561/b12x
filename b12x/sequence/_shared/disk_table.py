@@ -1,7 +1,7 @@
 """Bounded io_uring row staging shared by PLE and Engram.
 
-The native reader retains its existing ABI and implementation. This module owns
-only storage, source registration and the host/GPU transaction boundary; hashing
+The native reader owns bounded request planning and I/O. This module owns
+storage, source registration and the host/GPU transaction boundary; hashing
 and numerical decoding belong to each embedding operation.
 """
 

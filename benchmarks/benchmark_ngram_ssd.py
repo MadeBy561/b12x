@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
-import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -45,7 +45,7 @@ WARNING = "Native hash/D2H/event/io_uring/GPU-decode transaction timing; NOT ful
 
 
 def digest(path: pathlib.Path) -> str:
-    # Used only for small code/config/tokenizer/index files, never row payloads.
+    # Used only for source, metadata, and native-object files, never row payloads.
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
@@ -61,6 +61,51 @@ def file_identity(path: pathlib.Path) -> dict[str, Any]:
         "mtime_ns": stat.st_mtime_ns,
         "ctime_ns": stat.st_ctime_ns,
     }
+
+
+_READER_API = (
+    "ple_reader",
+    "ple_reader_add",
+    "ple_reader_run",
+    "ple_reader_stats",
+)
+
+
+def load_reader_library(path: pathlib.Path) -> Any:
+    """Load and validate an exact cached reader object for this process."""
+    path = path.expanduser().resolve(strict=True)
+    if not path.is_file():
+        raise ValueError(f"--reader-library must name a native library file: {path}")
+    spec = importlib.util.spec_from_file_location("_b12x_loader_storage", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load native reader library: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if getattr(module, "ABI_VERSION", None) != 1:
+        raise RuntimeError(
+            f"Native reader ABI mismatch in {path}: "
+            f"expected 1, got {getattr(module, 'ABI_VERSION', None)!r}"
+        )
+    missing = [
+        name for name in _READER_API if not callable(getattr(module, name, None))
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Native reader library {path} is missing reader API: {', '.join(missing)}"
+        )
+    return module
+
+
+def select_native_reader(reader_library: pathlib.Path | None) -> pathlib.Path:
+    """Select the native reader before DiskRowCache imports its loader."""
+    from b12x.loader import _native
+
+    if reader_library is None:
+        module = _native.load()
+    else:
+        module = load_reader_library(reader_library)
+        _native.load = lambda: module
+    return pathlib.Path(module.__file__).resolve()
 
 
 class Checkpoint:
@@ -432,6 +477,9 @@ def make_case(
     token_map: list[int] | None,
 ) -> Case:
     config = checkpoint.config["text_config"]
+    reader_options = (
+        {} if args.queue_depth is None else {"queue_depth": args.queue_depth}
+    )
     common = dict(
         device=torch.device("cuda", args.device),
         max_tokens=capacity,
@@ -466,7 +514,7 @@ def make_case(
                 f"layers.{owner}.engram.embed.scale",
             )
         }
-        table = engram.DiskTable(plan, queue_depth=args.queue_depth)
+        table = engram.DiskTable(plan, **reader_options)
         widths, dtypes = (
             (256, 8),
             (torch.float8_e4m3fn, (torch.uint8, torch.float8_e8m0fnu)),
@@ -514,7 +562,7 @@ def make_case(
             if i * source_rows < plan.shard_end
             and (i + 1) * source_rows > plan.shard_start
         }
-        table = ple_embedding.DiskTable(plan, source_rows, queue_depth=args.queue_depth)
+        table = ple_embedding.DiskTable(plan, source_rows, **reader_options)
         widths, dtypes = (80, 10), (torch.uint8, torch.float8_e4m3fn)
     for index, keys in planes.items():
         for scale, key in enumerate(keys):
@@ -692,8 +740,13 @@ def arguments() -> argparse.Namespace:
     )
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--tp-rank", type=int, default=0)
-    parser.add_argument("--device", type=int, default=0, choices=range(4))
-    parser.add_argument("--queue-depth", type=int, default=64)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--queue-depth",
+        type=int,
+        default=None,
+        help="Override the component's fixed reader depth (Engram 128, PLE 64)",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--stream-queries", type=int, default=4)
     parser.add_argument("--seed", type=int, default=2718)
@@ -724,6 +777,11 @@ def arguments() -> argparse.Namespace:
         "--l2-flush", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--reader-library",
+        type=pathlib.Path,
+        help="Exact cached native b12x reader library for a diagnostic A/B arm",
+    )
+    parser.add_argument(
         "--output", type=pathlib.Path, default=pathlib.Path("/tmp/b12x-ngram-ssd.json")
     )
     args = parser.parse_args()
@@ -746,7 +804,7 @@ def arguments() -> argparse.Namespace:
     ):
         parser.error("Invalid request/TP topology")
     if (
-        not 1 <= args.queue_depth <= 128
+        (args.queue_depth is not None and not 1 <= args.queue_depth <= 128)
         or not 1 <= args.repeats <= 100
         or not 1 <= args.stream_queries <= 128
     ):
@@ -764,13 +822,10 @@ def arguments() -> argparse.Namespace:
         parser.error("No eligible T/L/C case")
     if args.text_file and args.text_file.stat().st_size > 1 << 20:
         parser.error("text-file must be at most 1 MiB")
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible and any(
-        part.strip() not in {"0", "1", "2", "3"} for part in visible.split(",")
-    ):
-        parser.error(
-            "CUDA_VISIBLE_DEVICES must explicitly use only physical GPUs 0-3 (numeric IDs)"
-        )
+    if args.reader_library and not args.reader_library.is_file():
+        parser.error("--reader-library must name an existing native library file")
+    if not 0 <= args.device < torch.cuda.device_count():
+        parser.error("device must name a visible CUDA device")
     return args
 
 
@@ -780,6 +835,24 @@ def main() -> None:
     args = arguments()
     torch.cuda.set_device(args.device)
     root = pathlib.Path(__file__).resolve().parents[1]
+    native_reader_path = select_native_reader(args.reader_library)
+    native_reader_object = {
+        **file_identity(native_reader_path),
+        "sha256": digest(native_reader_path),
+        "selection": "override" if args.reader_library else "default",
+    }
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    worktree_identity = {
+        **file_identity(root),
+        "git_revision": revision,
+        "git_dirty": bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"], cwd=root, text=True
+            ).strip()
+        ),
+    }
     flush = make_l2_flush_fn(args.l2_flush)
     print(WARNING, flush=True)
     metadata = {
@@ -788,6 +861,9 @@ def main() -> None:
             k: str(v) if isinstance(v, pathlib.Path) else v
             for k, v in vars(args).items()
         },
+        "command_argv": [sys.executable, *sys.argv],
+        "worktree_identity": worktree_identity,
+        "native_reader_object": native_reader_object,
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -796,9 +872,7 @@ def main() -> None:
             name: importlib.metadata.version(name)
             for name in ("triton", "transformers", "tokenizers", "safetensors", "vllm")
         },
-        "b12x_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True
-        ).strip(),
+        "b12x_revision": revision,
         "source_sha256": {
             name: digest(root / name)
             for name in (

@@ -127,7 +127,7 @@ class DiskTable:
     """
 
     def __init__(
-        self, plan: Plan, shard_rows: int | None = None, queue_depth: int = 64
+        self, plan: Plan, shard_rows: int | None = None, queue_depth: int = 128
     ) -> None:
         from .._shared.disk_table import DiskRowCache
 
