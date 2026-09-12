@@ -53,9 +53,11 @@ rows (E2M1 plus per-16 E4M3 scales, without a global scale).
 `attention.mla_compress` produces normalized pre-RoPE latents for the
 nonoverlapping ratio-1/ratio-2 compressor. The MXFP4 DSA recipe exposes a
 score/reduce/select boundary and bounded candidate indices for hierarchical
-reindexing; tensor-parallel score reduction precedes selection.
-Its native CuTe scorer dequantizes Q/K to BF16 inside the paged kernel and
-uses BF16 tensor-core dots with FP32 accumulation. Dot results, weighted
+reindexing. The current V4.1 serving adapter replicates all 32 index heads and
+selects locally; integrations that shard index heads must reduce scores first.
+Its native CuTe scorers dequantize Q/K to BF16 inside the paged kernels.
+Prefill uses BF16 tensor-core dots and decode uses SIMT, both with FP32
+accumulation. Dot results, weighted
 products, and the final head sum retain their separate BF16 rounding points.
 
 
@@ -145,11 +147,11 @@ the selected context rows. Replay is intentionally approximate, as described
 in the model report, rather than identical to full-decoder prefill.
 
 The [profile-guided optimization record](validation/deepseek_v41/profile_optimization.json)
-separates full-serving latency from native-kernel diagnostics. V4.1 reuses the
-shared CuTe MLA pipeline with paired-lane PV dequantization, packed SWA pair
-conversion, and native shared-byte loads. These preserve the cache formats,
-FP32 scaling, BF16 rounding, and MMA operands; they do not change the attention
-recipe. Split-merge cache identity also distinguishes dynamic layout ABIs when
+separates full-serving latency from native-kernel diagnostics. Its original
+BF16-path changes—paired-lane PV dequantization, packed SWA pair conversion,
+and native shared-byte loads—preserve that path's arithmetic. The current
+default FP8 arithmetic and its independent oracle are described in the
+attention benchmark section below. Split-merge cache identity also distinguishes dynamic layout ABIs when
 one active split occupies workspaces with different planned capacities.
 
 V4.1 drafting retains its own checkpoint, three draft layers, cache layout and
@@ -353,6 +355,83 @@ alongside the residual/projection pass, then normalizes independent hidden
 tiles. It reuses existing scratch capacity and output storage; prefill keeps
 its established rounding path. Compile identities include the actual static
 block geometry and prepared-lagged mode, never the live token/CTA count.
+Unbound lagged calls retain one native producer/finalizer mode across live
+token counts as well.
+
+## DeepSeek indexer and sparse-MLA benchmarks
+
+`benchmark_dsa_indexer_profiles.py` and `benchmark_sparse_mla_profiles.py`
+load model geometry from the checkpoint config and match the native prepared-Q/K
+contracts in `vllm-hh-rebase`. These are CUDA-graph kernel benchmarks, not
+checkpoint-projection or whole-vLLM-forward timings. Both default to TP4:
+16 local attention heads, but 32 replicated V4.1 index heads (64 for V4.0).
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/benchmark_dsa_indexer_profiles.py \
+  --model-profile deepseek-v4.1-flash \
+  --max-model-len 32768 --contexts 16384,32768 --rows 1,2,4,8 \
+  --output /tmp/dsa-v41.json
+
+CUDA_VISIBLE_DEVICES=0 python benchmarks/benchmark_sparse_mla_profiles.py \
+  --model-profile deepseek-v4.1-flash --batch-sizes 1,2,4,8 \
+  --output /tmp/mla-v41.json
+```
+
+The position-sort stage uses warp-register compare/exchange for local stages,
+CTA synchronization for cross-warp stages, and parallel candidate-length
+reduction. It preserves index/value associations, newest-block inclusion,
+partial-block clipping, and output padding without changing scoring math.
+
+Indexer forms are `c2-dense`, `c1-source` (including publication of up to
+2048 block-8 candidates), and `c1-reindex` over that source-owned candidate
+set. Reuse layers do not run an indexer. Context arguments count original
+tokens, not compressed states; captured V4.1 scoring retains the planned
+capacity even when visibility is smaller. The 32K example exercises real
+candidate pruning beyond the 16K budget.
+
+MLA forms are `swa`, `c2`, `c1`, and `draft-swa`. C1 remains indexed attention,
+not SWA-only. Drafting uses seven query rows per request by default and a
+192-column padded noncausal SWA region. For target prefill, use
+`--modes extend --query-tokens 128 --batch-sizes 1,2,4,8`; `--query-rows`
+instead selects controlled kernel row counts. `--forms` selects a subset.
+V4.1 reuses fixed decode/extend capacities; the V4.0 comparison preserves its
+integration's per-capture-shape planning.
+
+V4.1 decode uses the native FP8 implementation by default, sharing the
+V4-style H8/H16, swapped-QK and FP8-PV machinery. H16 is selected for compatible
+head geometry; narrow or remainder shards retain H8. V4.1 prefill uses BF16
+QK and FP8 P×V, including the 128-token sliding window plus indexed-cache union.
+Precision and decode head grouping are selected once by the plan's typed
+`SparseMlaConfig`; bind/run and graph replay do not consult environment switches
+or resolve policy again. An explicit `plan(..., config=...)` can select the
+BF16 reference/debug path. Benchmark separate plans with
+`--compute-modes bf16,fp8` for either decode or extend.
+The serving cache stays in its native 528/288-byte formats. The I/O producer
+prepares scale ratios in kernel-local shared memory; math warps perform packed
+half2-to-FP8 conversion before tensor-core work. Prefill shares that canonical
+KV tile between BF16 QK and FP8 P×V.
+
+The FP8 implementation has an independent FP8 arithmetic oracle. Benchmark
+cosine/relative-L2 comparisons against BF16 measure approximation error, not
+bitwise equivalence or model-level quality. `--query-rms 1` provides a stronger
+query stress case. `--relative-error-limit` optionally applies a BF16-comparison
+budget; correctness is always checked against the selected arithmetic's oracle.
+MLA timings capture repeated native invocations in one graph to exclude gaps
+from a Python loop submitting tiny graphs.
+
+Switch either command to `--model-profile deepseek-v4-flash` for the native
+FP8 C4 indexer or V4 SWA/C4/C128 MLA forms. Their cache formats and arithmetic
+are different workloads, not interchangeable implementations. `--model-path`
+and `--vllm-path` select explicit config and integration checkouts.
+
+Each profile checks its quantization-aware oracle, graph mutations, frozen
+kernel resolution, fixed storage, and replay allocations before reporting raw
+samples. High physical page IDs beyond a 2-GiB byte offset are enabled by
+default. `--page-stride` supplies an allocator stride; otherwise native payload
+alignment is used. The indexer workload shares a physical prefix between
+queries; MLA gives each request separate cache pages. JSON records those
+contracts, active/planned sizes, source hashes, GPU state, and timing scope.
+The older synthetic indexer and V4.1 MLA diagnostic scripts remain available.
 
 ## Where to look next
 

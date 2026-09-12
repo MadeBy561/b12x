@@ -426,6 +426,7 @@ class CompressedSparseMlaAttentionGenerator(_AttentionGenerator):
             geometry_count=len(SPARSE_MLA_GEOMETRIES),
             benchmark_factory=benchmark_factory or SparseMlaBenchmarkFactory(),
             query_schema_version=2,
+            config_schema_version=2,
             candidate_contract_version=2,
         )
 

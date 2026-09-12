@@ -49,17 +49,39 @@ class SparseMlaQuery:
 @dataclass(frozen=True, kw_only=True)
 class SparseMlaConfig:
     max_chunks_per_row: int
+    v41_compute_mode: str = "fp8"
+    v41_heads_per_block: int = 16
 
     @classmethod
     def from_profile(cls, payload: FrozenMapping) -> "SparseMlaConfig":
-        if set(payload) != {"max_chunks_per_row"}:
+        required = {
+            "max_chunks_per_row",
+            "v41_compute_mode",
+            "v41_heads_per_block",
+        }
+        if set(payload) != required:
             raise ValueError(
-                "sparse MLA profiles require exactly max_chunks_per_row"
+                "sparse MLA profiles require exactly "
+                "max_chunks_per_row, v41_compute_mode, and v41_heads_per_block"
             )
-        value = payload["max_chunks_per_row"]
-        if not isinstance(value, int) or isinstance(value, bool):
+        max_chunks_per_row = payload["max_chunks_per_row"]
+        v41_compute_mode = payload["v41_compute_mode"]
+        v41_heads_per_block = payload["v41_heads_per_block"]
+        if not isinstance(max_chunks_per_row, int) or isinstance(
+            max_chunks_per_row, bool
+        ):
             raise TypeError("sparse MLA max_chunks_per_row must be an integer")
-        return cls(max_chunks_per_row=value)
+        if not isinstance(v41_compute_mode, str):
+            raise TypeError("sparse MLA v41_compute_mode must be a string")
+        if not isinstance(v41_heads_per_block, int) or isinstance(
+            v41_heads_per_block, bool
+        ):
+            raise TypeError("sparse MLA v41_heads_per_block must be an integer")
+        return cls(
+            max_chunks_per_row=max_chunks_per_row,
+            v41_compute_mode=v41_compute_mode,
+            v41_heads_per_block=v41_heads_per_block,
+        )
 
 
 def _heuristic(
@@ -75,7 +97,11 @@ def _heuristic(
         and query.swa_page_size == 64
         and (query.indexed_width == 0 or query.indexed_page_size == 64)
     )
-    return SparseMlaConfig(max_chunks_per_row=1 if uses_single_pass else 64)
+    return SparseMlaConfig(
+        max_chunks_per_row=1 if uses_single_pass else 64,
+        v41_compute_mode="fp8",
+        v41_heads_per_block=16 if query.num_q_heads % 16 == 0 else 8,
+    )
 
 
 def _validate(
@@ -83,14 +109,32 @@ def _validate(
     config: SparseMlaConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    if not isinstance(config, SparseMlaConfig):
+        raise TypeError("sparse MLA config must be SparseMlaConfig")
+    if (
+        not isinstance(config.max_chunks_per_row, int)
+        or isinstance(config.max_chunks_per_row, bool)
+    ):
+        raise TypeError("sparse MLA max_chunks_per_row must be an integer")
     if config.max_chunks_per_row <= 0:
         raise ValueError("sparse MLA max_chunks_per_row must be positive")
+    if not isinstance(config.v41_compute_mode, str):
+        raise TypeError("sparse MLA v41_compute_mode must be a string")
+    if config.v41_compute_mode not in {"fp8", "bf16"}:
+        raise ValueError("sparse MLA v41_compute_mode must be 'fp8' or 'bf16'")
+    if (
+        not isinstance(config.v41_heads_per_block, int)
+        or isinstance(config.v41_heads_per_block, bool)
+    ):
+        raise TypeError("sparse MLA v41_heads_per_block must be an integer")
+    if config.v41_heads_per_block not in {8, 16}:
+        raise ValueError("sparse MLA v41_heads_per_block must be 8 or 16")
 
 
 COMPRESSED_SPARSE_MLA_POLICY = ComponentPolicy(
     component_id=COMPRESSED_SPARSE_MLA_ATTENTION,
     query_schema_version=2,
-    config_schema_version=1,
+    config_schema_version=2,
     query_fields=frozenset(
         {
             "layout",
@@ -108,7 +152,9 @@ COMPRESSED_SPARSE_MLA_POLICY = ComponentPolicy(
             "query_rows",
         }
     ),
-    config_fields=frozenset({"max_chunks_per_row"}),
+    config_fields=frozenset(
+        {"max_chunks_per_row", "v41_compute_mode", "v41_heads_per_block"}
+    ),
     encode_query=SparseMlaQuery.profile_fields,
     decode_profile=SparseMlaConfig.from_profile,
     heuristic=_heuristic,

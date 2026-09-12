@@ -4381,6 +4381,9 @@ def _run_mhc_post_pre_partial_launch(
     compute_gram: bool = False,
     pre_mix: torch.Tensor | None = None,
     y: torch.Tensor | None = None,
+    planned_tokens: int | None = None,
+    decode_source_splits: int | None = None,
+    decode_tile_n: int | None = None,
 ) -> None:
     if (pre_mix is None) != (y is None):
         raise ValueError("pre_mix and y must be supplied together")
@@ -4391,17 +4394,47 @@ def _run_mhc_post_pre_partial_launch(
     hidden_size = int(residual.shape[2])
     split_k = int(partials.shape[1])
     _validate_split_k(hidden_size, split_k)
-    decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
-        num_tokens=tokens, hidden_size=hidden_size
-    )
+    if (decode_source_splits is None) != (decode_tile_n is None):
+        raise ValueError(
+            "decode_source_splits and decode_tile_n must be supplied together"
+        )
+    policy_tokens = tokens if planned_tokens is None else int(planned_tokens)
+    if policy_tokens <= 0:
+        raise ValueError(f"planned_tokens must be positive, got {policy_tokens}")
+    if decode_source_splits is None:
+        decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
+            num_tokens=tokens, hidden_size=hidden_size
+        )
+    else:
+        decode_source_splits = int(decode_source_splits)
+        decode_tile_n = int(decode_tile_n)
+        if decode_source_splits == 0:
+            if decode_tile_n != 0:
+                raise ValueError(
+                    "decode_tile_n must be zero when decode_source_splits is zero"
+                )
+        elif (
+            decode_source_splits < 0
+            or decode_source_splits > _SOURCE_TILES
+            or hidden_size % decode_source_splits != 0
+            or decode_tile_n <= 0
+            or _MIXES % decode_tile_n != 0
+        ):
+            raise ValueError(
+                "invalid static decode source split/tile decision: "
+                f"splits={decode_source_splits}, tile_n={decode_tile_n}"
+            )
+    assert decode_tile_n is not None
     raw_bf16x2 = os.environ.get("B12X_MHC_DECODE_BF16X2")
     decode_bf16x2 = (
         raw_bf16x2 != "0"
         if raw_bf16x2 is not None
-        else tokens == 16 and hidden_size == _HIDDEN and decode_source_splits > 0
+        else policy_tokens == 16
+        and hidden_size == _HIDDEN
+        and decode_source_splits > 0
     )
     partials_per_cta = _selected_post_pre_partials_per_cta(
-        num_tokens=tokens, hidden_size=hidden_size
+        num_tokens=policy_tokens, hidden_size=hidden_size
     )
     _validate_tensor_shape("x", x, (tokens, hidden_size))
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
@@ -4612,6 +4645,9 @@ def _mhc_post_pre_partial_launch_op(
     compute_gram: bool,
     pre_mix: torch.Tensor | None,
     y: torch.Tensor | None,
+    planned_tokens: int | None,
+    decode_source_splits: int | None,
+    decode_tile_n: int | None,
 ) -> None:
     _run_mhc_post_pre_partial_launch(
         x=x,
@@ -4624,6 +4660,9 @@ def _mhc_post_pre_partial_launch_op(
         compute_gram=compute_gram,
         pre_mix=pre_mix,
         y=y,
+        planned_tokens=planned_tokens,
+        decode_source_splits=decode_source_splits,
+        decode_tile_n=decode_tile_n,
     )
 
 
@@ -4639,6 +4678,9 @@ def _mhc_post_pre_partial_launch_fake(
     compute_gram: bool,
     pre_mix: torch.Tensor | None,
     y: torch.Tensor | None,
+    planned_tokens: int | None,
+    decode_source_splits: int | None,
+    decode_tile_n: int | None,
 ) -> None:
     return None
 
@@ -4655,6 +4697,9 @@ def run_mhc_post_pre_partial(
     compute_gram: bool = False,
     pre_mix: torch.Tensor | None = None,
     y: torch.Tensor | None = None,
+    planned_tokens: int | None = None,
+    decode_source_splits: int | None = None,
+    decode_tile_n: int | None = None,
 ) -> None:
     torch.ops.b12x.mhc_post_pre_partial_launch(
         x,
@@ -4667,6 +4712,9 @@ def run_mhc_post_pre_partial(
         bool(compute_gram),
         pre_mix,
         y,
+        planned_tokens,
+        decode_source_splits,
+        decode_tile_n,
     )
 
 

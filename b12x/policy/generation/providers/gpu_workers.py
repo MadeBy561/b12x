@@ -1505,11 +1505,12 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
         width = int(query["swa_width"]) + int(query["indexed_width"])
         indexed_width = int(query["indexed_width"])
         indexed_page_size = int(query["indexed_page_size"])
+        cache_format = str(query["cache_format"])
         capability = tuple(
             torch.cuda.get_device_capability(self._context.device_ordinal)
         )
         uses_single_pass = str(query["mode"]) != "decode" or (
-            str(query["cache_format"]) == "deepseek_v4"
+            cache_format == "deepseek_v4"
             and capability == (12, 1)
             and rows >= 16
             and int(query["num_q_heads"]) == 32
@@ -1528,8 +1529,20 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                 (int(config.chunk_size), int(config.num_chunks)),
                 chunk_cap,
             )
+        v41_heads_per_block = (
+            8
+            if cache_format == "deepseek_v41"
+            and int(query["num_q_heads"]) % 16
+            else 16
+        )
         candidates = tuple(
-            SweepCandidate.create({"max_chunks_per_row": chunk_cap})
+            SweepCandidate.create(
+                {
+                    "max_chunks_per_row": chunk_cap,
+                    "v41_compute_mode": "fp8",
+                    "v41_heads_per_block": v41_heads_per_block,
+                }
+            )
             for chunk_cap in sorted(representatives.values())
         )
         self._candidate_cache[case.case_id] = candidates
@@ -1636,13 +1649,15 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
         from b12x.attention._shared.mla.compressed_reference import (
             COMPRESSED_SPARSE_MLA_HEAD_DIM,
         )
+        from b12x.attention.compressed_sparse_mla._policy import SparseMlaConfig
 
         query = case.query
         settings = self._context.settings
         rows = int(query["query_rows"])
         heads = int(query["num_q_heads"])
         width = int(query["swa_width"]) + int(query["indexed_width"])
-        chunk_cap = int(candidate.config["max_chunks_per_row"])
+        config = SparseMlaConfig.from_profile(candidate.config)
+        chunk_cap = config.max_chunks_per_row
         split_config = compressed_sparse_mla_split_config_for_contract(
             rows=rows,
             width=max(1, width),
@@ -1667,8 +1682,8 @@ class _SparseMlaSession(AbstractContextManager["_SparseMlaSession"]):
                     swa_page_size=int(query["swa_page_size"]),
                     indexed_page_size=int(query["indexed_page_size"]),
                     use_cuda_graph=True,
-                    max_chunks_per_row=chunk_cap,
-                )
+                ),
+                config=config,
             )
             (scratch_spec,) = plan.scratch_specs()
             scratch = torch.empty(

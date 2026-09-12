@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Literal
 
 import torch
@@ -345,9 +346,27 @@ def compressed_sparse_mla_decode_forward(
     from .kernel import run_unified_decode
     from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
 
+    execution_config = getattr(scratch, "execution_config", None)
+    if execution_config is None:
+        raise RuntimeError("compressed MLA scratch is missing execution_config")
     traits = (
-        make_unified_traits(
-            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3, fp8_rope=False
+        replace(
+            make_unified_traits(
+                ModelType.DSV41,
+                (
+                    ComputeMode.FP8
+                    if execution_config.v41_compute_mode == "fp8"
+                    else ComputeMode.BF16
+                ),
+                ScaleFormat.NVFP4_E4M3,
+                fp8_rope=False,
+            ),
+            compute_mode=(
+                ComputeMode.FP8
+                if execution_config.v41_compute_mode == "fp8"
+                else ComputeMode.BF16
+            ),
+            fp8_internal=execution_config.v41_compute_mode == "fp8",
         )
         if cache_format == "deepseek_v41"
         else None
@@ -369,6 +388,7 @@ def compressed_sparse_mla_decode_forward(
         return_lse=return_lse,
         lse_scale=lse_scale,
         out=out,
+        v41_heads_per_block=execution_config.v41_heads_per_block,
         traits_override=traits,
     )
 
@@ -421,9 +441,18 @@ def _run_sm120_compressed_prefill(
     from .kernel import run_unified_prefill
     from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
 
+    execution_config = getattr(workspace, "execution_config", None)
+    if execution_config is None:
+        raise RuntimeError("compressed MLA scratch is missing execution_config")
     traits = (
-        make_unified_traits(
-            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3, fp8_rope=False
+        replace(
+            make_unified_traits(
+                ModelType.DSV41,
+                ComputeMode.BF16,
+                ScaleFormat.NVFP4_E4M3,
+                fp8_rope=False,
+            ),
+            fp8_internal=execution_config.v41_compute_mode == "fp8",
         )
         if getattr(workspace, "cache_format", "deepseek_v4") == "deepseek_v41"
         else None

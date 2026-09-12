@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 import torch
@@ -569,13 +570,17 @@ def test_compressed_sparse_mla_out_param_writes_directly_and_matches() -> None:
 
 
 @pytest.mark.parametrize(
-    "heads,mode,large_pool",
-    [(heads, mode, False) for heads in (8, 16, 32, 64) for mode in ("decode", "extend")]
-    + [(8, mode, True) for mode in ("decode", "extend")],
+    "heads,mode,large_pool,fp8",
+    [(heads, mode, False, False) for heads in (8, 16, 32, 64) for mode in ("decode", "extend")]
+    + [(8, mode, True, False) for mode in ("decode", "extend")]
+    + [(heads, "decode", False, True) for heads in (1, 2, 4, 8, 12, 16, 20, 32, 64)]
+    + [(heads, "extend", False, True) for heads in (8, 16, 32, 64)]
+    + [(8, mode, True, True) for mode in ("decode", "extend")]
+    + [(16, mode, True, "default") for mode in ("decode", "extend")],
 )
 @torch.inference_mode()
 def test_v41_heterogeneous_attention_replay_and_live_rows(
-    heads: int, mode: str, large_pool: bool,
+    heads: int, mode: str, large_pool: bool, fp8: bool | str, monkeypatch,
 ) -> None:
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
     from b12x.attention._shared.mla.compressed_reference import (
@@ -620,6 +625,13 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
         max_chunks_per_row=4,
         use_cuda_graph=True,
     ))
+    if fp8 != "default":
+        execution = replace(
+            plan.policy_resolution.config,
+            v41_compute_mode="fp8" if fp8 else "bf16",
+            v41_heads_per_block=16 if heads % 16 == 0 else 8,
+        )
+        plan = compressed_sparse_mla.plan(plan.caps, config=execution)
     (spec,) = plan.scratch_specs()
     storage = torch.empty(spec.shape, dtype=spec.dtype, device=device)
     binding = plan.bind(
@@ -646,14 +658,40 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
             extra_page_size=page_size, sm_scale=_SM_SCALE, return_lse=True,
             cache_format="deepseek_v41",
         )
-        torch.testing.assert_close(actual, expected, atol=0.035, rtol=0.035)
-        torch.testing.assert_close(lse, expected_lse, atol=0.025, rtol=0.01)
+        if fp8 and live:
+            from tests._reference.v41_fp8 import canonical_fp8_rows, split64_fp8_attention
+
+            swa_data, swa_scales = canonical_fp8_rows(swa_packed, "swa")
+            main_data, main_scales = canonical_fp8_rows(indexed_packed, "indexed")
+            swa_local = swa_indices[:live].long() - page_size
+            main_local = physical.long() - indexed_pid * page_size
+            columns = torch.arange(width, device=device)[None]
+            swa_valid = (columns < lengths[:live, None]) & (swa_local >= 0)
+            main_valid = (columns < indexed_lengths[:live, None]) & (physical >= 0)
+            key_data = torch.cat((swa_data[swa_local.clamp_min(0)], main_data[main_local.clamp_min(0)]), dim=1)
+            key_scales = torch.cat((swa_scales[swa_local.clamp_min(0)], main_scales[main_local.clamp_min(0)]), dim=1)
+            expected, expected_lse = split64_fp8_attention(
+                q[:live], key_data, key_scales, torch.cat((swa_valid, main_valid), dim=1), _SM_SCALE,
+                qk_fp8=mode == "decode",
+                round_split_outputs=mode == "decode",
+            )
+        tolerance = 0.008 if fp8 else 0.035
+        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(lse, expected_lse, atol=0.005 if fp8 else 0.025, rtol=0.005 if fp8 else 0.01)
         if live:
             assert torch.equal(actual[0], torch.zeros_like(actual[0]))
             assert torch.isneginf(lse[0]).all()
 
     warm_output, warm_lse = run(binding, output)
     check(warm_output, warm_lse, rows)
+    # Runtime environment mutations must not change an already-selected plan.
+    monkeypatch.setenv("B12X_MLA_SM120_DSV41_NATIVE", "0" if fp8 else "h8")
+    from b12x.policy import PolicyContext
+
+    def no_runtime_policy(*args, **kwargs):
+        raise AssertionError("bind/run must not resolve component policy")
+
+    monkeypatch.setattr(PolicyContext, "resolve", no_runtime_policy)
     freeze_kernel_resolution("V4.1 live row counts and graph replay reuse planned native kernels")
     try:
         for live in (3, 1, 0):

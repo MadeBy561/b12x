@@ -8,9 +8,15 @@ import pytest
 from benchmarks.benchmark_gdn_decode import QWEN38_GDN_CASES
 from benchmarks.benchmark_paged_attention import BENCHMARK_PROFILES
 from benchmarks.benchmark_qsa import PROFILES as QSA_PROFILES
+from b12x.attention.compressed_sparse_mla._policy import (
+    COMPRESSED_SPARSE_MLA_POLICY,
+    SparseMlaConfig,
+    SparseMlaQuery,
+)
 from b12x.policy import (
     EMBEDDED_REGISTRY,
     DeviceIdentity,
+    FrozenMapping,
     PolicyContext,
     PolicyMode,
     PolicySource,
@@ -45,11 +51,15 @@ from b12x.policy.generation.attention_corpus import (
 from b12x.policy.generation.providers import register_builtin_generators
 from b12x.policy.generation.progress import NullProgressReporter
 from b12x.policy.generation.providers.attention import (
+    CompressedSparseMlaAttentionGenerator,
     GdnAttentionGenerator,
     QsaAttentionGenerator,
     _QsaSession,
 )
-from b12x.policy.generation.providers.gpu_workers import GdnBenchmarkFactory
+from b12x.policy.generation.providers.gpu_workers import (
+    GdnBenchmarkFactory,
+    _SparseMlaSession,
+)
 from b12x.policy.generation.providers.qualification import (
     _DsaIndexerProbe,
     DsaIndexerGenerator,
@@ -243,6 +253,151 @@ def test_gdn_corpus_includes_qwen_and_glm_decay_contracts() -> None:
         if max(case.metadata["query_lengths"]) == int(case.query["state_index_columns"])
     }
     assert exercised == {case.query for case in cases}
+
+def test_compressed_sparse_mla_schema2_profiles_and_resolution_are_exact() -> None:
+    expected_config = {
+        "max_chunks_per_row",
+        "v41_compute_mode",
+        "v41_heads_per_block",
+    }
+    generator = CompressedSparseMlaAttentionGenerator()
+
+    assert generator.query_schema_version == 2
+    assert generator.config_schema_version == 2
+
+    for profile in EMBEDDED_REGISTRY.list_profiles():
+        component = profile.component("attention.compressed_sparse_mla")
+        assert component is not None, profile.profile_id
+        assert component.query_schema_version == 2
+        assert component.config_schema_version == 2
+        assert {frozenset(leaf.config) for leaf in component.config_entries} == {
+            frozenset(expected_config)
+        }
+        assert {
+            leaf.config["v41_compute_mode"] for leaf in component.config_entries
+        } == {"fp8"}
+        assert {
+            leaf.config["v41_heads_per_block"] for leaf in component.config_entries
+        } == {16}
+
+        query = SparseMlaQuery(
+            layout="compressed_dsv4",
+            cache_format="deepseek_v4",
+            mode="decode",
+            q_dtype="bfloat16",
+            kv_dtype="float8_e4m3fn",
+            num_q_heads=16,
+            qk_head_dim=512,
+            v_head_dim=448,
+            swa_width=128,
+            swa_page_size=64,
+            indexed_width=0,
+            indexed_page_size=64,
+            query_rows=1,
+        )
+        planned = PolicyContext.for_identity(
+            profile.targets[0],
+            mode=PolicyMode.PREPLANNED_ONLY,
+        ).resolve(COMPRESSED_SPARSE_MLA_POLICY, query)
+        assert planned.source is PolicySource.PREPLANNED
+        assert planned.config.v41_compute_mode == "fp8"
+        assert planned.config.v41_heads_per_block == 16
+
+        override = SparseMlaConfig(
+            max_chunks_per_row=3,
+            v41_compute_mode="bf16",
+            v41_heads_per_block=8,
+        )
+        overridden = PolicyContext.for_identity(
+            profile.targets[0],
+            mode=PolicyMode.PREPLANNED_ONLY,
+        ).with_override(
+            "attention.compressed_sparse_mla",
+            override,
+        ).resolve(COMPRESSED_SPARSE_MLA_POLICY, query)
+        assert overridden.source is PolicySource.OVERRIDE
+        assert overridden.config == override
+
+
+def test_compressed_sparse_mla_schema2_config_rejects_stale_or_invalid_payloads() -> None:
+    assert SparseMlaConfig(max_chunks_per_row=4) == SparseMlaConfig(
+        max_chunks_per_row=4,
+        v41_compute_mode="fp8",
+        v41_heads_per_block=16,
+    )
+
+    for payload in (
+        {"max_chunks_per_row": 4},
+        {
+            "max_chunks_per_row": 4,
+            "v41_compute_mode": "fp8",
+            "v41_heads_per_block": 16,
+            "unknown": True,
+        },
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            SparseMlaConfig.from_profile(FrozenMapping(payload))
+
+    for config in (
+        SparseMlaConfig(
+            max_chunks_per_row=4,
+            v41_compute_mode="invalid",
+            v41_heads_per_block=16,
+        ),
+        SparseMlaConfig(
+            max_chunks_per_row=4,
+            v41_compute_mode="fp8",
+            v41_heads_per_block=12,
+        ),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            COMPRESSED_SPARSE_MLA_POLICY.validate_config(None, config, None)
+
+def test_sparse_mla_candidates_serialize_complete_v41_execution_config(
+    monkeypatch,
+) -> None:
+    import torch
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _ordinal: (12, 0),
+    )
+    session = _SparseMlaSession(SimpleNamespace(device_ordinal=0))
+    v41_h8_case = next(
+        case
+        for case in sparse_mla_cases()
+        if case.query["cache_format"] == "deepseek_v41"
+        and case.query["num_q_heads"] == 8
+        and case.query["query_rows"] == 1
+    )
+    v4_h8_case = next(
+        case
+        for case in sparse_mla_cases()
+        if case.query["cache_format"] == "deepseek_v4"
+        and case.query["num_q_heads"] == 8
+        and case.query["query_rows"] == 1
+    )
+
+    v41_configs = tuple(
+        candidate.config.to_dict() for candidate in session.candidates(v41_h8_case)
+    )
+    v4_configs = tuple(
+        candidate.config.to_dict() for candidate in session.candidates(v4_h8_case)
+    )
+
+    assert {frozenset(config) for config in (*v41_configs, *v4_configs)} == {
+        frozenset(
+            {
+                "max_chunks_per_row",
+                "v41_compute_mode",
+                "v41_heads_per_block",
+            }
+        )
+    }
+    assert {config["v41_compute_mode"] for config in v41_configs} == {"fp8"}
+    assert {config["v41_heads_per_block"] for config in v41_configs} == {8}
+    assert {config["v41_heads_per_block"] for config in v4_configs} == {16}
 
 
 def test_embedded_gdn_profiles_cover_every_corpus_query() -> None:

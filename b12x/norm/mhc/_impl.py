@@ -33,6 +33,9 @@ MHC_SOURCE_TILE_H = 128
 MHC_GRAM_BLOCK_H = 1024
 MHC_SUPPORTED_HIDDEN_SIZES = (4096, 5120, 7168)
 MHC_SUPPORTED_RMS_EPS = (1.0e-20, 1.0e-6, 1.0e-5)
+# Unbound callers have no capacity contract.  Keep their producer/finalizer
+# selection fixed rather than letting a live view select a new compiled mode.
+MHC_NATIVE_UNBOUND_CAPACITY = 1
 
 
 def run_collapse(
@@ -957,10 +960,15 @@ def _b12x_mhc_pre_impl(
             and pre_mix is not None
             and norm_weight is not None
         )
+        lagged_capacity = (
+            int(binding.plan.caps.max_tokens)
+            if binding is not None
+            else MHC_NATIVE_UNBOUND_CAPACITY
+        )
         lagged_prepared = (
-            pre_mix is not None and not use_lagged_prefill
-            and (binding.plan.caps.max_tokens if binding is not None else tokens)
-            < int(os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
+            pre_mix is not None
+            and not use_lagged_prefill
+            and lagged_capacity < int(os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
         )
         if lagged_prepared:
             _validate_lagged_y_output(
@@ -1316,6 +1324,16 @@ def _b12x_mhc_post_pre_impl(
                 norm_eps=float(norm_eps),
             )
 
+        lagged_capacity = (
+            int(binding.plan.caps.max_tokens)
+            if binding is not None
+            else (
+                int(expected_m)
+                if expected_m is not None
+                else MHC_NATIVE_UNBOUND_CAPACITY
+            )
+        )
+        mode_policy_m = lagged_capacity if pre_mix is not None else policy_m
         prefill_min_tokens = int(
             os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96")
         )
@@ -1330,12 +1348,12 @@ def _b12x_mhc_post_pre_impl(
         else:
             use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
                 norm_weight=norm_weight,
-                policy_m=policy_m,
+                policy_m=mode_policy_m,
             )
         use_prefill_bf16_mma = (
             _use_mhc_prefill_bf16_project(
                 norm_weight=norm_weight,
-                policy_m=policy_m,
+                policy_m=mode_policy_m,
                 fn_bf16=fn_bf16,
             )
             and not use_prefill_tf32_mma
@@ -1344,7 +1362,7 @@ def _b12x_mhc_post_pre_impl(
             not use_prefill_tf32_mma
             and not use_prefill_bf16_mma
             and norm_weight is not None
-            and policy_m >= prefill_min_tokens
+            and mode_policy_m >= prefill_min_tokens
             and os.environ.get("B12X_MHC_PREFILL_BLOCK_M", "1") != "0"
         )
         prefill_block_m_size = int(
@@ -1361,22 +1379,26 @@ def _b12x_mhc_post_pre_impl(
             and not use_prefill_bf16_mma
             and not use_prefill_block_m
             and norm_weight is not None
-            and policy_m >= prefill_min_tokens
+            and mode_policy_m >= prefill_min_tokens
             and os.environ.get("B12X_MHC_PREFILL_COMPACT", "1") != "0"
         )
         decode_source_splits = 0
+        decode_tile_n = 0
         if not (
             use_prefill_tf32_mma
             or use_prefill_bf16_mma
             or use_prefill_block_m
             or use_prefill_compact
         ):
-            decode_source_splits, _ = _selected_post_pre_decode_split_n(
-                num_tokens=tokens,
+            decode_source_splits, decode_tile_n = _selected_post_pre_decode_split_n(
+                num_tokens=lagged_capacity if pre_mix is not None else tokens,
                 hidden_size=hidden_size,
             )
         lagged_prepared = pre_mix is not None and decode_source_splits == 0 and not (
-            use_prefill_tf32_mma or use_prefill_bf16_mma or use_prefill_block_m or use_prefill_compact
+            use_prefill_tf32_mma
+            or use_prefill_bf16_mma
+            or use_prefill_block_m
+            or use_prefill_compact
         )
         if lagged_prepared:
             _validate_lagged_y_output(
@@ -1449,6 +1471,9 @@ def _b12x_mhc_post_pre_impl(
                 compute_gram=norm_weight is not None and pre_mix is None,
                 pre_mix=pre_mix if lagged_prepared else None,
                 y=y_out if lagged_prepared else None,
+                planned_tokens=lagged_capacity if pre_mix is not None else None,
+                decode_source_splits=decode_source_splits if pre_mix is not None else None,
+                decode_tile_n=decode_tile_n if pre_mix is not None else None,
             )
         run_mhc_finalize_gram(
             residual=residual_out,

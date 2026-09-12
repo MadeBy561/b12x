@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ..._lib.gating import default_is_supported
-from ...policy import NO_POLICY_OVERRIDE, PolicyContext, get_auto_policy
+from ...policy import NO_POLICY_OVERRIDE, PolicyContext, PolicySource, get_auto_policy
 from .._shared.mla.api import (
     clear_mla_caches as clear_caches,
 )
@@ -39,11 +39,18 @@ from ._scratch import (
 )
 
 
-def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
-    """Size fixed scratch and resolve the capture-static split contract."""
+def plan(
+    caps: Caps,
+    *,
+    policy: PolicyContext | None = None,
+    config: SparseMlaConfig | None = None,
+) -> Plan:
+    """Size fixed scratch and snapshot its immutable execution configuration."""
 
     if not isinstance(caps, Caps):
         raise TypeError("caps must be compressed_sparse_mla.Caps")
+    if config is not None and not isinstance(config, SparseMlaConfig):
+        raise TypeError("config must be a SparseMlaConfig")
     policy = policy or get_auto_policy(caps.device)
     if not isinstance(policy, PolicyContext):
         raise TypeError("policy must be a PolicyContext")
@@ -63,22 +70,36 @@ def plan(caps: Caps, *, policy: PolicyContext | None = None) -> Plan:
         indexed_page_size=caps.indexed_page_size,
         query_rows=caps.max_q_rows,
     )
-    override = NO_POLICY_OVERRIDE
-    if caps.max_chunks_per_row is not None:
-        override = SparseMlaConfig(
-            max_chunks_per_row=caps.max_chunks_per_row,
-        )
     resolution = policy.resolve(
         COMPRESSED_SPARSE_MLA_POLICY,
         query,
-        override=override,
+        override=config if config is not None else NO_POLICY_OVERRIDE,
     )
+    execution_config = resolution.config
+    if caps.max_chunks_per_row is not None:
+        execution_config = replace(
+            execution_config, max_chunks_per_row=caps.max_chunks_per_row
+        )
+        COMPRESSED_SPARSE_MLA_POLICY.validate_config(
+            query, execution_config, resolution.device
+        )
+        if execution_config != resolution.config:
+            resolution = replace(
+                resolution,
+                config=execution_config,
+                source=PolicySource.OVERRIDE,
+                profile_id=None,
+                rule_name=None,
+                evidence=None,
+            )
     effective_caps = replace(
         caps,
-        max_chunks_per_row=resolution.config.max_chunks_per_row,
+        max_chunks_per_row=execution_config.max_chunks_per_row,
     )
     return replace(
-        plan_compressed_sparse_mla_scratch(effective_caps),
+        plan_compressed_sparse_mla_scratch(
+            effective_caps, execution_config=execution_config
+        ),
         policy_resolution=resolution,
     )
 

@@ -30,6 +30,7 @@ from b12x._lib.scratch import (
     scratch_buffer_spec,
     scratch_tensor,
 )
+from ._policy import SparseMlaConfig
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -183,6 +184,7 @@ class B12XCompressedSparseMLAScratch:
     max_swa_width: int
     max_indexed_width: int
     indexed_page_size: int
+    execution_config: SparseMlaConfig
     layout: str
     mode: str = "decode"
     cache_format: str = "deepseek_v4"
@@ -383,6 +385,7 @@ def _materialize_compressed_sparse_mla_scratch(
     caps: B12XCompressedSparseMLAScratchCaps,
     scratch_storage: torch.Tensor,
     layout: _B12XCompressedSparseMLAScratchLayout,
+    execution_config: SparseMlaConfig,
 ) -> B12XCompressedSparseMLAScratch:
     max_total_q = max(int(caps.max_q_rows), 1)
     tmp_output, _ = materialize_scratch_strided_view(
@@ -460,6 +463,7 @@ def _materialize_compressed_sparse_mla_scratch(
         cache_format=caps.cache_format,
         mode=caps.mode,
         use_cuda_graph=caps.use_cuda_graph,
+        execution_config=execution_config,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         output_buffer=_split_output_buffer_from_tmp(tmp_output),
@@ -680,6 +684,7 @@ class B12XCompressedSparseMLAScratchPlan:
     caps: B12XCompressedSparseMLAScratchCaps
     layout: _B12XCompressedSparseMLAScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    execution_config: SparseMlaConfig
     policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
@@ -708,6 +713,7 @@ class B12XCompressedSparseMLAScratchPlan:
             self.caps,
             scratch_storage,
             self.layout,
+            self.execution_config,
         )
         return build_compressed_sparse_mla_binding(
             scratch=scratch_views,
@@ -722,9 +728,29 @@ class B12XCompressedSparseMLAScratchPlan:
 
 def plan_compressed_sparse_mla_scratch(
     caps: B12XCompressedSparseMLAScratchCaps,
+    *,
+    execution_config: SparseMlaConfig | None = None,
 ) -> B12XCompressedSparseMLAScratchPlan:
+    if execution_config is None:
+        execution_config = SparseMlaConfig(
+            max_chunks_per_row=(
+                64 if caps.max_chunks_per_row is None else caps.max_chunks_per_row
+            ),
+            v41_compute_mode="fp8",
+            v41_heads_per_block=(
+                16 if caps.num_q_heads % 16 == 0 else 8
+            ),
+        )
+    if not isinstance(execution_config, SparseMlaConfig):
+        raise TypeError("execution_config must be SparseMlaConfig")
     if caps.max_chunks_per_row is None:
-        caps = replace(caps, max_chunks_per_row=64)
+        caps = replace(
+            caps, max_chunks_per_row=execution_config.max_chunks_per_row
+        )
+    elif caps.max_chunks_per_row != execution_config.max_chunks_per_row:
+        raise ValueError(
+            "caps.max_chunks_per_row must match execution_config.max_chunks_per_row"
+        )
     layout = _compressed_sparse_mla_scratch_layout(caps)
     return B12XCompressedSparseMLAScratchPlan(
         caps=caps,
@@ -736,6 +762,7 @@ def plan_compressed_sparse_mla_scratch(
                 device=caps.device,
             ),
         ),
+        execution_config=execution_config,
     )
 
 

@@ -754,12 +754,18 @@ class _SortPositions:
         tx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
+        # Each of the eight warps owns one element from every 256-slot stripe.
+        # The first five bitonic levels are therefore warp-local; retain them in
+        # registers and publish only the completed 32-element runs.  Higher
+        # levels retain shared storage only for compare-exchanges that actually
+        # cross a warp boundary.
         si = smem.allocate_tensor(
             Int32, cute.make_layout((self.topk,)), byte_alignment=16
         )
-        sv = smem.allocate_tensor(
-            Float32, cute.make_layout((self.topk,)), byte_alignment=16
-        )
+        if cutlass.const_expr(not self.expand_blocks):
+            sv = smem.allocate_tensor(
+                Float32, cute.make_layout((self.topk,)), byte_alignment=16
+            )
         visible = cutlass.min(
             cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0))
         )
@@ -772,23 +778,75 @@ class _SortPositions:
                 valid = valid and idx * Int32(8) < visible
             else:
                 valid = valid and idx < visible
-            si[slot] = Int32(2147483647)
-            if valid:
-                si[slot] = idx
-            sv[slot] = value
+            if not valid:
+                idx = Int32(2147483647)
+
+            for level in cutlass.range_constexpr(1, 6):
+                for step in cutlass.range_constexpr(level - 1, -1, -1):
+                    other_idx = cute.arch.shuffle_sync_bfly(idx, offset=1 << step)
+                    ascending = ((slot & Int32(1 << level)) == Int32(0)) == (
+                        (slot & Int32(1 << step)) == Int32(0)
+                    )
+                    swap = (ascending and idx > other_idx) or (
+                        not ascending and idx < other_idx
+                    )
+                    if cutlass.const_expr(not self.expand_blocks):
+                        other_value = cute.arch.shuffle_sync_bfly(
+                            value, offset=1 << step
+                        )
+                    if swap:
+                        idx = other_idx
+                        if cutlass.const_expr(not self.expand_blocks):
+                            value = other_value
+            si[slot] = idx
+            if cutlass.const_expr(not self.expand_blocks):
+                sv[slot] = value
         cute.arch.sync_threads()
-        for level in cutlass.range_constexpr(1, self.topk.bit_length()):
-            for step in cutlass.range_constexpr(level - 1, -1, -1):
+
+        for level in cutlass.range_constexpr(6, self.topk.bit_length()):
+            # Steps >= 5 pair lanes from distinct warps, so shared storage and a
+            # CTA fence are required only for these exchanges.
+            for step in cutlass.range_constexpr(level - 1, 4, -1):
                 for slot in cutlass.range(Int32(tx), self.topk, 256):
                     other = slot ^ Int32(1 << step)
                     if other > slot:
-                        a, b = si[slot], si[other]
+                        idx, other_idx = si[slot], si[other]
                         ascending = (slot & Int32(1 << level)) == Int32(0)
-                        if (ascending and a > b) or (not ascending and a < b):
-                            va, vb = sv[slot], sv[other]
-                            si[slot], si[other] = b, a
-                            sv[slot], sv[other] = vb, va
+                        if (ascending and idx > other_idx) or (
+                            not ascending and idx < other_idx
+                        ):
+                            si[slot], si[other] = other_idx, idx
+                            if cutlass.const_expr(not self.expand_blocks):
+                                value, other_value = sv[slot], sv[other]
+                                sv[slot], sv[other] = other_value, value
                 cute.arch.sync_threads()
+
+            # The remaining low-bit stages are again confined to each warp.
+            for slot in cutlass.range(Int32(tx), self.topk, 256):
+                idx = si[slot]
+                if cutlass.const_expr(not self.expand_blocks):
+                    value = sv[slot]
+                for step in cutlass.range_constexpr(4, -1, -1):
+                    other_idx = cute.arch.shuffle_sync_bfly(idx, offset=1 << step)
+                    ascending = ((slot & Int32(1 << level)) == Int32(0)) == (
+                        (slot & Int32(1 << step)) == Int32(0)
+                    )
+                    swap = (ascending and idx > other_idx) or (
+                        not ascending and idx < other_idx
+                    )
+                    if cutlass.const_expr(not self.expand_blocks):
+                        other_value = cute.arch.shuffle_sync_bfly(
+                            value, offset=1 << step
+                        )
+                    if swap:
+                        idx = other_idx
+                        if cutlass.const_expr(not self.expand_blocks):
+                            value = other_value
+                si[slot] = idx
+                if cutlass.const_expr(not self.expand_blocks):
+                    sv[slot] = value
+            cute.arch.sync_threads()
+
         for slot in cutlass.range(Int32(tx), self.topk, 256):
             idx = si[slot]
             valid = idx != Int32(2147483647)
@@ -808,14 +866,32 @@ class _SortPositions:
                 if valid:
                     out[out_pos] = idx
                     out_values[out_pos] = sv[slot]
+
         if cutlass.const_expr(self.expand_blocks):
-            if Int32(tx) == Int32(0):
+            # Reuse the now-dead first eight index slots for a two-stage CTA
+            # reduction; this counts only selected, visible (including partial)
+            # blocks and avoids a serial thread-0 scan.
+            count = Int32(0)
+            for slot in cutlass.range(Int32(tx), self.topk, 256):
+                idx = si[slot]
+                if idx != Int32(2147483647):
+                    count += cutlass.min(Int32(8), visible - idx * Int32(8))
+            lane = Int32(tx) & Int32(31)
+            warp = Int32(tx) >> Int32(5)
+            for offset in cutlass.range_constexpr(5):
+                count += cute.arch.shuffle_sync_bfly(count, offset=1 << offset)
+            cute.arch.sync_threads()
+            if lane == Int32(0):
+                si[warp] = count
+            cute.arch.sync_threads()
+            if warp == Int32(0):
                 count = Int32(0)
-                for slot in cutlass.range(self.topk):
-                    idx = si[slot]
-                    if idx != Int32(2147483647):
-                        count += cutlass.min(Int32(8), visible - idx * Int32(8))
-                out_lengths[row] = count
+                if lane < Int32(8):
+                    count = si[lane]
+                for offset in cutlass.range_constexpr(5):
+                    count += cute.arch.shuffle_sync_bfly(count, offset=1 << offset)
+                if lane == Int32(0):
+                    out_lengths[row] = count
 
 
 @cache
@@ -861,7 +937,7 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         *pointers,
         *scalars,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 7, key),
+        compile_spec=KernelCompileSpec.from_key("attention.indexer.mxfp4", 9, key),
     )
     return raw, dtypes
 
