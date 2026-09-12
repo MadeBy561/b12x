@@ -2550,7 +2550,7 @@ def _w4a8_mx_micro_supported(
     source_format = _canonical_moe_policy_source_format(source_format)
     if numerical_recipe == "deepseek_v41":
         return (
-            1 <= num_tokens <= 8 and k % 256 == 0 and n % 128 == 0
+            1 <= num_tokens <= 8 and k % 256 == 0 and n % 64 == 0
             and activation == "silu" and source_format == "fp4_e8m0_k32"
         )
     if source_format == "b12x_trellis":
@@ -13242,6 +13242,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
         if micro_w4a8_trellis:
             wv = _w4a8_trellis_weight_views(
+                prepared_payload,
+                w1_alphas,
+                w2_alphas,
+            )
+        elif prepared_payload is not None and quant_mode == "w4a8_mx":
+            wv = _w4a8_prepared_weight_views(
                 prepared_payload,
                 w1_alphas,
                 w2_alphas,

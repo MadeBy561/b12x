@@ -1222,15 +1222,18 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
     group_width: int,
     rank: int,
     hidden: int,
+    block_size: tuple[int, int] = (128, 128),
 ) -> WOProjectionMXFP8Weights:
-    """Pack local DSV4 WO-A/WO-B checkpoint FP8 weights for the b12x WO path."""
+    """Pack local DSV4/DSV4.1 FP8 WO-A/WO-B checkpoint weights."""
 
+    block_size = tuple(block_size)
     wo_a = pack_fp8_block_scaled_weight_mxfp8(
         wo_a_weight,
         wo_a_scale,
         m=rank,
         k=group_width,
         num_groups=groups,
+        block_size=block_size,
     )
     wo_b = pack_fp8_block_scaled_weight_mxfp8(
         wo_b_weight,
@@ -1238,6 +1241,7 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         m=hidden,
         k=groups * rank,
         num_groups=1,
+        block_size=block_size,
     )
     return WOProjectionMXFP8Weights(
         wo_a=wo_a,
@@ -1246,7 +1250,7 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         group_width=group_width,
         rank=rank,
         hidden=hidden,
-        sfb_k_replicated=True,
+        sfb_k_replicated=block_size == (128, 128),
     )
 
 

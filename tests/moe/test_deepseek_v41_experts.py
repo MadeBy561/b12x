@@ -112,6 +112,64 @@ def test_deepseek_v41_local_experts_live_counts_and_graph(local_experts, topk, c
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_deepseek_v41_n64_tail_reuses_micro_plan_and_graph():
+    plan, experts, scratch, checkpoint, x, ids, weights, output = _setup(
+        4, 256, 192, 3, 8
+    )
+    assert experts._impl.representation.value.n64_repack
+    assert plan.variant_for(8).implementation == "micro"
+
+    freeze_kernel_resolution("V4.1 N64-tail capacity reuse")
+    try:
+        for count in (1, 4, 8):
+            binding = fused_moe.bind(
+                plan,
+                scratch=scratch,
+                experts=experts,
+                a=x[:count],
+                topk_ids=ids[:count],
+                topk_weights=weights[:count],
+                output=output[:count],
+                input_scales_static=True,
+            )
+            allocated_before = torch.cuda.memory_allocated()
+            fused_moe.run(binding=binding)
+            assert torch.cuda.memory_allocated() == allocated_before
+            torch.testing.assert_close(
+                output[:count],
+                _oracle(x[:count], ids[:count], weights[:count], checkpoint),
+                rtol=0,
+                atol=0.002,
+            )
+
+        binding = fused_moe.bind(
+            plan,
+            scratch=scratch,
+            experts=experts,
+            a=x,
+            topk_ids=ids,
+            topk_weights=weights,
+            output=output,
+            input_scales_static=True,
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fused_moe.run(binding=binding)
+        x.mul_(0.5)
+        weights.mul_(0.75)
+        ids[:, -1] = -1
+        graph.replay()
+        torch.testing.assert_close(
+            output,
+            _oracle(x, ids, weights, checkpoint),
+            rtol=0,
+            atol=0.002,
+        )
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("capacity", [8, 65])
 def test_deepseek_v41_rejects_bf16_route_weights_at_bind(capacity):
     plan, experts, scratch, _, x, ids, weights, output = _setup(4, 256, 128, 3, capacity)

@@ -29,11 +29,12 @@ class V41MicroActivationKernel:
     def __init__(self, n: int, num_experts: int):
         self.n = int(n)
         self.num_experts = int(num_experts)
-        if self.n < 128 or self.n % 128:
-            raise ValueError("V4.1 micro activation requires N divisible by 128")
+        if self.n < 64 or self.n % 64:
+            raise ValueError("V4.1 micro activation requires N divisible by 64")
         if self.num_experts < 1:
             raise ValueError("V4.1 micro activation requires at least one expert")
-        self.n_tiles = self.n // 128
+        self.n_tiles = (self.n + 127) // 128
+        self.n_padded = self.n_tiles * 128
 
     @cute.jit
     def __call__(
@@ -74,77 +75,74 @@ class V41MicroActivationKernel:
             expert = Int64(topk_ids[pair])
             if expert >= Int64(0) and expert < Int64(self.num_experts):
                 col = output_tile * Int32(128) + lane * Int32(4)
-                gate = cute.make_rmem_tensor((4,), cutlass.Float32)
-                up = cute.make_rmem_tensor((4,), cutlass.Float32)
                 value = cute.make_rmem_tensor((4,), cutlass.Float32)
-                for i in cutlass.range_constexpr(4):
-                    gate[i] = projections[pair, col + Int32(i)].to(cutlass.Float32)
-                    up[i] = projections[
-                        pair, Int32(self.n) + col + Int32(i)
-                    ].to(cutlass.Float32)
-                    gate[i] = cutlass.min(gate[i], cutlass.Float32(10.0))
-                    up[i] = cutlass.max(
-                        cutlass.min(up[i], cutlass.Float32(10.0)),
-                        cutlass.Float32(-10.0),
-                    )
+                value.fill(0.0)
+                scale_byte = Uint32(0)
+                if col < Int32(self.n):
+                    gate = cute.make_rmem_tensor((4,), cutlass.Float32)
+                    up = cute.make_rmem_tensor((4,), cutlass.Float32)
+                    for i in cutlass.range_constexpr(4):
+                        gate[i] = projections[pair, col + Int32(i)].to(cutlass.Float32)
+                        up[i] = projections[pair, Int32(self.n) + col + Int32(i)].to(
+                            cutlass.Float32
+                        )
+                        gate[i] = cutlass.min(gate[i], cutlass.Float32(10.0))
+                        up[i] = cutlass.max(
+                            cutlass.min(up[i], cutlass.Float32(10.0)),
+                            cutlass.Float32(-10.0),
+                        )
 
-                route_weight = route_weights[pair].to(cutlass.Float32)
-                for i in cutlass.range_constexpr(4):
-                    silu = div_rn_f32(
-                        gate[i],
-                        cutlass.Float32(1.0)
-                        + cute.math.exp(-gate[i], fastmath=False),
-                    )
-                    # The FP32 route product crosses the required BF16
-                    # activation boundary before the E4M3 conversion.
-                    value[i] = cutlass.BFloat16(silu * up[i] * route_weight).to(
-                        cutlass.Float32
-                    )
+                    route_weight = route_weights[pair].to(cutlass.Float32)
+                    for i in cutlass.range_constexpr(4):
+                        silu = div_rn_f32(
+                            gate[i],
+                            cutlass.Float32(1.0)
+                            + cute.math.exp(-gate[i], fastmath=False),
+                        )
+                        # The FP32 route product crosses the required BF16
+                        # activation boundary before the E4M3 conversion.
+                        value[i] = cutlass.BFloat16(silu * up[i] * route_weight).to(
+                            cutlass.Float32
+                        )
 
-                amax = fabs_f32(value[0])
-                for i in cutlass.range_constexpr(1, 4):
-                    amax = fmax_f32(amax, fabs_f32(value[i]))
-                for shift in cutlass.range_constexpr(3):
-                    amax = fmax_f32(
-                        amax,
-                        cute.arch.shuffle_sync_bfly(amax, offset=1 << shift),
+                    amax = fabs_f32(value[0])
+                    for i in cutlass.range_constexpr(1, 4):
+                        amax = fmax_f32(amax, fabs_f32(value[i]))
+                    for shift in cutlass.range_constexpr(3):
+                        amax = fmax_f32(
+                            amax,
+                            cute.arch.shuffle_sync_bfly(amax, offset=1 << shift),
+                        )
+                    amax = fmax_f32(amax, cutlass.Float32(1.0e-4))
+                    _, scale_byte = pow2_ceil_ue8m0(
+                        amax * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
                     )
-                amax = fmax_f32(amax, cutlass.Float32(1.0e-4))
-                _, scale_byte = pow2_ceil_ue8m0(
-                    amax * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
-                )
-                inv_scale = ue8m0_to_output_scale(scale_byte)
+                    inv_scale = ue8m0_to_output_scale(scale_byte)
+                    for i in cutlass.range_constexpr(4):
+                        value[i] = value[i] * inv_scale
 
                 rows = Int64(projections.shape[0])
-                words_per_row = Int64(self.n // 4)
+                words_per_row = Int64(self.n_padded // 4)
                 physical_row = Int64(pair)
                 intermediate[
-                    physical_row * words_per_row
-                    + output_tile * Int32(32)
-                    + lane
+                    physical_row * words_per_row + output_tile * Int32(32) + lane
                 ] = cvt_f32x4_to_e4m3x4(
-                    value[0] * inv_scale,
-                    value[1] * inv_scale,
-                    value[2] * inv_scale,
-                    value[3] * inv_scale,
+                    value[0],
+                    value[1],
+                    value[2],
+                    value[3],
                 )
 
-                # The N128 scale plane has one packed word per physical row.
-                # Each subgroup leader writes its raw UE8M0 byte directly.
+                # Each N128 scale plane has one packed word per physical row.
+                # Tail padding receives zero scale bytes alongside zero values.
                 if lane % Int32(8) == Int32(0):
                     intermediate_u8 = cute.recast_tensor(intermediate, Uint8)
                     scale_byte_index = (
-                        (
-                            rows * words_per_row
-                            + output_tile * rows
-                            + physical_row
-                        )
-                        * Int32(4)
-                        + lane // Int32(8)
+                        rows * words_per_row + output_tile * rows + physical_row
+                    ) * Int32(4) + lane // Int32(8)
+                    intermediate_u8[scale_byte_index] = (scale_byte & Uint32(0xFF)).to(
+                        Uint8
                     )
-                    intermediate_u8[scale_byte_index] = (
-                        scale_byte & Uint32(0xFF)
-                    ).to(Uint8)
 
 
 __all__ = ["V41MicroActivationKernel"]

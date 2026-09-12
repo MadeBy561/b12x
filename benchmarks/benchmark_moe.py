@@ -3559,6 +3559,11 @@ def bench_e2e() -> None:
         w4a16_native=args.w4a16_native,
         plan=weight_plan,
     )
+    if is_v41:
+        prepared = experts.representation_for("w4a8_mx")
+        if not getattr(prepared, "n64_repack", False):
+            raise RuntimeError("V4.1 benchmark did not select the exact N128/N64 W4A8 route")
+        print("V4.1 W4A8 route: exact N128 bulk with N64 boundary")
     backend_w4a16_weights = None
     make_backend_w4a16_buffers = None
     if use_w4a16:

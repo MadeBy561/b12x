@@ -31,21 +31,27 @@ def _align_up(x: int, alignment: int = _ALIGN) -> int:
 
 
 @functools.cache
-def _layout(max_tokens: int, num_topk: int, k: int, n: int) -> dict[str, tuple[int, int]]:
+def _layout(
+    max_tokens: int, num_topk: int, k: int, n: int
+) -> dict[str, tuple[int, int]]:
     """Return aligned byte ranges for the caller-owned micro workspace."""
     cap = int(max_tokens)
     topk = int(num_topk)
     if cap < 1 or topk < 1 or k < 1 or n < 1:
         raise ValueError("max_tokens, num_topk, k, and n must be positive")
-    if k % 128 or n % 128:
-        raise ValueError("V4.1 W4A8 micro requires K and N divisible by 128")
+    if k % 128 or n < 64 or n % 64:
+        raise ValueError(
+            "V4.1 W4A8 micro requires K divisible by 128 and N divisible by 64"
+        )
     rows = cap * topk
+    n_tiles = _ceil_div(n, 128)
+    n_padded = n_tiles * 128
     regions = (
         ("a_values", cap * k),
         ("a_scales", cap * (k // 32)),
         ("a_mma_scales", _ceil_div(cap, 128) * _ceil_div(k, 128) * 512),
         ("projections", cap * topk * 2 * n * 2),
-        ("intermediate", rows * n + rows * (n // 128) * 4),
+        ("intermediate", rows * n_padded + rows * n_tiles * 4),
         ("route_output", cap * topk * k * 2),
     )
     offset = 0
@@ -64,13 +70,22 @@ def micro_scratch_nbytes(max_tokens: int, k: int, n: int, num_topk: int) -> int:
 
 
 def _ptr(dtype: object, tensor: torch.Tensor, *, align: int = 16):
-    return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
+    return make_ptr(
+        dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
+    )
 
 
 class _DirectV41Launch:
     def __init__(
-        self, *, max_tokens: int, num_topk: int, k: int, n: int, experts: int,
-        input_scale_count: int, down_scale_count: int,
+        self,
+        *,
+        max_tokens: int,
+        num_topk: int,
+        k: int,
+        n: int,
+        experts: int,
+        input_scale_count: int,
+        down_scale_count: int,
     ):
         self.capacity = max_tokens
         self.topk = num_topk
@@ -82,8 +97,12 @@ class _DirectV41Launch:
         self.projection = V41MicroProjectionKernel(k, n, num_topk)
         self.activation = V41MicroActivationKernel(n, experts)
         self.phase2 = W4A8MaterializedPhase2Kernel(
-            source_tile_m=1, deterministic_output=True,
-            numerical_recipe="deepseek_v41", direct_routes=True,
+            source_tile_m=1,
+            deterministic_output=True,
+            numerical_recipe="deepseek_v41",
+            direct_routes=True,
+            n64_repacked=self.n % 128 == 64,
+            n64_tail=self.n % 128 == 64,
         )
 
     @cute.jit
@@ -110,19 +129,37 @@ class _DirectV41Launch:
     ):
         pairs = self.capacity * self.topk
         rows = pairs
-        packed_a = cute.make_tensor(packed_a_ptr, cute.make_layout((self.capacity * self.k,)))
-        a_scales = cute.make_tensor(a_scales_ptr, cute.make_layout((self.capacity * self.k // 32,)))
-        w13_tiles = (self.n // 128) * (self.k // 128) * self.experts
-        w2_tiles = (self.k // 256) * (self.n // 128) * self.experts
-        w13 = cute.make_tensor(w13_ptr, cute.make_layout((w13_tiles * 4096,)))
-        w13_scales = cute.make_tensor(w13_scales_ptr, cute.make_layout((w13_tiles * 256,)))
-        w2 = cute.make_tensor(w2_ptr, cute.make_layout((w2_tiles * 4096,)))
-        w2_scales = cute.make_tensor(w2_scales_ptr, cute.make_layout((w2_tiles * 256,)))
+        packed_a = cute.make_tensor(
+            packed_a_ptr, cute.make_layout((self.capacity * self.k,))
+        )
+        a_scales = cute.make_tensor(
+            a_scales_ptr, cute.make_layout((self.capacity * self.k // 32,))
+        )
+        n_tiles = (self.n + 127) // 128
+        n_padded = n_tiles * 128
+        w13 = cute.make_tensor(
+            w13_ptr,
+            cute.make_layout((self.experts * self.n * self.k // 4,)),
+        )
+        w13_scales = cute.make_tensor(
+            w13_scales_ptr,
+            cute.make_layout((self.experts * self.n * self.k // 64,)),
+        )
+        w2 = cute.make_tensor(
+            w2_ptr,
+            cute.make_layout((self.experts * self.k * self.n // 8,)),
+        )
+        w2_scales = cute.make_tensor(
+            w2_scales_ptr,
+            cute.make_layout((self.experts * self.k * self.n // 128,)),
+        )
         intermediate = cute.make_tensor(
-            intermediate_ptr, cute.make_layout((rows * (self.n + self.n // 32) // 4,)),
+            intermediate_ptr,
+            cute.make_layout((rows * (n_padded + n_tiles * 4) // 4,)),
         )
         projections = cute.make_tensor(
-            projections_ptr, cute.make_ordered_layout((pairs, 2 * self.n), order=(1, 0)),
+            projections_ptr,
+            cute.make_ordered_layout((pairs, 2 * self.n), order=(1, 0)),
         )
         # Direct kernels only use this tensor's bounded shape, never its data.
         token_map = cute.make_tensor(intermediate_ptr, cute.make_layout((rows,)))
@@ -130,24 +167,55 @@ class _DirectV41Launch:
         token_weights = cute.make_tensor(token_weights_ptr, cute.make_layout((pairs,)))
         topk_ids = cute.make_tensor(topk_ids_ptr, cute.make_layout((pairs,)))
         alpha1 = cute.make_tensor(alpha1_ptr, cute.make_layout((self.experts,)))
-        input_scale = cute.make_tensor(input_scale_ptr, cute.make_layout((self.input_scale_count,)))
+        input_scale = cute.make_tensor(
+            input_scale_ptr, cute.make_layout((self.input_scale_count,))
+        )
         alpha2 = cute.make_tensor(alpha2_ptr, cute.make_layout((self.experts,)))
-        down_scale = cute.make_tensor(down_scale_ptr, cute.make_layout((self.down_scale_count,)))
+        down_scale = cute.make_tensor(
+            down_scale_ptr, cute.make_layout((self.down_scale_count,))
+        )
         route_output = cute.make_tensor(
-            route_output_ptr, cute.make_ordered_layout((pairs, self.k), order=(1, 0)),
+            route_output_ptr,
+            cute.make_ordered_layout((pairs, self.k), order=(1, 0)),
         )
         self.projection(
-            packed_a, a_scales, w13, w13_scales, projections, topk_ids,
-            alpha1, input_scale, num_pairs, stream,
+            packed_a,
+            a_scales,
+            w13,
+            w13_scales,
+            projections,
+            topk_ids,
+            alpha1,
+            input_scale,
+            num_pairs,
+            stream,
         )
         self.activation(
-            projections, intermediate, topk_ids, token_weights, num_pairs, stream,
+            projections,
+            intermediate,
+            topk_ids,
+            token_weights,
+            num_pairs,
+            stream,
         )
         self.phase2(
-            intermediate, w2, w2_scales, route_output, token_map,
-            token_weights, topk_ids, unused_metadata, unused_metadata, alpha2,
-            down_scale, packed_a, Int32(self.n // 128),
-            Int32(self.k // 256), max_active_clusters, num_pairs, stream,
+            intermediate,
+            w2,
+            w2_scales,
+            route_output,
+            token_map,
+            token_weights,
+            topk_ids,
+            unused_metadata,
+            unused_metadata,
+            alpha2,
+            down_scale,
+            packed_a,
+            Int32(n_tiles),
+            Int32(self.k // 256),
+            max_active_clusters,
+            num_pairs,
+            stream,
         )
 
 
@@ -164,8 +232,13 @@ def _compiled_direct_v41(
     down_scale_count: int,
 ):
     launch = _DirectV41Launch(
-        max_tokens=max_tokens, num_topk=num_topk, k=k, n=n, experts=experts,
-        input_scale_count=input_scale_count, down_scale_count=down_scale_count,
+        max_tokens=max_tokens,
+        num_topk=num_topk,
+        k=k,
+        n=n,
+        experts=experts,
+        input_scale_count=input_scale_count,
+        down_scale_count=down_scale_count,
     )
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
@@ -173,21 +246,54 @@ def _compiled_direct_v41(
         return make_ptr(dtype, align, cute.AddressSpace.gmem, assumed_align=align)
 
     raise_if_kernel_resolution_frozen(
-        "cute.compile", target=launch,
-        cache_key=(device_index, max_tokens, num_topk, k, n, experts, ids_dtype, input_scale_count, down_scale_count),
+        "cute.compile",
+        target=launch,
+        cache_key=(
+            device_index,
+            max_tokens,
+            num_topk,
+            k,
+            n,
+            experts,
+            ids_dtype,
+            input_scale_count,
+            down_scale_count,
+        ),
     )
     return b12x_compile(
-        launch, dummy(cutlass.Uint8), dummy(cutlass.Uint8),
-        dummy(cutlass.Uint32), dummy(cutlass.Uint32), dummy(cutlass.Uint32),
+        launch,
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint8),
+        dummy(cutlass.Uint32),
+        dummy(cutlass.Uint32),
+        dummy(cutlass.Uint32),
         dummy(cutlass.BFloat16),
-        dummy(cutlass.Float32, 4), dummy(ids_type, 4 if ids_dtype == torch.int32 else 8),
-        dummy(cutlass.Float32), dummy(cutlass.Float32),
-        dummy(cutlass.Uint32), dummy(cutlass.Uint32), dummy(cutlass.BFloat16),
-        dummy(cutlass.Float32), dummy(cutlass.Float32),
-        Int32(1), Int32(1), current_cuda_stream(),
+        dummy(cutlass.Float32, 4),
+        dummy(ids_type, 4 if ids_dtype == torch.int32 else 8),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Uint32),
+        dummy(cutlass.Uint32),
+        dummy(cutlass.BFloat16),
+        dummy(cutlass.Float32),
+        dummy(cutlass.Float32),
+        Int32(1),
+        Int32(1),
+        current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "moe.w4a8.v41_micro", 10,
-            (device_index, max_tokens, num_topk, k, n, experts, str(ids_dtype), input_scale_count, down_scale_count),
+            "moe.w4a8.v41_micro",
+            11,
+            (
+                device_index,
+                max_tokens,
+                num_topk,
+                k,
+                n,
+                experts,
+                str(ids_dtype),
+                input_scale_count,
+                down_scale_count,
+            ),
         ),
     )
 
@@ -201,11 +307,21 @@ def _as_bytes(scratch: torch.Tensor) -> torch.Tensor:
 
 
 def launch_v41_micro(
-    *, scratch: torch.Tensor, a: torch.Tensor, topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor, w13: torch.Tensor, w13_scales: torch.Tensor,
-    w2: torch.Tensor, w2_scales: torch.Tensor, alpha1: torch.Tensor,
-    alpha2: torch.Tensor, input_scale: torch.Tensor, down_scale: torch.Tensor,
-    max_tokens: int, num_topk: int,
+    *,
+    scratch: torch.Tensor,
+    a: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scales: torch.Tensor,
+    alpha1: torch.Tensor,
+    alpha2: torch.Tensor,
+    input_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+    max_tokens: int,
+    num_topk: int,
 ) -> torch.Tensor:
     """Run quantized projections, routed activation, and direct FC2 from fixed scratch."""
     if a.dtype != torch.bfloat16 or a.ndim != 2 or not a.is_contiguous():
@@ -226,10 +342,10 @@ def launch_v41_micro(
     if any(x.numel() not in (1, experts) for x in (input_scale, down_scale)):
         raise ValueError("V4.1 scale tensors must be scalar or per-expert")
     w2_bytes = w2.numel() * w2.element_size()
-    denom = experts * (k // 256) * 4096 * 4
-    if k % 256 or denom == 0 or w2_bytes % denom:
-        raise ValueError("w2 storage does not encode a prepared N256/K128 W4A8 layout")
-    n = (w2_bytes // denom) * 128
+    denom = experts * k
+    if k % 256 or denom == 0 or (2 * w2_bytes) % denom:
+        raise ValueError("w2 storage does not encode an exact prepared W4A8 layout")
+    n = (2 * w2_bytes) // denom
     layout = _layout(cap, num_topk, k, n)
     storage = _as_bytes(scratch)
     if storage.numel() < layout["total"][1]:
@@ -245,25 +361,46 @@ def launch_v41_micro(
     intermediate = region("intermediate")
     projections = region("projections")
     route = region("route_output").view(torch.bfloat16).view(cap * num_topk, k)
-    quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap, min_amax=1.0e-4)
+    quantize_mxfp8_rows_cute(
+        a, values, scale_rows, scale_mma, expected_m=cap, min_amax=1.0e-4
+    )
 
     compiled = _compiled_direct_v41(
-        int(a.device.index or 0), cap, int(num_topk), k, n, experts, topk_ids.dtype,
-        input_scale.numel(), down_scale.numel(),
+        int(a.device.index or 0),
+        cap,
+        int(num_topk),
+        k,
+        n,
+        experts,
+        topk_ids.dtype,
+        input_scale.numel(),
+        down_scale.numel(),
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)
     compiled(
-        _ptr(cutlass.Uint8, values), _ptr(cutlass.Uint8, scale_rows),
-        _ptr(cutlass.Uint32, w13), _ptr(cutlass.Uint32, w13_scales),
+        _ptr(cutlass.Uint8, values),
+        _ptr(cutlass.Uint8, scale_rows),
+        _ptr(cutlass.Uint32, w13),
+        _ptr(cutlass.Uint32, w13_scales),
         _ptr(cutlass.Uint32, intermediate),
         _ptr(cutlass.BFloat16, projections),
         _ptr(cutlass.Float32, weights, align=4),
-        _ptr(cutlass.Int32 if ids.dtype == torch.int32 else cutlass.Int64, ids, align=4 if ids.dtype == torch.int32 else 8),
-        _ptr(cutlass.Float32, alpha1), _ptr(cutlass.Float32, input_scale),
-        _ptr(cutlass.Uint32, w2), _ptr(cutlass.Uint32, w2_scales), _ptr(cutlass.BFloat16, route),
-        _ptr(cutlass.Float32, alpha2), _ptr(cutlass.Float32, down_scale),
-        num_tokens * int(num_topk), get_num_sm(a.device), current_cuda_stream(),
+        _ptr(
+            cutlass.Int32 if ids.dtype == torch.int32 else cutlass.Int64,
+            ids,
+            align=4 if ids.dtype == torch.int32 else 8,
+        ),
+        _ptr(cutlass.Float32, alpha1),
+        _ptr(cutlass.Float32, input_scale),
+        _ptr(cutlass.Uint32, w2),
+        _ptr(cutlass.Uint32, w2_scales),
+        _ptr(cutlass.BFloat16, route),
+        _ptr(cutlass.Float32, alpha2),
+        _ptr(cutlass.Float32, down_scale),
+        num_tokens * int(num_topk),
+        get_num_sm(a.device),
+        current_cuda_stream(),
     )
     return route.narrow(0, 0, num_tokens * int(num_topk))
 

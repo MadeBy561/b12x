@@ -838,6 +838,62 @@ def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
     torch.testing.assert_close(binding.output[:, :, 0], eager, rtol=0, atol=0)
 
 
+def test_wo_projection_block32_pack_preserves_k_scale_bytes() -> None:
+    require_b12x()
+    torch.manual_seed(41004)
+
+    tokens, groups, group_width, rank, hidden = 3, 2, 128, 128, 128
+    x_tgd = (
+        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
+        / 4
+    )
+    wo_a_weight = (
+        torch.randn((groups * rank, group_width), device="cuda", dtype=torch.bfloat16)
+        / 8
+    ).to(torch.float8_e4m3fn)
+    wo_b_weight = (
+        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16) / 8
+    ).to(torch.float8_e4m3fn)
+    wo_a_scale = torch.randint(
+        121,
+        130,
+        (groups * (rank // 32), group_width // 32),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e8m0fnu)
+    wo_b_scale = torch.randint(
+        121,
+        130,
+        (hidden // 32, groups * rank // 32),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e8m0fnu)
+
+    weights = pack_wo_projection_fp8_block_scaled_weights_mxfp8(
+        wo_a_weight,
+        wo_a_scale,
+        wo_b_weight,
+        wo_b_scale,
+        groups=groups,
+        group_width=group_width,
+        rank=rank,
+        hidden=hidden,
+        block_size=(32, 32),
+    )
+    assert not weights.sfb_k_replicated
+
+    actual = wo_projection_mxfp8(binding=_make_wo_projection_binding(x_tgd, weights))
+    x_q = quantize_wo_a_input_mxfp8(x_tgd)
+    x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
+    wo_a_deq = dequantize_mxfp8_rows_torch(weights.wo_a.values, weights.wo_a.scale_rows)
+    tmp = torch.einsum("mkg,rkg->mrg", x_deq, wo_a_deq).to(torch.bfloat16)
+    tmp_q = quantize_wo_b_input_mxfp8(tmp)
+    tmp_deq = dequantize_mxfp8_rows_torch(tmp_q.values, tmp_q.scale_rows)
+    wo_b_deq = dequantize_mxfp8_rows_torch(weights.wo_b.values, weights.wo_b.scale_rows)
+    expected = tmp_deq @ wo_b_deq.T
+    torch.testing.assert_close(actual, expected.to(actual.dtype), rtol=0, atol=0)
+
+
 def test_wo_dense_gemms_sfb_k_reuse_is_byte_identical() -> None:
     require_b12x()
     torch.manual_seed(31007)

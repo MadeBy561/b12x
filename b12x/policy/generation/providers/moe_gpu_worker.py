@@ -738,7 +738,7 @@ def _candidates_for_geometry(
             "dynamic_tile_m": 64, "route_planner": "internal",
             "max_active_clusters": None, "w4a16_route_mode": None,
         })
-        if geometry.hidden_size % 256 or geometry.intermediate_size % 128:
+        if geometry.hidden_size % 256 or geometry.intermediate_size % 64:
             return (dynamic_candidate,)
         return (
             MoeCandidate.create({

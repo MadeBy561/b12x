@@ -699,7 +699,7 @@ def test_deepseek_v41_micro_policy_requires_small_aligned_geometry() -> None:
         activation="silu",
         num_experts=8,
         hidden_size=256,
-        intermediate_size=128,
+        intermediate_size=192,
         top_k=2,
         num_tokens=8,
         routed_rows=16,
@@ -714,6 +714,10 @@ def test_deepseek_v41_micro_policy_requires_small_aligned_geometry() -> None:
     with pytest.raises(ValueError, match="K divisible by 256"):
         validate_moe_decode_config(
             replace(query, hidden_size=384), config, None
+        )
+    with pytest.raises(ValueError, match="N divisible by 64"):
+        validate_moe_decode_config(
+            replace(query, intermediate_size=160), config, None
         )
 
     geometry = next(

@@ -121,10 +121,10 @@ def validate_moe_decode_config(
                 raise ValueError(
                     "deepseek_v41 micro execution requires capacity from 1 to 8"
                 )
-            if query.hidden_size % 256 or query.intermediate_size % 128:
+            if query.hidden_size % 256 or query.intermediate_size % 64:
                 raise ValueError(
                     "deepseek_v41 micro execution requires K divisible by 256 "
-                    "and N divisible by 128"
+                    "and N divisible by 64"
                 )
         elif not dynamic_v41:
             raise ValueError(
