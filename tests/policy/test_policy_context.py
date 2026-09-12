@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, replace
 
 import pytest
@@ -188,46 +187,6 @@ def test_explicit_empty_component_coverage_is_not_a_preplanned_config() -> None:
     del payload["components"][0]["rules"]
     with pytest.raises(ValueError):
         profile_from_dict(payload)
-
-
-def test_auto_warns_once_per_missing_profile_query(caplog) -> None:
-    component = replace(_component(), component_id="test.warning")
-    context = PolicyContext.for_identity(
-        _DEVICE,
-        registry=_registry(component_id=component.component_id),
-    )
-
-    with caplog.at_level(logging.WARNING, logger="b12x.policy.context"):
-        context.resolve(component, _Query(family="a", rows=8))
-        context.resolve(component, _Query(family="b", rows=6))
-        context.resolve(component, _Query(family="a", rows=8))
-
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if "test.warning is using a heuristic" in record.getMessage()
-    ]
-    assert len(messages) == 2
-    assert all("does not cover the query" in message for message in messages)
-    assert any("'family': 'a'" in message for message in messages)
-    assert any("'family': 'b'" in message for message in messages)
-
-
-def test_heuristic_only_does_not_warn(caplog) -> None:
-    component = replace(_component(), component_id="test.explicit_heuristic")
-    context = PolicyContext.for_identity(
-        _DEVICE,
-        mode=PolicyMode.HEURISTIC_ONLY,
-        registry=_registry(),
-    )
-
-    with caplog.at_level(logging.WARNING, logger="b12x.policy.context"):
-        context.resolve(component, _Query(family="a", rows=5))
-
-    assert not any(
-        "test.explicit_heuristic is using a heuristic" in record.getMessage()
-        for record in caplog.records
-    )
 
 
 def test_explicit_override_precedes_profile() -> None:

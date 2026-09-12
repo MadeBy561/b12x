@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 import threading
@@ -29,42 +28,6 @@ NO_POLICY_OVERRIDE = object()
 _COMPONENT_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _QUERY_SCALAR_TYPES = (str, int, float, bool, type(None))
 _RESOLUTION_CACHE_CAPACITY = 4096
-_HEURISTIC_WARNING_KEYS: set[tuple[str, DeviceIdentity | None, str, FrozenMapping]] = (
-    set()
-)
-_HEURISTIC_WARNING_LOCK = threading.Lock()
-logger = logging.getLogger(__name__)
-
-
-def _device_label(device: DeviceIdentity | None) -> str:
-    if device is None:
-        return "an unknown device"
-    major, minor = device.compute_capability
-    return (
-        f"{device.product_name} (compute capability {major}.{minor}, "
-        f"{device.sm_count} SMs)"
-    )
-
-
-def _warn_heuristic_fallback(
-    *,
-    component_id: str,
-    device: DeviceIdentity | None,
-    reason: str,
-    query: FrozenMapping,
-) -> None:
-    key = (component_id, device, reason, query)
-    with _HEURISTIC_WARNING_LOCK:
-        if key in _HEURISTIC_WARNING_KEYS:
-            return
-        _HEURISTIC_WARNING_KEYS.add(key)
-    logger.warning(
-        "b12x policy fallback: %s is using a heuristic on %s because %s; query=%s",
-        component_id,
-        _device_label(device),
-        reason,
-        query.to_dict(),
-    )
 
 
 class PreplannedPolicyNotFoundError(LookupError):
@@ -330,13 +293,9 @@ class PolicyContext:
                 self._cache_resolution(cache_key, resolution),
             )
 
-        fallback_reason = "no embedded profile matches the device"
         if self.mode is not PolicyMode.HEURISTIC_ONLY and self._profile is not None:
             component_profile = self._profile.component(component.component_id)
             if component_profile is not None:
-                fallback_reason = (
-                    f"profile {self._profile.profile_id!r} does not cover the query"
-                )
                 try:
                     self._validate_profile_contract_once(
                         cast(ComponentPolicy[object, object], component),
@@ -369,10 +328,6 @@ class PolicyContext:
                     raise InvalidPreplannedPolicyError(
                         f"invalid preplanned {component.component_id} config"
                     ) from exc
-            else:
-                fallback_reason = (
-                    f"profile {self._profile.profile_id!r} has no component entry"
-                )
 
         if self.mode is PolicyMode.PREPLANNED_ONLY:
             raise PreplannedPolicyNotFoundError(
@@ -382,13 +337,6 @@ class PolicyContext:
 
         config = component.heuristic(query, self.device)
         component.validate_config(query, config, self.device)
-        if self.mode is PolicyMode.AUTO:
-            _warn_heuristic_fallback(
-                component_id=component.component_id,
-                device=self.device,
-                reason=fallback_reason,
-                query=cache_key[1],
-            )
         resolution = PolicyResolution(
             config=config,
             source=PolicySource.HEURISTIC,
