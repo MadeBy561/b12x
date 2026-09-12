@@ -14,7 +14,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-from cutlass.cutlass_dsl import Int32, Int64, Uint32
+from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32
 
 from b12x._lib.intrinsics import (
     cp_async4_shared_global,
@@ -29,6 +29,7 @@ from b12x._lib.intrinsics import (
     scatter_add_bf16x2,
     shared_ptr_to_u32,
     st_global_u32,
+    st_shared_u8,
 )
 from b12x._lib.intrinsics import (
     mxfp8_mma_m16n8k32_f32_e4m3,
@@ -75,9 +76,13 @@ class W4A8MaterializedPhase2Kernel:
         trellis_bits: int | None = None,
         trellis_direct_lut: bool = False,
         numerical_recipe: str = "default",
+        n64_repacked: bool = False,
+        n64_tail: bool = False,
         direct_routes: bool = False,
     ):
         self.deepseek_v41 = numerical_recipe == "deepseek_v41"
+        self.n64_repacked = bool(n64_repacked)
+        self.n64_tail = bool(n64_tail)
         self.direct_routes = bool(direct_routes)
         if self.direct_routes:
             if not self.deepseek_v41 or source_tile_m != 1:
@@ -168,6 +173,95 @@ class W4A8MaterializedPhase2Kernel:
             min_blocks_per_mp=2,
             stream=stream,
         )
+
+    @cute.jit
+    def _stage_n64_b(
+        self,
+        weights: cute.Tensor,
+        dst_base: Int32,
+        expert_idx: Int32,
+        output_tile: Int32,
+        k128_slice: Int32,
+        total_output_tiles: Int32,
+        total_k32: cutlass.Constexpr,
+        tid: Int32,
+    ):
+        transfers = 4 * 4 * 32
+        total_output_n = total_output_tiles * Int32(128)
+        expert_words = total_output_n * Int32(total_k32 * 4)
+        output_base = output_tile * Int32(128 * total_k32 * 4)
+        k32_count = Int32(4)
+        if cutlass.const_expr(self.n64_tail):
+            if k128_slice == Int32(total_k32 // 4):
+                k32_count = Int32(2)
+        for i in cutlass.range_constexpr(
+            (transfers + self.threads_per_cta - 1) // self.threads_per_cta
+        ):
+            idx = tid + Int32(i * self.threads_per_cta)
+            if idx < Int32(transfers):
+                lane = idx & Int32(31)
+                tmp = idx >> Int32(5)
+                n32 = tmp & Int32(3)
+                kb = tmp >> Int32(2)
+                dst_transfer = (kb * Int32(4) + n32) * Int32(32) + lane
+                dst_addr = dst_base + (dst_transfer << Int32(4))
+                if kb < k32_count:
+                    source_word = (
+                        Int64(expert_idx) * Int64(expert_words)
+                        + Int64(output_base)
+                        + Int64(k128_slice * Int32(2048))
+                        + Int64(kb * Int32(512))
+                        + Int64(n32 * Int32(128))
+                        + Int64(lane * Int32(4))
+                    )
+                    cp_async4_shared_global(
+                        dst_addr,
+                        get_ptr_as_int64(weights, source_word),
+                    )
+                else:
+                    st_shared_u32(dst_addr, Uint32(0))
+                    st_shared_u32(dst_addr + Int32(4), Uint32(0))
+                    st_shared_u32(dst_addr + Int32(8), Uint32(0))
+                    st_shared_u32(dst_addr + Int32(12), Uint32(0))
+
+    @cute.jit
+    def _stage_n64_sfb(
+        self,
+        scales: cute.Tensor,
+        dst_base: Int32,
+        expert_idx: Int32,
+        output_tile: Int32,
+        k128_slice: Int32,
+        total_output_tiles: Int32,
+        total_k32: cutlass.Constexpr,
+        tid: Int32,
+    ):
+        scales_u8 = cute.recast_tensor(scales, Uint8)
+        copies = 4 * 128
+        total_output_n = total_output_tiles * Int32(128)
+        expert_bytes = total_output_n * Int32(total_k32)
+        output_base = output_tile * Int32(128 * total_k32)
+        tile_cols = Int32(4)
+        if cutlass.const_expr(self.n64_tail):
+            if k128_slice == Int32(total_k32 // 4):
+                tile_cols = Int32(2)
+        for i in cutlass.range_constexpr(
+            (copies + self.threads_per_cta - 1) // self.threads_per_cta
+        ):
+            idx = tid + Int32(i * self.threads_per_cta)
+            if idx < Int32(copies):
+                row = idx & Int32(127)
+                kb = idx >> Int32(7)
+                value = Uint8(0)
+                if kb < tile_cols:
+                    source_byte = (
+                        Int64(expert_idx) * Int64(expert_bytes)
+                        + Int64(output_base)
+                        + Int64(k128_slice * Int32(512))
+                        + Int64(row * tile_cols + kb)
+                    )
+                    value = scales_u8[source_byte]
+                st_shared_u8(dst_base + row * Int32(4) + kb, value)
 
     @cute.jit
     def _stage_slice(
@@ -270,6 +364,31 @@ class W4A8MaterializedPhase2Kernel:
                 tid,
                 self.threads_per_cta,
                 8,
+            )
+        elif cutlass.const_expr(self.n64_repacked):
+            total_output_tiles = packed_output_tiles * Int32(2)
+            total_k32 = intermediate_tiles * Int32(4)
+            if cutlass.const_expr(self.n64_tail):
+                total_k32 -= Int32(2)
+            self._stage_n64_b(
+                down_rp,
+                b_base,
+                expert_idx,
+                output_tile,
+                intermediate_slice,
+                total_output_tiles,
+                total_k32,
+                tid,
+            )
+            self._stage_n64_sfb(
+                down_sfb_rp,
+                sfb_base,
+                expert_idx,
+                output_tile,
+                intermediate_slice,
+                total_output_tiles,
+                total_k32,
+                tid,
             )
         else:
             # Prepared weights remain N256 tile-major. Compact this CTA's

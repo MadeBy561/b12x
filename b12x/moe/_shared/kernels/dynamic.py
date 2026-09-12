@@ -345,6 +345,107 @@ def _w4a8_stage_repacked_sfb_full(
                 get_ptr_as_int64(sfb_rp_u32, tile_base + Int64(idx * 4)),
             )
 
+@cute.jit
+def _w4a8_stage_n64_b_tile(
+    b_rp_u32: cute.Tensor,
+    smem_base: Int32,
+    expert_idx: Int32,
+    n64_first: Int32,
+    k128_tile: Int32,
+    total_n64: cutlass.Constexpr,
+    total_k32: cutlass.Constexpr,
+    tidx: Int32,
+    tcnt: cutlass.Constexpr,
+):
+    """Stage an exact packed N128/K128 tile from one or two N64 tiles."""
+
+    transfers = 2 * 4 * 2 * 32
+    expert_words = total_n64 * total_k32 * 256
+    for i in cutlass.range_constexpr((transfers + tcnt - 1) // tcnt):
+        idx = tidx + Int32(i * tcnt)
+        if idx < Int32(transfers):
+            lane = idx & Int32(31)
+            tmp = idx >> Int32(5)
+            n32 = tmp & Int32(1)
+            tmp = tmp >> Int32(1)
+            kb = tmp & Int32(3)
+            n64_half = tmp >> Int32(2)
+            source_n64 = n64_first + n64_half
+            source_k32 = k128_tile * Int32(4) + kb
+            dst_transfer = (
+                (kb * Int32(4) + n64_half * Int32(2) + n32) * Int32(32)
+                + lane
+            )
+            dst_addr = smem_base + (dst_transfer << Int32(4))
+            if source_n64 < Int32(total_n64) and source_k32 < Int32(total_k32):
+                source_word = (
+                    Int64(expert_idx) * Int64(expert_words)
+                    + Int64(source_n64) * Int64(total_k32 * 256)
+                    + Int64(source_k32) * Int64(256)
+                    + Int64(n32) * Int64(128)
+                    + Int64(lane) * Int64(4)
+                )
+                cp_async4_shared_global(
+                    dst_addr,
+                    get_ptr_as_int64(b_rp_u32, source_word),
+                )
+            else:
+                st_shared_u32(dst_addr, Uint32(0))
+                st_shared_u32(dst_addr + Int32(4), Uint32(0))
+                st_shared_u32(dst_addr + Int32(8), Uint32(0))
+                st_shared_u32(dst_addr + Int32(12), Uint32(0))
+
+
+@cute.jit
+def _w4a8_stage_n64_sfb_tile(
+    sfb_rp_u32: cute.Tensor,
+    smem_base: Int32,
+    expert_idx: Int32,
+    n64_first: Int32,
+    k128_tile: Int32,
+    total_n64: cutlass.Constexpr,
+    total_k32: cutlass.Constexpr,
+    tidx: Int32,
+    tcnt: cutlass.Constexpr,
+):
+    """Stage exact N64-packed E8M0 bytes into the N128/K128 SFB tile."""
+
+    sfb_u8 = cute.recast_tensor(sfb_rp_u32, Uint8)
+    copies = 2 * 4 * 64
+    expert_bytes = total_n64 * total_k32 * 64
+    full_k_tiles = total_k32 // 4
+    for i in cutlass.range_constexpr((copies + tcnt - 1) // tcnt):
+        idx = tidx + Int32(i * tcnt)
+        if idx < Int32(copies):
+            row = idx & Int32(63)
+            tmp = idx >> Int32(6)
+            kb = tmp & Int32(3)
+            n64_half = tmp >> Int32(2)
+            source_n64 = n64_first + n64_half
+            source_k32 = k128_tile * Int32(4) + kb
+            value = Uint8(0)
+            if source_n64 < Int32(total_n64) and source_k32 < Int32(total_k32):
+                source_kt = source_k32 >> Int32(2)
+                source_kb = source_k32 & Int32(3)
+                tile_cols = Int32(4)
+                tile_base = source_kt * Int32(256)
+                if source_kt == Int32(full_k_tiles):
+                    tile_cols = Int32(total_k32 - full_k_tiles * 4)
+                    tile_base = Int32(full_k_tiles * 256)
+                source_byte = (
+                    Int64(expert_idx) * Int64(expert_bytes)
+                    + Int64(source_n64) * Int64(total_k32 * 64)
+                    + Int64(tile_base)
+                    + Int64(row * tile_cols + source_kb)
+                )
+                value = sfb_u8[source_byte]
+            st_shared_u8(
+                smem_base
+                + (n64_half * Int32(64) + row) * Int32(4)
+                + kb,
+                value,
+            )
+
 
 @cute.jit
 def _w4a8_stage_a_tile(
@@ -701,6 +802,8 @@ class MoEDynamicKernelBackend:
         separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
+        w4a8_n64_repacked: bool = False,
+        w4a8_n64_tail: bool = False,
         direct_routing: bool = False,
         external_route_plan: bool = False,
         materialize_intermediate: bool = False,
@@ -717,15 +820,21 @@ class MoEDynamicKernelBackend:
     ):
         activation = normalize_moe_activation(activation)
         self.deepseek_v41 = numerical_recipe == "deepseek_v41"
-        if numerical_recipe not in {"default", "deepseek_v41"}:
-            raise ValueError(f"unsupported numerical_recipe {numerical_recipe!r}")
-        if self.deepseek_v41 and not (
-            quant_recipe == "w4a8_mx" and activation == "silu"
-            and w4a8_repacked and materialize_intermediate
-            and deterministic_output and mma_tiler_mn == (64, 128)
-            and share_input_across_experts and not direct_routing
-        ):
-            raise ValueError("deepseek_v41 requires the planned materialized M64 W4A8 pipeline")
+        if self.deepseek_v41:
+            materialized_pipeline = (
+                quant_recipe == "w4a8_mx"
+                and activation == "silu"
+                and w4a8_repacked
+                and materialize_intermediate
+                and deterministic_output
+                and mma_tiler_mn == (64, 128)
+                and share_input_across_experts
+                and not direct_routing
+            )
+            if not materialized_pipeline:
+                raise ValueError(
+                    "deepseek_v41 requires the materialized M64 W4A8 pipeline"
+                )
         if quant_recipe not in {
             "nvfp4",
             "w4a8_mx",
@@ -855,6 +964,12 @@ class MoEDynamicKernelBackend:
         self.trellis_coupled = bool(trellis_coupled)
         self.trellis_direct_lut = bool(trellis_direct_lut) and self.w4a8_trellis
         self.w4a8_repacked = bool(w4a8_repacked)
+        self.w4a8_n64_repacked = bool(w4a8_n64_repacked)
+        self.w4a8_n64_tail = bool(w4a8_n64_tail)
+        if self.w4a8_n64_repacked and not self.w4a8_repacked:
+            raise ValueError("w4a8_n64_repacked requires w4a8_repacked")
+        if self.w4a8_n64_tail and not self.w4a8_n64_repacked:
+            raise ValueError("w4a8_n64_tail requires w4a8_n64_repacked")
         self.direct_routing = bool(direct_routing)
         self.external_route_plan = bool(external_route_plan)
         self.materialize_intermediate = bool(materialize_intermediate)
@@ -942,6 +1057,8 @@ class MoEDynamicKernelBackend:
                 source_tile_m=materialized_source_tile_m,
                 deterministic_output=bool(deterministic_output),
                 num_topk=self.num_topk,
+                n64_repacked=self.w4a8_n64_repacked,
+                n64_tail=self.w4a8_n64_tail,
                 trellis_bits=(
                     trellis_bits
                     if self.w4a8_trellis and self.w4a8_split_materialized
@@ -966,6 +1083,8 @@ class MoEDynamicKernelBackend:
                 source_tile_m=materialized_source_tile_m,
                 numerical_recipe=numerical_recipe,
                 deterministic_output=bool(deterministic_output),
+                n64_repacked=self.w4a8_n64_repacked,
+                n64_tail=self.w4a8_n64_tail,
                 trellis_bits=(
                     trellis_bits
                     if self.w4a8_trellis and self.w4a8_split_materialized
@@ -8538,6 +8657,38 @@ class MoEDynamicKernelBackend:
                                                 Int32(lane_id),
                                                 32,
                                             )
+                                    elif cutlass.const_expr(self.w4a8_n64_repacked):
+                                        w4a8_b_dst = (
+                                            w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
+                                        )
+                                        n64_per_projection = (
+                                            b_w13_u32.shape[0] // 2
+                                        ) // 64
+                                        total_w13_k32 = b_w13_u32.shape[1] // 4
+                                        _w4a8_stage_n64_b_tile(
+                                            w13_rp,
+                                            w4a8_b_dst,
+                                            task_expert_idx,
+                                            Int32(n64_per_projection)
+                                            + cur_slice_p * Int32(2),
+                                            Int32(_pkt),
+                                            n64_per_projection * 2,
+                                            total_w13_k32,
+                                            Int32(lane_id),
+                                            32,
+                                        )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            _w4a8_stage_n64_b_tile(
+                                                w13_rp,
+                                                w4a8_b_dst + Int32(128 * 64),
+                                                task_expert_idx,
+                                                cur_slice_p * Int32(2),
+                                                Int32(_pkt),
+                                                n64_per_projection * 2,
+                                                total_w13_k32,
+                                                Int32(lane_id),
+                                                32,
+                                            )
                                     elif cutlass.const_expr(self.w4a8_repacked):
                                         # Canonical compute format: select the
                                         # N128 gate/up halves from their N256
@@ -8704,7 +8855,32 @@ class MoEDynamicKernelBackend:
                                         w4a8_sfb_dst = w4a8_sfbb + (par << Int32(9))
                                     # Trellis B is fully scaled E4M3 with an
                                     # identity SFB word; no SFB staging.
-                                    if cutlass.const_expr(
+                                    if cutlass.const_expr(self.w4a8_n64_repacked):
+                                        _w4a8_stage_n64_sfb_tile(
+                                            w13_sfb_rp,
+                                            w4a8_sfb_dst,
+                                            task_expert_idx,
+                                            Int32(n64_per_projection)
+                                            + cur_slice_p * Int32(2),
+                                            Int32(_pkt),
+                                            n64_per_projection * 2,
+                                            total_w13_k32,
+                                            Int32(lane_id),
+                                            32,
+                                        )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            _w4a8_stage_n64_sfb_tile(
+                                                w13_sfb_rp,
+                                                w4a8_sfb_dst + Int32(512),
+                                                task_expert_idx,
+                                                cur_slice_p * Int32(2),
+                                                Int32(_pkt),
+                                                n64_per_projection * 2,
+                                                total_w13_k32,
+                                                Int32(lane_id),
+                                                32,
+                                            )
+                                    elif cutlass.const_expr(
                                         self.w4a8_repacked
                                         and not self.w4a8_trellis
                                     ):
@@ -8979,6 +9155,35 @@ class MoEDynamicKernelBackend:
                                             Int32(lane_id),
                                             32,
                                         )
+                                elif cutlass.const_expr(self.w4a8_n64_repacked):
+                                    w4a8_b2_dst = (
+                                        w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par2
+                                    )
+                                    total_down_n64 = b_down_u32.shape[0] // 64
+                                    total_down_k32 = b_down_u32.shape[1] // 4
+                                    _w4a8_stage_n64_b_tile(
+                                        down_rp,
+                                        w4a8_b2_dst,
+                                        task_expert_idx,
+                                        _pt * Int32(2),
+                                        cur_slice_p,
+                                        total_down_n64,
+                                        total_down_k32,
+                                        Int32(lane_id),
+                                        32,
+                                    )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        _w4a8_stage_n64_b_tile(
+                                            down_rp,
+                                            w4a8_b2_dst + Int32(128 * 64),
+                                            task_expert_idx,
+                                            (_pt + Int32(1)) * Int32(2),
+                                            cur_slice_p,
+                                            total_down_n64,
+                                            total_down_k32,
+                                            Int32(lane_id),
+                                            32,
+                                        )
                                 elif cutlass.const_expr(self.w4a8_repacked):
                                     w4a8_b2_dst = (
                                         w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par2
@@ -9124,7 +9329,31 @@ class MoEDynamicKernelBackend:
                                     w4a8_sfb2_dst = w4a8_sfbb + (par2 << Int32(10))
                                 else:
                                     w4a8_sfb2_dst = w4a8_sfbb + (par2 << Int32(9))
-                                if cutlass.const_expr(
+                                if cutlass.const_expr(self.w4a8_n64_repacked):
+                                    _w4a8_stage_n64_sfb_tile(
+                                        down_sfb_rp,
+                                        w4a8_sfb2_dst,
+                                        task_expert_idx,
+                                        _pt * Int32(2),
+                                        cur_slice_p,
+                                        total_down_n64,
+                                        total_down_k32,
+                                        Int32(lane_id),
+                                        32,
+                                    )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        _w4a8_stage_n64_sfb_tile(
+                                            down_sfb_rp,
+                                            w4a8_sfb2_dst + Int32(512),
+                                            task_expert_idx,
+                                            (_pt + Int32(1)) * Int32(2),
+                                            cur_slice_p,
+                                            total_down_n64,
+                                            total_down_k32,
+                                            Int32(lane_id),
+                                            32,
+                                        )
+                                elif cutlass.const_expr(
                                     self.w4a8_repacked and not self.w4a8_trellis
                                 ):
                                     _w4a8_stage_repacked_sfb_full(

@@ -74,9 +74,13 @@ class W4A8MaterializedPhase1Kernel:
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
         numerical_recipe: str = "default",
+        n64_repacked: bool = False,
+        n64_tail: bool = False,
     ):
         self.fast_math = bool(fast_math)
         self.deepseek_v41 = numerical_recipe == "deepseek_v41"
+        self.n64_repacked = bool(n64_repacked)
+        self.n64_tail = bool(n64_tail)
         if source_tile_m not in (64, 128):
             raise ValueError(
                 f"materialized phase 1 source_tile_m must be 64 or 128, got {source_tile_m}"
@@ -245,6 +249,110 @@ class W4A8MaterializedPhase1Kernel:
                 )
 
     @cute.jit
+    def _stage_n64_b_k64(
+        self,
+        weights: cute.Tensor,
+        dst_base: Int32,
+        expert_idx: Int32,
+        projection: Int32,
+        output_tile: Int32,
+        k64_slice: Int32,
+        intermediate_tiles: Int32,
+        total_k32: cutlass.Constexpr,
+        tid: Int32,
+    ):
+        logical_n = intermediate_tiles * Int32(128)
+        if cutlass.const_expr(self.n64_tail):
+            logical_n -= Int32(64)
+        n_rows = Int32(128)
+        if cutlass.const_expr(self.n64_tail):
+            if output_tile == intermediate_tiles - Int32(1):
+                n_rows = Int32(64)
+        transfers = 2 * 4 * 32
+        expert_words = logical_n * Int32(total_k32 * 8)
+        projection_words = logical_n * Int32(total_k32 * 4)
+        tile_base = output_tile * Int32(128 * total_k32 * 4)
+        for i in cutlass.range_constexpr(
+            (transfers + self.threads_per_cta - 1) // self.threads_per_cta
+        ):
+            idx = tid + Int32(i * self.threads_per_cta)
+            if idx < Int32(transfers):
+                lane = idx & Int32(31)
+                tmp = idx >> Int32(5)
+                n32 = tmp & Int32(3)
+                kb = tmp >> Int32(2)
+                dst_transfer = (kb * Int32(4) + n32) * Int32(32) + lane
+                dst_addr = dst_base + (dst_transfer << Int32(4))
+                if n32 < n_rows // Int32(32):
+                    source_k32 = k64_slice * Int32(2) + kb
+                    source_word = (
+                        Int64(expert_idx) * Int64(expert_words)
+                        + Int64(projection) * Int64(projection_words)
+                        + Int64(tile_base)
+                        + Int64(source_k32 * (n_rows // Int32(32)) * Int32(128))
+                        + Int64(n32 * Int32(128))
+                        + Int64(lane * Int32(4))
+                    )
+                    cp_async4_shared_global(
+                        dst_addr,
+                        get_ptr_as_int64(weights, source_word),
+                    )
+                else:
+                    st_shared_u32(dst_addr, Uint32(0))
+                    st_shared_u32(dst_addr + Int32(4), Uint32(0))
+                    st_shared_u32(dst_addr + Int32(8), Uint32(0))
+                    st_shared_u32(dst_addr + Int32(12), Uint32(0))
+
+    @cute.jit
+    def _stage_n64_sfb(
+        self,
+        scales: cute.Tensor,
+        dst_base: Int32,
+        expert_idx: Int32,
+        projection: Int32,
+        output_tile: Int32,
+        k128_slice: Int32,
+        intermediate_tiles: Int32,
+        total_k32: cutlass.Constexpr,
+        tid: Int32,
+    ):
+        logical_n = intermediate_tiles * Int32(128)
+        if cutlass.const_expr(self.n64_tail):
+            logical_n -= Int32(64)
+        n_rows = Int32(128)
+        if cutlass.const_expr(self.n64_tail):
+            if output_tile == intermediate_tiles - Int32(1):
+                n_rows = Int32(64)
+        transfers = 512 // 16
+        expert_words = logical_n * Int32(total_k32) // Int32(2)
+        projection_words = logical_n * Int32(total_k32) // Int32(4)
+        tile_base = output_tile * Int32(128 * total_k32 // 4)
+        valid_transfers = n_rows // Int32(4)
+        for i in cutlass.range_constexpr(
+            (transfers + self.threads_per_cta - 1) // self.threads_per_cta
+        ):
+            transfer = tid + Int32(i * self.threads_per_cta)
+            if transfer < Int32(transfers):
+                dst_addr = dst_base + (transfer << Int32(4))
+                if transfer < valid_transfers:
+                    source_word = (
+                        Int64(expert_idx) * Int64(expert_words)
+                        + Int64(projection) * Int64(projection_words)
+                        + Int64(tile_base)
+                        + Int64(k128_slice * n_rows)
+                        + Int64(transfer * Int32(4))
+                    )
+                    cp_async4_shared_global(
+                        dst_addr,
+                        get_ptr_as_int64(scales, source_word),
+                    )
+                else:
+                    st_shared_u32(dst_addr, Uint32(0))
+                    st_shared_u32(dst_addr + Int32(4), Uint32(0))
+                    st_shared_u32(dst_addr + Int32(8), Uint32(0))
+                    st_shared_u32(dst_addr + Int32(12), Uint32(0))
+
+    @cute.jit
     def _stage_slice(
         self,
         packed_a_u32: cute.Tensor,
@@ -366,6 +474,52 @@ class W4A8MaterializedPhase1Kernel:
                 tid,
                 self.threads_per_cta,
                 4,
+            )
+        elif cutlass.const_expr(self.n64_repacked):
+            total_k32 = input_k128_tiles * Int32(4)
+            self._stage_n64_b_k64(
+                w13_rp,
+                gate_b_base,
+                expert_idx,
+                Int32(1),
+                output_tile,
+                k64_slice,
+                intermediate_tiles,
+                total_k32,
+                tid,
+            )
+            self._stage_n64_b_k64(
+                w13_rp,
+                up_b_base,
+                expert_idx,
+                Int32(0),
+                output_tile,
+                k64_slice,
+                intermediate_tiles,
+                total_k32,
+                tid,
+            )
+            self._stage_n64_sfb(
+                w13_sfb_rp,
+                gate_sfb_base,
+                expert_idx,
+                Int32(1),
+                output_tile,
+                k128_slice,
+                intermediate_tiles,
+                total_k32,
+                tid,
+            )
+            self._stage_n64_sfb(
+                w13_sfb_rp,
+                up_sfb_base,
+                expert_idx,
+                Int32(0),
+                output_tile,
+                k128_slice,
+                intermediate_tiles,
+                total_k32,
+                tid,
             )
         else:
             self._stage_b_half_k64(

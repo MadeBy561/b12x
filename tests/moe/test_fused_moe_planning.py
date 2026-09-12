@@ -932,19 +932,20 @@ def test_tp_moe_plan_retains_one_policy_resolution(
 
 
 @pytest.mark.parametrize(
-    ("tile_m", "external", "direct", "cluster_cap"),
+    ("tile_m", "external", "direct", "n64_repacked", "cluster_cap"),
     (
-        (16, False, False, -1),
-        (16, False, True, 0),
-        (32, True, False, 12),
-        (64, False, False, 48),
-        (128, True, False, 188),
+        (16, False, False, False, -1),
+        (16, False, True, True, 0),
+        (32, True, False, False, 12),
+        (64, False, False, True, 48),
+        (128, True, False, False, 188),
     ),
 )
 def test_dynamic_launch_policy_round_trips_planned_tile(
     tile_m: int,
     external: bool,
     direct: bool,
+    n64_repacked: bool,
     cluster_cap: int,
 ) -> None:
     encoded = fused_moe_impl._encode_dynamic_launch_policy(
@@ -953,6 +954,7 @@ def test_dynamic_launch_policy_round_trips_planned_tile(
         policy_max_active_clusters=cluster_cap,
         planned_tile_m=tile_m,
         planned_direct_routing=direct,
+        w4a8_n64_repacked=n64_repacked,
     )
 
     assert fused_moe_impl._decode_dynamic_launch_policy(encoded) == (
@@ -960,6 +962,7 @@ def test_dynamic_launch_policy_round_trips_planned_tile(
         external,
         tile_m,
         direct,
+        n64_repacked,
         cluster_cap,
     )
 

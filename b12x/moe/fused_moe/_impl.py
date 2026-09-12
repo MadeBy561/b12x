@@ -422,7 +422,7 @@ class TPMoEWorkspacePool:
 
 @dataclass(frozen=True, kw_only=True)
 class _PreparedW4A8Weights:
-    """N256/K128 W4A8 weights prepared for the unified dynamic kernel."""
+    """Exact tiled W4A8 weights prepared for the unified dynamic kernel."""
 
     w13_rp: torch.Tensor
     w13_sfb: torch.Tensor
@@ -434,6 +434,7 @@ class _PreparedW4A8Weights:
     params_dtype: torch.dtype
     source_format: str = "fp4_e8m0_k32"
     w13_layout: str = "w13"
+    n64_repack: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -2207,7 +2208,8 @@ def _dynamic_materialized_intermediate_bytes(
     """Return the byte extent of the materialized payload and scale planes."""
     if quant_mode == "nvfp4":
         return rows_padded * (n // 128) * 72
-    return rows_padded * (n + n // 32)
+    materialized_n = align_up(n, 128) if _is_w4a8_quant_mode(quant_mode) else n
+    return rows_padded * (materialized_n + materialized_n // 32)
 
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
@@ -4808,6 +4810,140 @@ def _e8m0_scale_to_grid_kernel(
         mask=mask,
     )
 
+@triton.jit
+def _qweight_to_w4a8_n64_kernel(
+    q,
+    dst,
+    total_words: tl.constexpr,
+    rows: tl.constexpr,
+    group_rows: tl.constexpr,
+    q_cols: tl.constexpr,
+    row_rotation: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < total_words
+    expert_words = rows * q_cols
+    expert = idx // expert_words
+    local = idx - expert * expert_words
+    group_words = group_rows * q_cols
+    group = local // group_words
+    group_local = local - group * group_words
+
+    full_n_tiles = group_rows // 128
+    full_n_words = full_n_tiles * 128 * q_cols
+    if group_rows % 128:
+        n_tail = group_local >= full_n_words
+        nt = tl.where(n_tail, full_n_tiles, group_local // (128 * q_cols))
+        n_rows = tl.where(n_tail, group_rows % 128, 128)
+        within_n = tl.where(
+            n_tail,
+            group_local - full_n_words,
+            group_local - nt * 128 * q_cols,
+        )
+    else:
+        nt = group_local // (128 * q_cols)
+        n_rows = 128
+        within_n = group_local - nt * 128 * q_cols
+
+    full_k_tiles = q_cols // 16
+    full_k_words = full_k_tiles * n_rows * 16
+    if q_cols % 16:
+        k_tail = within_n >= full_k_words
+        kt = tl.where(k_tail, full_k_tiles, within_n // (n_rows * 16))
+        k_words = tl.where(k_tail, q_cols % 16, 16)
+        within_kt = tl.where(
+            k_tail,
+            within_n - full_k_words,
+            within_n - kt * n_rows * 16,
+        )
+    else:
+        kt = within_n // (n_rows * 16)
+        k_words = 16
+        within_kt = within_n - kt * n_rows * 16
+
+    n32_count = n_rows // 32
+    k32 = within_kt // (n32_count * 128)
+    within_k32 = within_kt - k32 * n32_count * 128
+    n32 = within_k32 // 128
+    inner = within_k32 - n32 * 128
+    n8 = inner & 3
+    combined = inner >> 2
+    cgrp = combined & 3
+    r8 = combined >> 2
+    row = group * group_rows + nt * 128 + n32 * 32 + n8 * 8 + r8
+    row = row + row_rotation
+    row = tl.where(row >= rows, row - rows, row)
+    col = kt * 16 + k32 * 4 + cgrp
+    value = tl.load(
+        q + expert * expert_words + row * q_cols + col,
+        mask=mask,
+        other=0,
+    )
+    tl.store(dst + idx, value, mask=mask)
+
+
+@triton.jit
+def _grid_to_w4a8_n64_sfb_kernel(
+    grid,
+    dst,
+    total_bytes: tl.constexpr,
+    rows: tl.constexpr,
+    group_rows: tl.constexpr,
+    scale_cols: tl.constexpr,
+    row_rotation: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < total_bytes
+    expert_bytes = rows * scale_cols
+    expert = idx // expert_bytes
+    local = idx - expert * expert_bytes
+    group_bytes = group_rows * scale_cols
+    group = local // group_bytes
+    group_local = local - group * group_bytes
+
+    full_n_tiles = group_rows // 128
+    full_n_bytes = full_n_tiles * 128 * scale_cols
+    if group_rows % 128:
+        n_tail = group_local >= full_n_bytes
+        nt = tl.where(n_tail, full_n_tiles, group_local // (128 * scale_cols))
+        n_rows = tl.where(n_tail, group_rows % 128, 128)
+        within_n = tl.where(
+            n_tail,
+            group_local - full_n_bytes,
+            group_local - nt * 128 * scale_cols,
+        )
+    else:
+        nt = group_local // (128 * scale_cols)
+        n_rows = 128
+        within_n = group_local - nt * 128 * scale_cols
+
+    full_k_tiles = scale_cols // 4
+    full_k_bytes = full_k_tiles * n_rows * 4
+    if scale_cols % 4:
+        k_tail = within_n >= full_k_bytes
+        kt = tl.where(k_tail, full_k_tiles, within_n // (n_rows * 4))
+        tile_cols = tl.where(k_tail, scale_cols % 4, 4)
+        within_kt = tl.where(
+            k_tail,
+            within_n - full_k_bytes,
+            within_n - kt * n_rows * 4,
+        )
+    else:
+        kt = within_n // (n_rows * 4)
+        tile_cols = 4
+        within_kt = within_n - kt * n_rows * 4
+    row = group * group_rows + nt * 128 + within_kt // tile_cols
+    row = row + row_rotation
+    row = tl.where(row >= rows, row - rows, row)
+    col = kt * 4 + within_kt % tile_cols
+    value = tl.load(
+        grid + expert * expert_bytes + row * scale_cols + col,
+        mask=mask,
+        other=0,
+    )
+    tl.store(dst + idx, value, mask=mask)
 
 @triton.jit
 def _grid_to_w4a8_sfb_kernel(
@@ -5127,6 +5263,76 @@ def _logical_weight_to_w4a8_rp_inplace(
     return weight_i32.view(int(weight.shape[0]), *rp_shape)
 
 
+def _logical_weight_to_w4a8_n64_inplace(
+    weight: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    row_rotation: int | None = None,
+    group_rows: int | None = None,
+) -> torch.Tensor:
+    """Repack exact N128 tiles with compact N64/K64 boundary tiles."""
+
+    size_k = int(size_k)
+    size_n = int(size_n)
+    group_rows = size_n if group_rows is None else int(group_rows)
+    if (
+        size_n % 64
+        or size_k % 64
+        or group_rows % 64
+        or size_n % group_rows
+    ):
+        raise ValueError(
+            "exact W4A8 repack requires N, K, and group rows divisible by 64 "
+            f"with whole row groups; got N={size_n}, K={size_k}, "
+            f"group_rows={group_rows}"
+        )
+    if weight.dtype != torch.uint8 or tuple(weight.shape[1:]) != (
+        size_n,
+        size_k // 2,
+    ):
+        raise ValueError(
+            f"logical FP4 weight must be uint8 [E, {size_n}, {size_k // 2}], "
+            f"got {weight.dtype} {tuple(weight.shape)}"
+        )
+    if not weight.is_cuda:
+        raise NotImplementedError("exact W4A8 repack currently requires CUDA weights")
+
+    weight_E = int(weight.shape[0])
+    q_cols = size_k // 8
+    expert_words = size_n * q_cols
+    weight_i32 = weight.view(torch.int32)
+    chunk = _w4a8_convert_chunk_experts(
+        weight_E=weight_E,
+        scratch_elements_per_expert=expert_words,
+        dtype=torch.int32,
+    )
+    row_rot = 0 if row_rotation is None else int(row_rotation)
+    block = 256
+    for e0 in range(0, weight_E, chunk):
+        e1 = min(weight_E, e0 + chunk)
+        q_chunk = torch.empty(
+            (e1 - e0, size_n, q_cols),
+            dtype=torch.int32,
+            device=weight.device,
+        )
+        q_chunk.copy_(weight_i32[e0:e1].reshape(e1 - e0, size_n, q_cols))
+        dst_chunk = weight_i32[e0:e1].reshape(-1)
+        total_words = (e1 - e0) * expert_words
+        _qweight_to_w4a8_n64_kernel[(triton.cdiv(total_words, block),)](
+            q_chunk,
+            dst_chunk,
+            total_words,
+            size_n,
+            group_rows,
+            q_cols,
+            row_rot,
+            BLOCK=block,
+            num_warps=4,
+        )
+    return weight_i32.view(weight_E, -1)
+
+
 def _packed_w4a16_weight_to_w4a8_rp_inplace(
     packed_weight: torch.Tensor,
     *,
@@ -5430,6 +5636,93 @@ def _e8m0_scale_to_w4a8_sfb_inplace(
             row_rotation=row_rotation,
         )
     return scale_u8.view(torch.int32).view(weight_E, *sfb_shape)
+
+
+def _e8m0_scale_to_w4a8_n64_sfb_inplace(
+    scale: torch.Tensor,
+    *,
+    weight_E: int,
+    rows: int,
+    k_dim: int,
+    row_rotation: int | None = None,
+    group_rows: int | None = None,
+) -> torch.Tensor:
+    """Repack E8M0 scales into exact N128 tiles with compact boundaries."""
+
+    weight_E = int(weight_E)
+    rows = int(rows)
+    k_dim = int(k_dim)
+    group_rows = rows if group_rows is None else int(group_rows)
+    if (
+        rows % 64
+        or k_dim % 64
+        or group_rows % 64
+        or rows % group_rows
+    ):
+        raise ValueError(
+            "exact W4A8 scale repack requires N, K, and group rows divisible "
+            f"by 64 with whole row groups; got N={rows}, K={k_dim}, "
+            f"group_rows={group_rows}"
+        )
+    scale_cols = k_dim // 32
+    scale_u8 = scale.view(torch.uint8)
+    is_logical, _ = _validate_e8m0_scale_w4a8_convertible(
+        scale_u8,
+        weight_E=weight_E,
+        rows=rows,
+        k_dim=k_dim,
+    )
+    if not scale.is_cuda:
+        raise NotImplementedError("exact W4A8 scale repack currently requires CUDA scales")
+    rows_pad = rows if is_logical else int(scale_u8.shape[2])
+    if rows_pad != rows:
+        raise ValueError(
+            "exact W4A8 in-place scale conversion requires unpadded E8M0 "
+            f"storage; got rows={rows}, rows_pad={rows_pad}"
+        )
+    expert_bytes = rows * scale_cols
+    chunk = _w4a8_convert_chunk_experts(
+        weight_E=weight_E,
+        scratch_elements_per_expert=expert_bytes,
+        dtype=torch.uint8,
+    )
+    row_rot = 0 if row_rotation is None else int(row_rotation)
+    source_stride = expert_bytes if is_logical else scale_cols * rows_pad
+    block = 256
+    for e0 in range(0, weight_E, chunk):
+        e1 = min(weight_E, e0 + chunk)
+        chunk_experts = e1 - e0
+        grid_scratch = torch.empty(
+            (chunk_experts, rows, scale_cols),
+            dtype=torch.uint8,
+            device=scale.device,
+        )
+        total_bytes = chunk_experts * expert_bytes
+        _e8m0_scale_to_grid_kernel[(triton.cdiv(total_bytes, block),)](
+            scale_u8[e0:e1],
+            grid_scratch,
+            total_bytes,
+            rows,
+            scale_cols,
+            rows_pad,
+            source_stride,
+            expert_bytes,
+            is_logical,
+            BLOCK=block,
+            num_warps=4,
+        )
+        _grid_to_w4a8_n64_sfb_kernel[(triton.cdiv(total_bytes, block),)](
+            grid_scratch,
+            scale_u8[e0:e1].reshape(-1),
+            total_bytes,
+            rows,
+            group_rows,
+            scale_cols,
+            row_rot,
+            BLOCK=block,
+            num_warps=4,
+        )
+    return scale_u8.reshape(weight_E, -1).view(torch.int32)
 
 
 def _validate_e8m0_scale_w4a8_convertible(
@@ -5968,6 +6261,7 @@ def _prepare_w4a8_from_e8m0_source(
     params_dtype: torch.dtype,
     source_format: str,
     w13_layout: str,
+    n64_repack: bool = False,
 ) -> _PreparedW4A8Weights:
     source_format = _normalize_fp4_source_format(source_format)
     if source_format != "fp4_e8m0_k32":
@@ -6024,32 +6318,60 @@ def _prepare_w4a8_from_e8m0_source(
 
     is_gated = is_gated_moe_activation(activation)
     row_rotation = n if w13_layout == "w31" and is_gated else None
-    w13_rp = _logical_weight_to_w4a8_rp_inplace(
-        w1_fp4,
-        size_k=k,
-        size_n=w1_rows,
-        row_rotation=row_rotation,
-        gated_half_rows=n if is_gated else None,
-    )
-    w2_rp = _logical_weight_to_w4a8_rp_inplace(
-        w2_fp4,
-        size_k=n,
-        size_n=k,
-    )
-    w13_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
-        w1_blockscale,
-        weight_E=weight_E,
-        rows=w1_rows,
-        k_dim=k,
-        row_rotation=row_rotation,
-        gated_half_rows=n if is_gated else None,
-    )
-    w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
-        w2_blockscale,
-        weight_E=weight_E,
-        rows=k,
-        k_dim=n,
-    )
+    if n64_repack:
+        w13_rp = _logical_weight_to_w4a8_n64_inplace(
+            w1_fp4,
+            size_k=k,
+            size_n=w1_rows,
+            row_rotation=row_rotation,
+            group_rows=n if is_gated else None,
+        )
+        w2_rp = _logical_weight_to_w4a8_n64_inplace(
+            w2_fp4,
+            size_k=n,
+            size_n=k,
+        )
+        w13_sfb = _e8m0_scale_to_w4a8_n64_sfb_inplace(
+            w1_blockscale,
+            weight_E=weight_E,
+            rows=w1_rows,
+            k_dim=k,
+            row_rotation=row_rotation,
+            group_rows=n if is_gated else None,
+        )
+        w2_sfb = _e8m0_scale_to_w4a8_n64_sfb_inplace(
+            w2_blockscale,
+            weight_E=weight_E,
+            rows=k,
+            k_dim=n,
+        )
+    else:
+        w13_rp = _logical_weight_to_w4a8_rp_inplace(
+            w1_fp4,
+            size_k=k,
+            size_n=w1_rows,
+            row_rotation=row_rotation,
+            gated_half_rows=n if is_gated else None,
+        )
+        w2_rp = _logical_weight_to_w4a8_rp_inplace(
+            w2_fp4,
+            size_k=n,
+            size_n=k,
+        )
+        w13_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
+            w1_blockscale,
+            weight_E=weight_E,
+            rows=w1_rows,
+            k_dim=k,
+            row_rotation=row_rotation,
+            gated_half_rows=n if is_gated else None,
+        )
+        w2_sfb = _e8m0_scale_to_w4a8_sfb_inplace(
+            w2_blockscale,
+            weight_E=weight_E,
+            rows=k,
+            k_dim=n,
+        )
     return _PreparedW4A8Weights(
         w13_rp=w13_rp,
         w13_sfb=w13_sfb,
@@ -6061,6 +6383,7 @@ def _prepare_w4a8_from_e8m0_source(
         params_dtype=params_dtype,
         source_format=source_format,
         w13_layout=w13_layout,
+        n64_repack=n64_repack,
     )
 
 
@@ -6198,7 +6521,7 @@ def plan_b12x_fp4_moe_weights(
         )
         for mode in modes
     )
-    result = plan_moe_weight_preparation(
+    return plan_moe_weight_preparation(
         specs,
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -6211,8 +6534,8 @@ def plan_b12x_fp4_moe_weights(
         trellis_rate_granularity=trellis_rate_granularity,
         trellis_pair_kinds=trellis_pair_kinds,
         coupled_hadamard_blocks=coupled_hadamard_blocks,
+        numerical_recipe=numerical_recipe,
     )
-    return replace(result, numerical_recipe=numerical_recipe)
 
 
 def prepare_b12x_fp4_moe_weights(
@@ -6463,6 +6786,10 @@ def prepare_b12x_fp4_moe_weights(
             params_dtype=params_dtype,
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
+            n64_repack=(
+                plan.numerical_recipe == "deepseek_v41"
+                and plan.intermediate_size % 128 == 64
+            ),
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a8_mx",
@@ -10274,10 +10601,16 @@ class _DynamicMoEW4A8Launch:
             scale_storage_ptr,
             layout=cute.make_layout((rows_padded * (self._k // 32),), stride=(1,)),
         )
+        materialized_n = align_up(self._n, 128)
         intermediate_u32 = cute.make_tensor(
             intermediate_ptr,
             layout=cute.make_layout(
-                (rows_padded * (self._n + self._n // 32) // 4,), stride=(1,)
+                (
+                    rows_padded
+                    * (materialized_n + materialized_n // 32)
+                    // 4,
+                ),
+                stride=(1,),
             ),
         )
         w13_grid_rows = self._w1_n
@@ -10348,6 +10681,35 @@ class _DynamicMoEW4A8Launch:
             _tr_sentinel = cute.make_layout((1,), stride=(1,))
             w13_sfb_rp = cute.make_tensor(w13_sfb_rp_ptr, layout=_tr_sentinel)
             down_sfb_rp = cute.make_tensor(down_sfb_rp_ptr, layout=_tr_sentinel)
+        elif cutlass.const_expr(self._kernel.w4a8_n64_repacked):
+            w13_rp = cute.make_tensor(
+                w13_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * self._w1_n * self._k // 8,),
+                    stride=(1,),
+                ),
+            )
+            w13_sfb_rp = cute.make_tensor(
+                w13_sfb_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * self._w1_n * (self._k // 32) // 4,),
+                    stride=(1,),
+                ),
+            )
+            down_rp = cute.make_tensor(
+                down_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * self._k * self._n // 8,),
+                    stride=(1,),
+                ),
+            )
+            down_sfb_rp = cute.make_tensor(
+                down_sfb_rp_ptr,
+                layout=cute.make_layout(
+                    (num_experts * self._k * (self._n // 32) // 4,),
+                    stride=(1,),
+                ),
+            )
         elif cutlass.const_expr(self._kernel.w4a8_repacked):
             w13_rp = cute.make_tensor(
                 w13_rp_ptr,
@@ -10505,6 +10867,7 @@ def _get_dynamic_kernel(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     w4a8_repacked: bool = False,
+    w4a8_n64_repacked: bool = False,
     direct_routing: bool = False,
     external_route_plan: bool = False,
     share_input_across_experts: bool = False,
@@ -10580,7 +10943,15 @@ def _get_dynamic_kernel(
             planned_tile_m=planned_tile_m,
         )
     )
-    if numerical_recipe == "deepseek_v41":
+    if w4a8_n64_repacked and (
+        numerical_recipe != "deepseek_v41" or not w4a8_repacked
+    ):
+        raise ValueError(
+            "w4a8_n64_repacked requires the deepseek_v41 repacked W4A8 recipe"
+        )
+    if w4a8_n64_repacked and n % 64 != 0:
+        raise ValueError("w4a8_n64_repacked requires N divisible by 64")
+    if numerical_recipe == "deepseek_v41" and w4a8_repacked:
         materialize_intermediate = True
         share_input_across_experts = True
     separate_w13_halves = bool(
@@ -10634,6 +11005,7 @@ def _get_dynamic_kernel(
         bool(deterministic_output),
         work_source,
         bool(w4a8_repacked),
+        bool(w4a8_n64_repacked),
         bool(direct_routing),
         bool(external_route_plan),
         materialize_intermediate,
@@ -10699,6 +11071,11 @@ def _get_dynamic_kernel(
     elif is_w4a8:
         kernel_kwargs["quant_recipe"] = quant_mode
         kernel_kwargs["w4a8_repacked"] = bool(w4a8_repacked)
+        if numerical_recipe == "deepseek_v41":
+            kernel_kwargs["w4a8_n64_repacked"] = w4a8_n64_repacked
+            kernel_kwargs["w4a8_n64_tail"] = bool(
+                w4a8_n64_repacked and n % 128
+            )
     elif is_w6a8:
         # mxfp6_fmt_a/mxfp6_fmt_b stay at the ctor defaults ("e4m3" MXFP8
         # activations against "e2m3" FP6 weights).
@@ -11036,6 +11413,7 @@ def _launch_dynamic_flat(
     activation: str,
     quant_mode: str,
     w4a8_repacked: bool,
+    w4a8_n64_repacked: bool,
     share_input_across_experts: bool,
     deterministic_output: bool,
     swiglu_limit: float | None,
@@ -11081,13 +11459,10 @@ def _launch_dynamic_flat(
                 "w4a8 trellis rotation extent must be E*3n or E*6n fp16 "
                 f"values, got {rot_elems} for E={E}, n={n}"
             )
-    if w4a8_repacked and int(n) % 128 != 0:
-        # Half-aligned ceil-tiled rp/sfb storage is byte-identical to the
-        # storage of zero-padded n_pad weights, and the dynamic kernel has no
-        # external tensor with an n extent (output is [m, k]); launching at
-        # n_pad therefore computes the exact result — the padded FC1 columns
-        # are silu(0)*0 = 0 and w2's padded K rows are zero. tiny_decode
-        # keeps the logical-n bounds for the decode band.
+    if w4a8_repacked and int(n) % 128 != 0 and not w4a8_n64_repacked:
+        # The legacy N128 repack materializes zero-padded weight tails. Launch
+        # that representation at its physical N extent. Exact N64 repacks keep
+        # logical N and specialize the CuTe staging path instead.
         n = _dynamic_kernel_intermediate_size(n, quant_mode)
     decode_regime = bool(
         w4a8_repacked
@@ -11246,6 +11621,7 @@ def _launch_dynamic_flat(
         activation=activation,
         quant_mode=quant_mode,
         w4a8_repacked=w4a8_repacked,
+        w4a8_n64_repacked=w4a8_n64_repacked,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
         share_input_across_experts=share_input_across_experts,
@@ -11383,6 +11759,7 @@ def _encode_dynamic_launch_policy(
     policy_max_active_clusters: int,
     planned_tile_m: int,
     planned_direct_routing: bool,
+    w4a8_n64_repacked: bool,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -11397,18 +11774,22 @@ def _encode_dynamic_launch_policy(
         | (int(bool(external_route_plan_requested)) << 1)
         | (tile_code << 2)
         | (int(bool(planned_direct_routing)) << 4)
-        | ((int(policy_max_active_clusters) + 1) << 5)
+        | (int(bool(w4a8_n64_repacked)) << 5)
+        | ((int(policy_max_active_clusters) + 1) << 6)
     )
 
 
-def _decode_dynamic_launch_policy(value: int) -> tuple[bool, bool, int, bool, int]:
+def _decode_dynamic_launch_policy(
+    value: int,
+) -> tuple[bool, bool, int, bool, bool, int]:
     value = int(value)
     return (
         bool(value & 1),
         bool(value & 2),
         _DYNAMIC_POLICY_TILE_MS[(value >> 2) & 3],
         bool(value & 16),
-        (value >> 5) - 1,
+        bool(value & 32),
+        (value >> 6) - 1,
     )
 
 
@@ -11515,6 +11896,7 @@ def _tp_moe_dynamic_launch_op(
         external_route_plan_requested,
         planned_tile_m,
         planned_direct_routing,
+        w4a8_n64_repacked,
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
     _launch_dynamic_flat(
@@ -11575,6 +11957,7 @@ def _tp_moe_dynamic_launch_op(
         activation=activation,
         quant_mode=quant_mode,
         w4a8_repacked=w4a8_repacked,
+        w4a8_n64_repacked=w4a8_n64_repacked,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
@@ -11681,6 +12064,7 @@ def _launch_dynamic(
     activation: str = "silu",
     quant_mode: str = "nvfp4",
     w4a8_prepared: dict | None = None,
+    w4a8_n64_repacked: bool = False,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -11701,6 +12085,7 @@ def _launch_dynamic(
         policy_max_active_clusters=policy_max_active_clusters,
         planned_tile_m=planned_tile_m,
         planned_direct_routing=dynamic_route_mode == "direct",
+        w4a8_n64_repacked=w4a8_n64_repacked,
     )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
@@ -13018,7 +13403,11 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             if prepared_payload is not None and quant_mode == "w4a8_mx"
             else None
         )
-        if quant_mode == "w4a8_mx" and dynamic_w4a8_prepared is None:
+        if (
+            quant_mode == "w4a8_mx"
+            and dynamic_w4a8_prepared is None
+            and plan.execution.weight_layout is PreparedWeightLayout.QMMA_REPACKED
+        ):
             raise RuntimeError(
                 "the W4A8-MX weight plan did not materialize its required "
                 "QMMA representation"
@@ -13044,6 +13433,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             quant_mode=quant_mode,
             numerical_recipe=plan.numerical_recipe,
             w4a8_prepared=dynamic_w4a8_prepared,
+            w4a8_n64_repacked=bool(
+                getattr(prepared_payload, "n64_repack", False)
+            ),
             deterministic_output=deterministic_output,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,

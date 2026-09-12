@@ -764,6 +764,7 @@ def plan_moe_weight_preparation(
     trellis_rate_granularity: str | None = None,
     trellis_pair_kinds: Iterable[str] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
+    numerical_recipe: str = "default",
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
 
@@ -789,6 +790,8 @@ def plan_moe_weight_preparation(
     ):
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}")
+    if numerical_recipe not in {"default", "deepseek_v41"}:
+        raise ValueError(f"unsupported numerical_recipe {numerical_recipe!r}")
 
     source_format = normalized_specs[0].source_format
     requested_w4a16_layout = (
@@ -871,12 +874,9 @@ def plan_moe_weight_preparation(
                 weight_layouts.add(PreparedWeightLayout.TRELLIS_NATIVE)
                 scale_layouts.add(PreparedScaleLayout.SOURCE_NATIVE)
                 continue
-            # The rp storage ceil-tiles partial 256/128 tiles (zero-filled),
-            # so 32-aligned shards (352 = 2048/TP6, 192 = 3072/TP16) prepare
-            # fine; consumers bound their reads by the logical sizes.
             if hidden_size % 256 != 0 or intermediate_size % 32 != 0:
                 raise ValueError(
-                    "W4A8-MX QMMA layout requires hidden_size % 256 == 0 and "
+                    "W4A8-MX requires hidden_size % 256 == 0 and "
                     "intermediate_size % 32 == 0"
                 )
             transforms.add(WeightPreparationTransform.W4A8_QMMA)
@@ -1024,6 +1024,7 @@ def plan_moe_weight_preparation(
             else frozenset(str(kind) for kind in trellis_pair_kinds)
         ),
         coupled_hadamard_blocks=coupled_hadamard_blocks,
+        numerical_recipe=numerical_recipe,
     )
 
 
