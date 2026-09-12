@@ -307,9 +307,13 @@ def run_unified_prefill(
 
         partitions = _mg_head_partitions(heads, hpb)
         if model_type == ModelType.DSV41:
-            # The heterogeneous double-buffered 544-byte records leave room
-            # for one BF16 query group, not two, in the SM120 shared carveout.
-            partitions = ((1, heads, 0),)
+            # DSV4.1's 544-byte records permit one 16-head group per CTA.
+            # One launch covers the full 16-aligned prefix; only an 8-head
+            # remainder needs a separate valid-HPB launch.
+            prefix_heads = heads - heads % hpb
+            partitions = ((1, prefix_heads, 0),) if prefix_heads else ()
+            if prefix_heads != heads:
+                partitions += ((1, heads - prefix_heads, prefix_heads),)
         if not partitions:
             raise ValueError(
                 f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
