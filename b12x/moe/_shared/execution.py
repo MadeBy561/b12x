@@ -302,12 +302,12 @@ class MoEWeightPreparationPlan:
             and self.activation == "silu"
             and self.io_dtype == "bfloat16"
             and self.hidden_size % 256 == 0
-            and self.intermediate_size % 128 == 0
+            and self.intermediate_size % 32 == 0
         ):
             raise ValueError(
                 "deepseek_v41 requires BF16 SiLU, native MXFP4/E8M0-K32 "
                 "weights, A8, hidden size divisible by 256 and intermediate "
-                "size divisible by 128"
+                "size divisible by 32"
             )
         object.__setattr__(self, "num_experts", int(self.num_experts))
         object.__setattr__(self, "hidden_size", int(self.hidden_size))

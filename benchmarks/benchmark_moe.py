@@ -271,13 +271,21 @@ class ModelSpec:
     top_k: int
     tp_size: int
     tp_rank: int
-    expert_parallel: bool = False
+    logical_intermediate_size: int | None = None
 
     @property
     def I_tp(self) -> int:
-        if self.expert_parallel:
+        if self.logical_intermediate_size is not None:
             return self.intermediate_size
         return self.intermediate_size // self.tp_size
+
+    @property
+    def logical_I_tp(self) -> int:
+        return self.logical_intermediate_size or self.I_tp
+
+    @property
+    def global_intermediate_size(self) -> int:
+        return self.logical_I_tp * self.tp_size
 
 
 @dataclass(frozen=True)
@@ -665,6 +673,25 @@ def _fp4_checkpoint_bytes(tensor: torch.Tensor) -> torch.Tensor:
         raise TypeError(f"expected one-byte packed FP4 tensor, got {tensor.dtype}")
     return tensor.view(torch.uint8)
 
+def _slice_v41_tp_shard(
+    source: torch.Tensor,
+    *,
+    dimension: int,
+    intermediate_size_per_partition: int,
+    tp_rank: int,
+    packing: int = 1,
+) -> torch.Tensor:
+    """Slice one exact, MX-block-aligned TP shard."""
+    if (
+        intermediate_size_per_partition <= 0
+        or intermediate_size_per_partition % 32
+        or intermediate_size_per_partition % packing
+    ):
+        raise ValueError("invalid V4.1 TP shard geometry")
+    shard_width = intermediate_size_per_partition // packing
+    offset = tp_rank * shard_width
+    return source.narrow(dimension, offset, shard_width).contiguous()
+
 
 def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size_override: int | None = None, tp_rank: int = 0) -> ModelSpec:
     tp = tp_size_override if tp_size_override is not None else profile.tp_size
@@ -682,16 +709,19 @@ def build_model_spec(model_path: pathlib.Path, profile: ModelProfile, *, tp_size
     if profile.checkpoint_family == "deepseek_v41_flash":
         if cfg.get("model_type") != "deepseek_v41_text":
             raise ValueError("DeepSeek V4.1 Flash requires its V4.1 text config, not V4.0")
-        if tp <= 0 or not 0 <= tp_rank < tp or cfg["n_routed_experts"] % tp:
-            raise ValueError("V4.1 requires a valid rank and an evenly divisible expert count")
+        if tp <= 0 or not 0 <= tp_rank < tp:
+            raise ValueError("V4.1 requires a valid TP rank")
+        logical_I_tp, remainder = divmod(cfg["moe_intermediate_size"], tp)
+        if remainder:
+            raise ValueError("V4.1 requires an evenly divisible intermediate size")
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
-            intermediate_size=cfg["moe_intermediate_size"],
-            num_experts=cfg["n_routed_experts"] // tp,
+            intermediate_size=logical_I_tp,
+            logical_intermediate_size=logical_I_tp,
+            num_experts=cfg["n_routed_experts"],
             top_k=cfg["num_experts_per_tok"],
             tp_size=tp,
             tp_rank=tp_rank,
-            expert_parallel=True,
         )
     if profile.checkpoint_family == "qwen":
         return ModelSpec(
@@ -1163,8 +1193,8 @@ def load_expert_weights(
         is_v41 = checkpoint_family == "deepseek_v41_flash"
         family_label = "DeepSeek V4.1 Flash" if is_v41 else "DeepSeek V4 Flash"
         if is_v41:
-            if not spec.expert_parallel or cfg.get("model_type") != "deepseek_v41_text":
-                raise ValueError("V4.1 requires whole-expert partitioning and a V4.1 checkpoint")
+            if cfg.get("model_type") != "deepseek_v41_text":
+                raise ValueError("V4.1 requires a V4.1 checkpoint")
             if not 0 <= layer_idx < cfg["num_hidden_layers"]:
                 raise ValueError("V4.1 Flash profile requires a target-model layer, not DSpark")
             numerical_recipe = "deepseek_v41"
@@ -1178,8 +1208,10 @@ def load_expert_weights(
                 f"{family_label} requires K and local intermediate size divisible by 32, "
                 f"got K={spec.hidden_size}, I_tp={spec.I_tp}"
             )
-        assert cfg["n_routed_experts"] == spec.num_experts * (spec.tp_size if is_v41 else 1)
-        assert cfg["moe_intermediate_size"] == spec.intermediate_size
+        assert cfg["n_routed_experts"] == spec.num_experts
+        assert cfg["moe_intermediate_size"] == (
+            spec.global_intermediate_size if is_v41 else spec.intermediate_size
+        )
         assert cfg["hidden_size"] == spec.hidden_size
 
         source_format = "fp4_e8m0_k32"
@@ -1199,30 +1231,72 @@ def load_expert_weights(
         gate_sf = torch.empty(E, I_tp, K // 32, dtype=e8m0_dtype, device=device)
         up_sf = torch.empty(E, I_tp, K // 32, dtype=e8m0_dtype, device=device)
         down_sf = torch.empty(E, K, I_tp // 32, dtype=e8m0_dtype, device=device)
+        if is_v41:
+            def shard(
+                tensor: torch.Tensor,
+                dimension: int,
+                packing: int = 1,
+            ) -> torch.Tensor:
+                return _slice_v41_tp_shard(
+                    tensor,
+                    dimension=dimension,
+                    intermediate_size_per_partition=spec.logical_I_tp,
+                    tp_rank=spec.tp_rank,
+                    packing=packing,
+                )
+
 
         print(f"  Loading {E} {family_label} FP4 experts...", end="", flush=True)
         for eid in range(E):
-            global_eid = spec.tp_rank * E + eid if is_v41 else eid
-            ep = f"{prefix}.{global_eid}"
-            tp_off = 0 if is_v41 else spec.tp_rank * I_tp
-            tp_off_packed = tp_off // 2
-            tp_sf_cols = I_tp // 32
-            tp_sf_off = tp_off // 32
-
-            gate_w[eid] = _fp4_checkpoint_bytes(
-                loader.get_tensor(f"{ep}.{gate_proj}.weight")
-            ).narrow(0, tp_off, I_tp).to(device)
-            gate_sf[eid] = loader.get_tensor(f"{ep}.{gate_proj}.scale").narrow(0, tp_off, I_tp).to(device)
-
-            up_w[eid] = _fp4_checkpoint_bytes(
-                loader.get_tensor(f"{ep}.{up_proj}.weight")
-            ).narrow(0, tp_off, I_tp).to(device)
-            up_sf[eid] = loader.get_tensor(f"{ep}.{up_proj}.scale").narrow(0, tp_off, I_tp).to(device)
-
-            down_w[eid] = _fp4_checkpoint_bytes(
-                loader.get_tensor(f"{ep}.{down_proj}.weight")
-            ).narrow(1, tp_off_packed, I_tp // 2).to(device)
-            down_sf[eid] = loader.get_tensor(f"{ep}.{down_proj}.scale").narrow(1, tp_sf_off, tp_sf_cols).to(device)
+            ep = f"{prefix}.{eid}"
+            if is_v41:
+                gate_w[eid] = shard(
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{gate_proj}.weight")),
+                    0,
+                ).to(device)
+                gate_sf[eid] = shard(
+                    loader.get_tensor(f"{ep}.{gate_proj}.scale"), 0,
+                ).to(device)
+                up_w[eid] = shard(
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{up_proj}.weight")),
+                    0,
+                ).to(device)
+                up_sf[eid] = shard(
+                    loader.get_tensor(f"{ep}.{up_proj}.scale"), 0,
+                ).to(device)
+                down_w[eid] = shard(
+                    _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{down_proj}.weight")),
+                    1,
+                    packing=2,
+                ).to(device)
+                down_sf[eid] = shard(
+                    loader.get_tensor(f"{ep}.{down_proj}.scale"),
+                    1,
+                    packing=32,
+                ).to(device)
+            else:
+                tp_off = spec.tp_rank * I_tp
+                tp_off_packed = tp_off // 2
+                tp_sf_cols = I_tp // 32
+                tp_sf_off = tp_off // 32
+                gate_w[eid] = _fp4_checkpoint_bytes(
+                    loader.get_tensor(f"{ep}.{gate_proj}.weight")
+                ).narrow(0, tp_off, I_tp).to(device)
+                gate_sf[eid] = loader.get_tensor(
+                    f"{ep}.{gate_proj}.scale"
+                ).narrow(0, tp_off, I_tp).to(device)
+                up_w[eid] = _fp4_checkpoint_bytes(
+                    loader.get_tensor(f"{ep}.{up_proj}.weight")
+                ).narrow(0, tp_off, I_tp).to(device)
+                up_sf[eid] = loader.get_tensor(
+                    f"{ep}.{up_proj}.scale"
+                ).narrow(0, tp_off, I_tp).to(device)
+                down_w[eid] = _fp4_checkpoint_bytes(
+                    loader.get_tensor(f"{ep}.{down_proj}.weight")
+                ).narrow(1, tp_off_packed, I_tp // 2).to(device)
+                down_sf[eid] = loader.get_tensor(
+                    f"{ep}.{down_proj}.scale"
+                ).narrow(1, tp_sf_off, tp_sf_cols).to(device)
         print(" done.")
 
         # Match vLLM FusedMoE loading for the B12X backend: native DeepSeek V4
@@ -1468,11 +1542,6 @@ def compute_model_gate_routing(
     elif score_func != "softmax" and weights.gate_norm_topk_prob:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
     topk_weights = topk_weights * weights.gate_route_scale
-    if weights.spec.expert_parallel:
-        local_ids = topk_ids - weights.spec.tp_rank * weights.spec.num_experts
-        topk_ids = torch.where(
-            (local_ids >= 0) & (local_ids < weights.spec.num_experts), local_ids, -1,
-        )
     return normalize_kernel_routing(topk_ids, topk_weights)
 
 
@@ -3228,7 +3297,7 @@ def bench_e2e() -> None:
             raise ValueError("V4.1 fixes SwiGLU clamp=10, alpha=1, beta=0")
         if args.reference != "none" or args.tp_parallel or args.graph_mode != "single-op":
             raise ValueError(
-                "V4.1 benchmarks one local EP rank with --reference none and "
+                "V4.1 benchmarks one rank-local TP shard with --reference none and "
                 "--graph-mode single-op; generic references and TP stream simulation "
                 "do not implement its numerical/collective contract"
             )
@@ -3284,7 +3353,6 @@ def bench_e2e() -> None:
         raise ValueError(
             "--routing-repeat-period cannot exceed any requested batch size"
         )
-
     require_sm120()
     torch.empty(1, device="cuda")
     device = torch.device("cuda", torch.cuda.current_device())
@@ -3340,12 +3408,11 @@ def bench_e2e() -> None:
         f"{model_profile.label}  TP={spec.tp_size}, K={spec.hidden_size}, I_tp={spec.I_tp}, "
         f"E={spec.num_experts}, top_k={spec.top_k}"
     )
-    if spec.expert_parallel:
-        start = spec.tp_rank * spec.num_experts
+    if is_v41:
         print(
-            f"Whole-expert partition: rank {spec.tp_rank}, global experts "
-            f"[{start}, {start + spec.num_experts}); FP32 local routed sum. "
-            "Excludes all-reduce and shared expert."
+            f"Intermediate TP shard: rank {spec.tp_rank}, all {spec.num_experts} experts, "
+            f"logical I_tp={spec.logical_I_tp}, physical I_tp={spec.I_tp}. "
+            "Excludes the TP all-reduce and shared expert."
         )
     print(f"Model path: {model_path}")
     if model_profile.shape is not None:
