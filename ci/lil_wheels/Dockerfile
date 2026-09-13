@@ -16,8 +16,8 @@ RUN --mount=type=cache,id=lil-wheel-pip,target=/root/.cache/pip,sharing=locked \
     && env -u PYTHONPATH python -m pip install \
       --no-deps --force-reinstall /wheelhouse/b12x-*.whl \
     && cd /tmp \
-    && env -u PYTHONPATH python -c \
-      'import pathlib, sys, torch, b12x; location = pathlib.Path(b12x.__file__).resolve(); prefix = pathlib.Path(sys.prefix).resolve(); assert location.is_relative_to(prefix), (location, prefix); assert int(torch._C._GLIBCXX_USE_CXX11_ABI) == int("'"'"'${CXX11_ABI}'"'"'"); print("b12x_wheel_import=PASS")'
+    && env -u PYTHONPATH CXX11_ABI="${CXX11_ABI}" python -c \
+      'import os, pathlib, sys, torch, b12x; location = pathlib.Path(b12x.__file__).resolve(); prefix = pathlib.Path(sys.prefix).resolve(); assert location.is_relative_to(prefix), (location, prefix); assert int(torch._C._GLIBCXX_USE_CXX11_ABI) == int(os.environ["CXX11_ABI"]); print("b12x_wheel_import=PASS")'
 
 FROM scratch AS export
 COPY --from=wheels /wheelhouse/ /wheels/
