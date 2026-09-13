@@ -32,6 +32,7 @@ docker buildx build \
   --builder "${builder}" \
   --file "${tool_dir}/Dockerfile" \
   --build-arg "BUILDER_IMAGE=$(lock_value builder.image)" \
+  --build-arg "CXX11_ABI=$(lock_value cxx11-abi)" \
   --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}" \
   --target export \
   --output "type=local,dest=${output_dir}/raw" \
@@ -65,6 +66,7 @@ jq -n \
   --arg cuda "$(lock_value cuda.version)" \
   --arg pytorch "$(lock_value pytorch.version)" \
   --arg pytorch_commit "$(lock_value pytorch.commit)" \
+  --arg cxx11_abi "$(lock_value cxx11-abi)" \
   --arg cutlass_dsl "$(lock_value cutlass-dsl.version)" \
   --arg cuda_arch_list "$(lock_value cuda.arch-list)" \
   '{schema: "local-inference-b12x-wheel-release/v1", status: $status,
@@ -73,6 +75,7 @@ jq -n \
     package_version: $package_version, release_tag: $release_tag,
     runtime: {builder_image: $builder_image, python: $python, cuda: $cuda,
       pytorch: $pytorch, pytorch_commit: $pytorch_commit,
+      cxx11_abi: $cxx11_abi,
       cutlass_dsl: $cutlass_dsl, cuda_arch_list: $cuda_arch_list},
     packages: [{name: "b12x", version: $package_version, file: $file,
       sha256: $sha256, url: $url}]}' \

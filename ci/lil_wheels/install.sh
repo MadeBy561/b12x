@@ -12,4 +12,5 @@ uv_binary=${UV_BIN:-uv}
   --no-deps \
   --require-hashes \
   -r "${bundle_dir}/requirements-github.txt"
-"${venv_path}/bin/python" -c 'import b12x; print("b12x_install=PASS")'
+(cd / && "${venv_path}/bin/python" -c \
+  'import pathlib, sys, b12x; location = pathlib.Path(b12x.__file__).resolve(); prefix = pathlib.Path(sys.prefix).resolve(); assert location.is_relative_to(prefix), (location, prefix); print("b12x_install=PASS")')

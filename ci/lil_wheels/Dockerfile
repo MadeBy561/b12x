@@ -4,6 +4,7 @@ ARG BUILDER_IMAGE
 FROM ${BUILDER_IMAGE} AS wheels
 
 ARG SOURCE_DATE_EPOCH
+ARG CXX11_ABI
 ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 COPY . /src/b12x
 WORKDIR /src/b12x
@@ -14,8 +15,9 @@ RUN --mount=type=cache,id=lil-wheel-pip,target=/root/.cache/pip,sharing=locked \
     && test "$(find /wheelhouse -maxdepth 1 -name 'b12x-*.whl' | wc -l)" -eq 1 \
     && env -u PYTHONPATH python -m pip install \
       --no-deps --force-reinstall /wheelhouse/b12x-*.whl \
+    && cd /tmp \
     && env -u PYTHONPATH python -c \
-      'import b12x; print("b12x_wheel_import=PASS")'
+      'import pathlib, sys, torch, b12x; location = pathlib.Path(b12x.__file__).resolve(); prefix = pathlib.Path(sys.prefix).resolve(); assert location.is_relative_to(prefix), (location, prefix); assert int(torch._C._GLIBCXX_USE_CXX11_ABI) == int("'"'"'${CXX11_ABI}'"'"'"); print("b12x_wheel_import=PASS")'
 
 FROM scratch AS export
 COPY --from=wheels /wheelhouse/ /wheels/
