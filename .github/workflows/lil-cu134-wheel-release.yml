@@ -48,10 +48,20 @@ jobs:
           if gh release view "${tag}" >/dev/null 2>&1; then
             mkdir existing-release
             gh release download "${tag}" --dir existing-release
+            mkdir built-release
+            cp "${output}"/bundle/wheels/*.whl \
+              "${output}"/bundle/manifest.json \
+              "${output}"/bundle/SHA256SUMS \
+              "${output}"/bundle/requirements-github.txt \
+              "${output}"/bundle/install.sh \
+              "${output}"/bundle/runtime.lock \
+              "${output}"/b12x-cu134-*.tar.zst \
+              "${output}"/b12x-cu134-*.tar.zst.sha256 built-release/
             python ci/lil_wheels/verify_release_assets.py \
               --directory existing-release \
               --source-commit "${GITHUB_SHA}" \
-              --beta-tag "${tag}"
+              --beta-tag "${tag}" \
+              --reference-directory built-release
             exit 0
           fi
           gh release create "${tag}" \
@@ -99,6 +109,7 @@ jobs:
               --directory existing-stable-release \
               --source-commit "${GITHUB_SHA}" \
               --beta-tag "${beta_tag}" \
+              --reference-directory assets \
               --promotion
             exit 0
           fi

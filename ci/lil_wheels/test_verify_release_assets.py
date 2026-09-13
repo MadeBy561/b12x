@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,11 +28,14 @@ class VerifyReleaseAssetsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.directory = Path(self.temporary_directory.name)
+        self.reference_temporary_directory = tempfile.TemporaryDirectory()
+        self.reference_directory = Path(self.reference_temporary_directory.name)
         self.script = Path(__file__).with_name("verify_release_assets.py")
         self._write_assets(promotion=False)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+        self.reference_temporary_directory.cleanup()
 
     def _write_assets(self, *, promotion: bool) -> None:
         wheel = b"source-locked B12X wheel"
@@ -85,7 +89,9 @@ class VerifyReleaseAssetsTest(unittest.TestCase):
                 json.dumps(promotion_marker)
             )
 
-    def _verify(self, *, promotion: bool = False) -> subprocess.CompletedProcess[str]:
+    def _verify(
+        self, *, promotion: bool = False, reference: bool = False
+    ) -> subprocess.CompletedProcess[str]:
         command = [
             sys.executable,
             str(self.script),
@@ -98,6 +104,8 @@ class VerifyReleaseAssetsTest(unittest.TestCase):
         ]
         if promotion:
             command.append("--promotion")
+        if reference:
+            command.extend(["--reference-directory", str(self.reference_directory)])
         return subprocess.run(command, text=True, capture_output=True, check=False)
 
     def test_complete_beta_release_passes(self) -> None:
@@ -124,6 +132,47 @@ class VerifyReleaseAssetsTest(unittest.TestCase):
         self._write_assets(promotion=True)
         result = self._verify(promotion=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_independent_beta_bytes_pass(self) -> None:
+        """The published beta must match the independently built assets."""
+        shutil.copytree(self.directory, self.reference_directory, dirs_exist_ok=True)
+        result = self._verify(reference=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stable_matches_beta_without_promotion_marker(self) -> None:
+        """A stable marker is additional metadata, not a change to beta bytes."""
+        shutil.copytree(self.directory, self.reference_directory, dirs_exist_ok=True)
+        self._write_assets(promotion=True)
+        result = self._verify(promotion=True, reference=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_coordinated_asset_and_metadata_replacement_is_rejected(self) -> None:
+        """Self-consistent replacement bytes must not override trusted bytes."""
+        shutil.copytree(self.directory, self.reference_directory, dirs_exist_ok=True)
+        replacement = b"substituted wheel"
+        (self.directory / WHEEL_NAME).write_bytes(replacement)
+        manifest_path = self.directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["packages"][0]["sha256"] = digest(replacement)
+        manifest_path.write_text(json.dumps(manifest))
+        checksums = self.directory / "SHA256SUMS"
+        entries = [line.split(maxsplit=1)[1] for line in checksums.read_text().splitlines()]
+        checksums.write_text(
+            "".join(
+                f"{digest((self.directory / Path(name).name).read_bytes())}  {name}\n"
+                for name in entries
+            )
+        )
+        self.assertEqual(self._verify().returncode, 0)
+        result = self._verify(reference=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("independent reference mismatch", result.stderr)
+
+    def test_incomplete_reference_is_rejected(self) -> None:
+        """A partial independent inventory cannot establish byte identity."""
+        result = self._verify(reference=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reference asset set differs", result.stderr)
 
 
 if __name__ == "__main__":

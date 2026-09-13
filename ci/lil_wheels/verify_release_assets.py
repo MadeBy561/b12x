@@ -51,6 +51,11 @@ def main() -> None:
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--beta-tag", required=True)
     parser.add_argument("--promotion", action="store_true")
+    parser.add_argument(
+        "--reference-directory",
+        type=Path,
+        help="Independent flat asset directory from a fresh build or source beta",
+    )
     args = parser.parse_args()
 
     require(args.directory.is_dir(), f"asset directory is missing: {args.directory}")
@@ -126,6 +131,20 @@ def main() -> None:
         sha256(args.directory / archive) == archive_checksum[0],
         "release archive digest mismatch",
     )
+
+    if args.reference_directory is not None:
+        require(args.reference_directory.is_dir(), "reference directory is missing")
+        reference_assets = {
+            path.name for path in args.reference_directory.iterdir() if path.is_file()
+        }
+        beta_assets = expected_assets - {"stable-promotion.json"}
+        require(reference_assets == beta_assets, "reference asset set differs")
+        for name in sorted(beta_assets):
+            require(
+                sha256(args.directory / name)
+                == sha256(args.reference_directory / name),
+                f"independent reference mismatch: {name}",
+            )
 
     if args.promotion:
         promotion = json.loads((args.directory / "stable-promotion.json").read_text())
