@@ -133,8 +133,8 @@ class VerifyReleaseAssetsTest(unittest.TestCase):
         result = self._verify(promotion=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_independent_beta_bytes_pass(self) -> None:
-        """The published beta must match the independently built assets."""
+    def test_reference_beta_bytes_pass(self) -> None:
+        """Matching reference assets satisfy byte-identity verification."""
         shutil.copytree(self.directory, self.reference_directory, dirs_exist_ok=True)
         result = self._verify(reference=True)
         self.assertEqual(result.returncode, 0, result.stderr)
