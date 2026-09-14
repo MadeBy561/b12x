@@ -462,7 +462,7 @@ def test_equal_declarations_enumerate_their_candidates_once(tmp_path, monkeypatc
 def test_duplicate_choice_dependency_order_still_prepares_both_plans(tmp_path, monkeypatch):
     _deterministic_timer(monkeypatch)
     calls = []
-    producer = request(name="producer")
+    producer = request(name="producer", tuning=contract(), pin=Config(2))
 
     def benchmark(state):
         return PreparedCall(run=lambda: state.value, produce=lambda: None)
@@ -507,7 +507,7 @@ def test_composite_prepares_children_and_assembles_their_states(tmp_path):
 
     def child(width):
         return Plan(
-            contract=contract(values=(width,)), query=Query(3),
+            contract=contract(), query=Query(3), override=Config(width),
             _compile_jobs=lambda config, device: (),
             _memory_requirements=lambda config, device: MemoryRequirements(),
             _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
@@ -730,3 +730,195 @@ def test_prepare_default_primes_with_the_request_call_and_refuses_after_freeze_o
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="under CUDA graph capture"):
         prepare_default(request(name="captured"))
+
+
+def test_gpu_steps_share_a_bounded_advance_without_changing_order(tmp_path, monkeypatch):
+    from b12x.preparation import session as implementation
+    from b12x.preparation.types import PreparationResult
+
+    clock = [implementation.time.monotonic()]
+    monkeypatch.setattr(implementation.time, "monotonic", lambda: clock[0])
+    seen = []
+
+    def steps():
+        for index in range(10):
+            seen.append(index)
+            clock[0] += 0.03
+            yield "gpu"
+        return PreparationResult(plans={})
+
+    with session(tmp_path) as engine:
+        job = engine.begin(())
+        job._steps = steps()
+        assert not job.advance().done
+        assert seen == list(range(4))
+        assert not job.advance().done
+        assert seen == list(range(8))
+        assert job.advance().done
+        assert seen == list(range(10))
+        job.result()
+
+
+@pytest.mark.parametrize("boundary", ("compile", "collective", "tuning"))
+def test_batched_gpu_steps_stop_before_unready_work(tmp_path, boundary):
+    from b12x.preparation.types import PreparationResult, TuningRequirement
+
+    seen = []
+    collective = CollectiveRequirement("ready/collective", (0, 1))
+    tuning = TuningRequirement("ready/tuning", (0, 1), {"width": 2}, 1.0, 0)
+    signals = {"compile": "compile", "collective": collective, "tuning": tuning}
+
+    def steps():
+        for index in range(2):
+            seen.append(index)
+            yield "gpu"
+        authorization = yield signals[boundary]
+        seen.append(authorization)
+        yield "gpu"
+        return PreparationResult(plans={})
+
+    with session(tmp_path) as engine:
+        job = engine.begin(())
+        job._steps = steps()
+        progress = job.advance()
+        assert seen == [0, 1]
+        assert not progress.done
+        if boundary == "collective":
+            assert progress.ready_collectives == (collective,)
+            assert job.advance().ready_collectives == (collective,)
+            assert seen == [0, 1]
+            progress = job.advance(collective_key=collective.key)
+        elif boundary == "tuning":
+            assert progress.ready_tuning == (tuning,)
+            assert job.advance().ready_tuning == (tuning,)
+            assert seen == [0, 1]
+            progress = job.advance(tuning=tuning)
+        else:
+            assert progress.pending_compilation
+            progress = job.advance()
+        assert progress.done
+        assert seen == [0, 1, tuning if boundary == "tuning" else None]
+        job.result()
+
+
+def test_closed_trials_release_storage_before_the_next_batch(tmp_path, monkeypatch):
+    import weakref
+    from b12x.preparation import _measurement
+
+    class TrialStorage:
+        pass
+
+    references, alive, allocation_peaks = [], [], []
+    _deterministic_timer(monkeypatch)
+    prepare = _measurement.prepare_race_steps
+
+    def observe(calls, **kwargs):
+        alive.append(sum(reference() is not None for reference in references))
+        return (yield from prepare(calls, **kwargs))
+
+    def benchmark(state):
+        storage = TrialStorage()
+        references.append(weakref.ref(storage))
+        allocation_peaks.append(sum(reference() is not None for reference in references))
+
+        def run():
+            _ = storage
+            return state.value
+
+        return PreparedCall(run=run, produce=lambda: None)
+
+    monkeypatch.setattr(_measurement, "prepare_race_steps", observe)
+    with session(tmp_path, race_batch=2) as engine:
+        result = engine.prepare((request(
+            name="trial-lifetime", tuning=contract(values=(1, 2, 4, 8, 16, 32)),
+            benchmark=benchmark,
+        ),))
+        assert result.benchmarked_candidates == 6
+        assert result.selections["trial-lifetime"].config.width == 2
+        assert alive == [2, 3, 3]
+        assert allocation_peaks == [1, 2, 2, 3, 2, 3]
+        assert all(reference() is None for reference in references)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_fifty_layer_bindings_are_one_preparation_request(tmp_path, monkeypatch, shared):
+    from b12x.preparation.tuning import TuningContract
+
+    _deterministic_timer(monkeypatch)
+    configured, compiled, primed, closed = [], [], [], []
+    configure = TuningContract.configure
+
+    def count_configuration(self, query, **kwargs):
+        configured.append(query)
+        return configure(self, query, **kwargs)
+
+    monkeypatch.setattr(TuningContract, "configure", count_configuration)
+    weights = [index + 1 for index in range(50)]
+
+    def make(index):
+        def compile_jobs(config, device):
+            compiled.append(config.width)
+            return ()
+
+        plan = Plan(
+            contract=contract(), query=Query(3), shared=shared,
+            _compile_jobs=compile_jobs,
+            _memory_requirements=lambda config, device: MemoryRequirements(),
+            _materialize=lambda selection, device: SimpleNamespace(value=3 * selection.config.width),
+        )
+        return plan.request(
+            name=f"layer.{index}",
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: primed.append((index, state.value * weights[index])),
+                close=lambda: closed.append(index),
+            ),
+            benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+        )
+
+    requests = tuple(make(index) for index in range(50))
+    progress = []
+    with session(tmp_path) as engine:
+        result = engine.prepare(requests, progress=progress.append)
+        assert len(configured) == 1
+        assert sorted(compiled) == [1, 2, 4, 7]
+        assert result.benchmarked_candidates == 3 and result.cache_hits == 0
+        assert progress[-1].completed_requests == progress[-1].total_requests == 1
+        assert len(result.plans) == 50
+        assert len(primed) == (1 if shared else 50)
+        assert len({id(item.plan.prepared) for item in requests}) == (1 if shared else 50)
+        for index, item in enumerate(requests):
+            assert require_prepared(item.plan, "test.arithmetic").value * weights[index] == 6 * (index + 1)
+        weights[27] = -3
+        assert require_prepared(requests[27].plan, "test.arithmetic").value * weights[27] == -18
+        engine.release(requests[0].plan)
+        extra = make(0)
+        if shared:
+            engine.prepare((extra,))
+            assert extra.plan.prepared is requests[1].plan.prepared
+            assert len(primed) == 1 and closed == []
+        engine.freeze()
+        ready = tuple(item for item in requests if item.plan.prepared is not None)
+        engine.prepare(ready, progress=progress.append)
+        assert progress[-1].total_requests == progress[-1].completed_requests == 1
+    assert len(closed) == (1 if shared else 50)
+
+
+def test_coalesced_collectives_authorize_each_resource_binding(tmp_path):
+    calls, authorizations, progress = [], [], []
+    requests = tuple(request(
+        name=name, calls=calls, collective=CollectiveRequirement(name, (0, 1)),
+    ) for name in ("first-channel", "second-channel"))
+
+    def coordinate(state):
+        if not state.ready_collectives:
+            return None
+        key = state.ready_collectives[0].key
+        authorizations.append(key)
+        return key
+
+    with session(tmp_path) as engine:
+        engine.prepare(requests, coordinator=coordinate, progress=progress.append)
+        assert calls == [6, 6]
+        assert authorizations == ["first-channel", "second-channel"]
+        assert progress[-1].completed_requests == progress[-1].total_requests == 1
+        assert requests[0].plan.prepared is not requests[1].plan.prepared

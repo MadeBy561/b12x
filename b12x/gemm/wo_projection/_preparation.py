@@ -173,7 +173,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 TUNING.encode_query(query), device.ordinal,
             ),
         ),
-        _memory_requirements=memory, _materialize=materialize, _device=caps.device,
+        _memory_requirements=memory, _materialize=materialize, _device=caps.device, shared=True,
     )
 
 

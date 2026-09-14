@@ -673,10 +673,13 @@ class PCIeDmaAllReduce:
         state.require_runtime(self)
         self._kernels.install(state.launchers)
         with torch.cuda.device(self.device):
-            flag = self._flag_ptr(self.rank, 0)
-            self._kernels.dma_set_flag(flag, self._counter_ptr(self._send_counters, 0))
-            self._kernels.dma_wait_flag(flag, self._counter_ptr(self._wait_counters, 0))
-            scratch = self._scratch_ptr(self.rank, 0)
+            # Local probes must not overwrite an arriving peer flag or payload.
+            # The final slot is beyond both transport layouts for supported worlds.
+            slot = FLAG_SLOTS - 1
+            flag = self._flag_ptr(self.rank, slot)
+            self._kernels.dma_set_flag(flag, self._counter_ptr(self._send_counters, slot))
+            self._kernels.dma_wait_flag(flag, self._counter_ptr(self._wait_counters, slot))
+            scratch = flag + 16
             self._kernels.dma_copy(scratch, scratch, 16)
             for dtype_code, elems in ((0, 8), (1, 8), (2, 4)):
                 self._kernels.dma_add(scratch, scratch, scratch, elems, dtype_code)

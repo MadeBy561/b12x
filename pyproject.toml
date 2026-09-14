@@ -41,6 +41,7 @@ where = ["."]
 include = ["b12x*"]
 
 [tool.setuptools.package-data]
+"b12x.preparation" = ["*.cpp"]
 "b12x.comm.roce" = ["*.c"]
 "b12x.loader" = ["*.c"]
 

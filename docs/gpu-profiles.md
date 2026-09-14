@@ -42,6 +42,12 @@ owners=..., close=...)`. Priming runs reset, activation production, and the
 operation under a guard that fails if the operation launches a program the
 declaration did not list. A no-op primer does not qualify an operation.
 
+A prepare callback's `owners` and `close` are retained until the plan is
+released. Include only resources needed by the prepared execution. Temporary
+activation, output and scratch buffers belong to the call's closures, which
+are released after priming. `restore` runs before readiness; it restores
+borrowed inputs and finishes cleanup of call-only resources.
+
 A benchmark callback is required when an unpinned declaration has more than one
 eligible configuration. It uses representative state, valid nonzero inputs and
 the serving numerical recipe. Producers write activations and their scales,
@@ -91,8 +97,15 @@ Races run in bounded batches. The session instantiates candidates up to
 `race_batch` at a time or until the measured resident bytes reach
 `race_budget` (half of free device memory by default), times the batch, keeps
 the best candidate, and carries it into the next batch so every candidate is
-compared head to head with the running best. Losers are restored and closed
-after each batch.
+compared head to head with the running best. Losers are restored and closed,
+and their trial storage is released before the following batch is materialized.
+
+Race memory accounting reads the native allocator's aggregate allocated-byte
+counter without converting historical CUDA graph-pool statistics to Python.
+The first race lazily builds a small C++ extension through PyTorch; this
+requires a host C++ compiler and CUDA headers located through `CUDA_HOME`.
+The extension uses PyTorch's extension cache (`TORCH_EXTENSIONS_DIR` when
+set). Preparation that performs no race does not build it.
 
 Within a batch every candidate is timed by CUDA-graph replay for at least one
 round. After each round a candidate whose best round trails the batch leader
@@ -194,8 +207,11 @@ new obligations; captured graphs replay prepared launchers only.
 
 ## Cooperative startup
 
-`session.begin(requests)` returns a `PreparationJob`; `job.advance()` performs
-bounded metadata work or one GPU preparation or measurement bracket.
+`session.begin(requests)` returns a `PreparationJob`; `job.advance()` runs
+local metadata, GPU preparation and measurement steps within a 100 ms time
+slice. An in-flight step finishes before the deadline is checked. Pending
+compilation, collective readiness and winner exchange return control
+immediately, so a driver can coordinate ranks before admitting dependent work.
 `configure_tuning_shard(rank, ranks)` assigns the process a disjoint share of
 every race; ranks exchange their local winners through `TuningRequirement`
 and install the global winner. Collective declarations are never raced; their
@@ -248,7 +264,27 @@ retaining mandatory preparation with:
 
 The compact loading display is rank-zero only and is driven by real
 preparation phases, candidate counts, completed timing rounds and cache and
-compiler activity. Redirected output uses plain milestone lines.
+compiler activity. Race status identifies the displayed rank and batch;
+latency histories reset between batches and do not combine different ranks.
+Redirected output uses plain milestone lines.
+
+Set `B12X_PREPARATION_TRACE_DIR` before startup to collect timing JSONL:
+
+```bash
+export B12X_PREPARATION_TRACE_DIR=/tmp/b12x-preparation-timing
+```
+
+Each worker writes `job-<pid>.jsonl` with request queries, completed
+selection sources and coverage, batch candidate indices, carried champions,
+latencies, and cumulative wall-time counters. The vLLM driver also writes
+`coordinator-<pid>.jsonl`. A `begin` record starts a job or coordinator
+segment; multiple preparation stages append to the same per-process file.
+Counters are inclusive: `compile_plan`, `materialize_prime`,
+`memory_accounting` and cleanup are contained in the job's phase and
+`advance` totals. Job `between_advances` measures time outside the job.
+Coordinator `local` includes `compiler_wait`; `control_exchange` measures
+rank coordination, and its `between_advances` measures the external driver.
+These nested totals must not be added together.
 
 ## Native benchmark consumers
 

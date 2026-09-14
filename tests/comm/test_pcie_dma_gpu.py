@@ -324,3 +324,93 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     assert torch.equal(
         payload.cpu(), expected_payload.repeat_interleave(32)
     )
+
+
+def _preparation_skew_worker(rank: int, world_size: int, port: int) -> None:
+    import time
+    from datetime import timedelta
+    from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
+        world_size=world_size, timeout=timedelta(seconds=45),
+    )
+    ring = PCIeDmaAllReduce(
+        exchange_group=dist.group.WORLD, device=device, max_bytes=80 << 20,
+        fp8="",
+    )
+    session = PreparationSession(device=device, autotune=False)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        cases = []
+        for index, rows in enumerate((4089, 4096)):
+            source = torch.full(
+                (rows, 5120), rank + 1, device=device, dtype=torch.bfloat16,
+            )
+            output = torch.empty_like(source)
+            declaration = dma_plan(
+                query_from_metadata(ring, shape=tuple(source.shape), dtype=source.dtype),
+                runtime=ring,
+            )
+
+            def call(state):
+                if rank == index + 1:
+                    time.sleep(0.3)
+                return prepared_call(state, inp=source, out=output)
+
+            session.prepare((declaration.request(name=f"dma.m{rows}", prepare_call=call),))
+            torch.testing.assert_close(output, torch.full_like(output, 10), rtol=0, atol=0)
+            cases.append((declaration, source, output))
+            dist.barrier()
+        session.freeze()
+        for declaration, source, output in cases:
+            with session.capture(), torch.cuda.graph(graph):
+                ring.all_reduce(source, plan=declaration, out=output)
+            address = output.data_ptr()
+            for iteration in (1, 2):
+                source.fill_(rank + 1 + iteration)
+                output.fill_(float("nan"))
+                allocated = torch.cuda.memory_allocated(device)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert output.data_ptr() == address
+                assert torch.cuda.memory_allocated(device) == allocated
+                torch.testing.assert_close(
+                    output, torch.full_like(output, 10 + world_size * iteration),
+                    rtol=0, atol=0,
+                )
+            graph.reset()
+        dist.barrier()
+    finally:
+        graph.reset()
+        session.close()
+        ring.close()
+        dist.destroy_process_group()
+
+
+def test_pcie_dma_preparation_tolerates_rank_skew_and_replays() -> None:
+    import time
+    import torch.multiprocessing as mp
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 4:
+        pytest.skip("requires four CUDA devices")
+    workers = mp.spawn(
+        _preparation_skew_worker, args=(4, _free_port()), nprocs=4, join=False,
+    )
+    finished = False
+    deadline = time.monotonic() + 60
+    try:
+        while time.monotonic() < deadline:
+            if workers.join(timeout=1):
+                finished = True
+                return
+        raise TimeoutError("DMA preparation or replay stalled with delayed ranks")
+    finally:
+        if not finished:
+            for process in workers.processes:
+                if process.is_alive():
+                    process.kill()
+            for process in workers.processes:
+                process.join(timeout=5)

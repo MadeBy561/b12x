@@ -22,6 +22,7 @@ from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from ._cache import SelectionCache, cache_identity, digest
 from ._measurement import SURVIVOR_ROUNDS
+from ._timing import PreparationTiming
 from .device import DetectedDevice, detect_device
 from .types import (
     CollectiveRequirement, FrozenMapping, MemoryRequirements, Plan,
@@ -37,6 +38,7 @@ logger = logging.getLogger("b12x.preparation")
 class _Obligation:
     request: PreparationRequest
     configuration: object
+    requests: tuple = ()
     candidates: list = field(default_factory=list)
     coverage: dict = field(default_factory=dict)
     selection: Selection | None = None
@@ -71,7 +73,10 @@ class _CallGuard:
                 self.call.close()
 
     def finish(self):
-        _close_all((self.restore, self.close))
+        try:
+            _close_all((self.restore, self.close))
+        finally:
+            self.call = None
 
 
 @dataclass
@@ -87,11 +92,14 @@ class _Trial:
     latency_us: float | None = None
 
     def close(self):
-        self.guard.finish()
+        try:
+            self.guard.finish()
+        finally:
+            self.call = self.state = self.retained = None
 
 
-# Metadata steps carry no signal, so this bounds how long one advance() call
-# withholds progress reporting and collective coordination from the caller.
+# Local metadata and GPU steps share one time slice. Collective readiness and
+# pending compilation always return control before more work is admitted.
 _ADVANCE_SECONDS = 0.1
 
 
@@ -180,6 +188,20 @@ def _expand_requests(requests):
                 dependencies.append(name)
         normalized.append(replace(request, dependencies=tuple(dict.fromkeys(dependencies))))
     return _topological(normalized), composites
+
+
+def _coalesce_requests(requests):
+    """Group declaration-equivalent work while preserving its runtime bindings."""
+    groups, keys = {}, {}
+    for request in requests:
+        key = (
+            _declaration_key(request.plan),
+            tuple(dict.fromkeys(keys[name] for name in request.dependencies)),
+            None if request.collective is None else request.collective.ranks,
+        )
+        keys[request.name] = key
+        groups.setdefault(key, []).append(request)
+    return tuple(tuple(group) for group in groups.values())
 
 
 def _plans_of(request):
@@ -275,8 +297,8 @@ class PreparationSession:
     def _allocated(self):
         if self.device.ordinal is None:
             return 0
-        import torch
-        return int(torch.cuda.memory_allocated(self.device.ordinal))
+        from ._memory import allocated_bytes
+        return allocated_bytes(self.device.ordinal)
 
     def _race_budget(self):
         if self.race_budget is not None:
@@ -334,30 +356,31 @@ class PreparationSession:
             raise RuntimeError("cannot inspect memory while preparation is active")
         expanded, _ = _expand_requests(tuple(requests))
         requirements = []
-        for request in expanded:
-            plan = request.plan
+        for requests in _coalesce_requests(expanded):
+            plan = requests[0].plan
             configuration = plan.contract.configure(
-                plan.query,
-                device=self.device.identity,
-                override=plan.override,
+                plan.query, device=self.device.identity, override=plan.override,
             )
-            if configuration.pinned is not None:
-                configs = (configuration.pinned,)
-            else:
-                configs = (
-                    configuration.default,
-                    *(config for _, config in plan.contract.iterate(configuration)),
-                )
+            configs = ((configuration.pinned,) if configuration.pinned is not None else (
+                configuration.default,
+                *(config for _, config in plan.contract.iterate(configuration)),
+            ))
+            plans, shared = [], False
+            for request in requests:
+                candidate = request.plan
+                if candidate in plans or (candidate.shared and shared):
+                    continue
+                plans.append(candidate)
+                shared |= candidate.shared
             seen = set()
             for config in configs:
                 payload = plan.contract.config_payload(config)
                 if payload in seen:
                     continue
                 seen.add(payload)
-                with _plan_scope(plan):
-                    requirements.append(
-                        plan._memory_requirements(config, self.device)
-                    )
+                for candidate in plans:
+                    with _plan_scope(candidate):
+                        requirements.append(candidate._memory_requirements(config, self.device))
         return MemoryRequirements.sequential(requirements)
 
     def cancel_tuning(self):
@@ -411,8 +434,13 @@ class PreparationSession:
             self._plans.remove(plan)
         if plan.shared:
             key = _declaration_key(plan)
-            if self._shared.get(key) is plan:
-                self._shared.pop(key)
+            if self._shared.get(key) is plan and plan.prepared is not prepared:
+                if plan.prepared is None:
+                    replacement = next((user for user in prepared.users if user.shared), None)
+                    if replacement is None:
+                        self._shared.pop(key)
+                    else:
+                        self._shared[key] = replacement
         if prepared.users or prepared.closed:
             return
         prepared.closed = True
@@ -512,12 +540,15 @@ class PreparationJob:
         self._benchmark_calls = {}
         self._plans_by_name = {}
         self._started = time.monotonic()
+        self._timing = PreparationTiming("job", rank=session._tuning_rank)
+        self._last_advance_end = None
         self._phase = "planning"
         self._active_request = None
         self._total_requests = len(requests)
         self._completed_requests = 0
         self._candidate_count = self._candidates_prepared = 0
         self._candidate_sharded = False
+        self._batch_index = self._batch_candidates = 0
         self._completed_rounds = self._total_rounds = self._active_count = 0
         self._latest_round_us = ()
         self._compilations = 0
@@ -560,9 +591,28 @@ class PreparationJob:
             tuning_stopped=self.session._stop.is_set(),
             ready_tuning=tuple(ready_tuning),
             candidate_sharded=self._candidate_sharded,
+            batch_index=self._batch_index, batch_candidates=self._batch_candidates,
+            tuning_rank=self.session._tuning_rank,
         )
 
     def advance(self, *, collective_key=None, tuning=None):
+        started = time.perf_counter()
+        if self._last_advance_end is not None:
+            self._timing.add("between_advances", started - self._last_advance_end)
+        try:
+            return self._advance(collective_key=collective_key, tuning=tuning)
+        finally:
+            self._timing.add("advance", time.perf_counter() - started)
+            self._timing.record(
+                "complete" if self._result is not None else "progress",
+                periodic=self._result is None and self._error is None,
+                phase=self._phase, failed=self._error is not None,
+                request=None if self._active_request is None else self._active_request.name,
+                completed_requests=self._completed_requests,
+            )
+            self._last_advance_end = time.perf_counter()
+
+    def _advance(self, *, collective_key=None, tuning=None):
         self.session._check_thread()
         if self._error is not None:
             raise self._error
@@ -596,7 +646,11 @@ class PreparationJob:
         try:
             deadline = time.monotonic() + _ADVANCE_SECONDS
             while True:
-                signal = self._steps.send(send_value)
+                started = time.perf_counter()
+                try:
+                    signal = self._steps.send(send_value)
+                finally:
+                    self._timing.add(self._phase, time.perf_counter() - started)
                 send_value = None
                 if isinstance(signal, CollectiveRequirement):
                     self._blocked = signal
@@ -606,8 +660,6 @@ class PreparationJob:
                     return self._progress(False, False, (), False, (signal,))
                 if signal == "compile":
                     return self._progress(False, True, (), False)
-                if signal == "gpu":
-                    return self._progress(True, False, (), False)
                 if time.monotonic() >= deadline:
                     break
         except StopIteration as finished:
@@ -691,8 +743,9 @@ class PreparationJob:
         obligation.key = self._choice_key(obligation, selections)
         if obligation.key is None:
             return
-        cache = self.session._selection_cache()
-        record = cache.get(obligation.key)
+        with self._timing.span("cache_lookup"):
+            cache = self.session._selection_cache()
+            record = cache.get(obligation.key)
         if record is None:
             return
         configuration, contract = obligation.configuration, obligation.request.plan.contract
@@ -714,8 +767,13 @@ class PreparationJob:
         if owner is None or owner is plan or owner.prepared is None:
             return False
         prepared = owner.prepared
+        if prepared.selection.source == "default" and self.autotune and not self.session._stop.is_set():
+            return False
+        previous = plan._prepared
         prepared.users.append(plan)
         plan._install(prepared)
+        if previous is not None and previous is not prepared:
+            self.session._release_payload(plan, previous)
         if plan not in self.session._plans:
             self.session._plans.append(plan)
         self._new_plans.append(plan)
@@ -723,9 +781,16 @@ class PreparationJob:
         obligation.ready = True
         return True
 
-    def _configure(self, requests):
+    def _configure(self, groups):
         obligations, settled, enumerations, requirements = [], {}, {}, []
-        for request in requests:
+        for requests in groups:
+            request = next((item for item in requests if item.plan.prepared is not None and (
+                not self.autotune or self.session._stop.is_set()
+                or item.plan.selection.source != "default"
+            )), None)
+            if request is None:
+                request = next((item for item in requests if item.benchmark_call is not None), requests[0])
+            requests = (request, *(item for item in requests if item is not request))
             self._active_request = request
             self._candidate_count = self._candidates_prepared = 0
             self._candidate_sharded = False
@@ -741,7 +806,7 @@ class PreparationJob:
             configuration = plan.contract.configure(
                 plan.query, device=self.session.device.identity, override=plan.override,
             )
-            obligation = _Obligation(request, configuration)
+            obligation = _Obligation(request, configuration, requests=requests)
             obligations.append(obligation)
             prepared = plan.prepared
             if (
@@ -769,10 +834,8 @@ class PreparationJob:
                 if obligation.selection is None:
                     declaration = _declaration_key(plan)
                     enumerated = enumerations.get(declaration)
-                    # The candidate space is a function of the contract object and
-                    # the configuration, and two contract objects can share a key.
-                    if enumerated is not None and enumerated[0] is plan.contract:
-                        _, candidates, coverage = enumerated
+                    if enumerated is not None:
+                        candidates, coverage = enumerated
                         obligation.candidates.extend(candidates)
                         complete = True
                     else:
@@ -800,7 +863,7 @@ class PreparationJob:
                         # interrupted enumeration describes the stop, not the space.
                         if complete:
                             enumerations[declaration] = (
-                                plan.contract, tuple(obligation.candidates), coverage,
+                                tuple(obligation.candidates), coverage,
                             )
                     self._candidate_count = len(obligation.candidates)
                     if complete and not obligation.candidates:
@@ -814,19 +877,18 @@ class PreparationJob:
                         raise LookupError(f"no completed selection for {request.name}")
                     if obligation.selection is None:
                         obligation.coverage = dict(coverage)
-            if obligation.selection is not None:
-                settled[request.name] = (obligation.selection, plan.contract)
-            if not obligation.ready:
-                # One requirement per obligation: what the combination checks is
-                # that plans sharing a persistent allocation key agree on that
-                # key's residency, which a plan declares per query, not per
-                # candidate.
+            for item in requests:
+                if obligation.selection is not None:
+                    settled[item.name] = (obligation.selection, item.plan.contract)
+                if (item.plan.prepared is not None and item.plan.selection == obligation.selection
+                        or item is not request and item.plan.shared and plan.shared):
+                    continue
                 config = (
                     configuration.default if obligation.selection is None
                     else obligation.selection.config
                 )
-                with _plan_scope(plan):
-                    requirements.append(plan._memory_requirements(config, self.session.device))
+                with _plan_scope(item.plan):
+                    requirements.append(item.plan._memory_requirements(config, self.session.device))
             yield "metadata"
         MemoryRequirements.sequential(requirements)
         return obligations
@@ -838,7 +900,8 @@ class PreparationJob:
             compiled = []
             for job in plan._compile_jobs(config, self.session.device):
                 with self.session._gpu_scope():
-                    description = describe_compilation(job)
+                    with self._timing.span("compile_plan"):
+                        description = describe_compilation(job)
                 compiled.append(description)
                 yield "metadata"
             obligation.compiled[payload] = tuple(compiled)
@@ -902,14 +965,16 @@ class PreparationJob:
             raise RuntimeError(f"preparation used undeclared programs for {request.name}")
         return state, call, guard, retained
 
-    def _call(self, obligation, selection, factory):
-        plan = obligation.request.plan
+    def _call(self, obligation, selection, factory, *, request=None):
+        request = obligation.request if request is None else request
+        plan = request.plan
         expected = obligation.programs[plan.contract.config_payload(selection.config)]
         expected = expected | frozenset(
-            program for name in obligation.request.dependencies
+            program for name in request.dependencies
             for program in self._dependency_programs[name]
         )
-        return self._instantiate(obligation.request, selection, factory, expected)
+        with self._timing.span("materialize_prime"):
+            return self._instantiate(request, selection, factory, expected)
 
     def _trial(self, obligation, index, assignment, config):
         request = obligation.request
@@ -921,9 +986,11 @@ class PreparationJob:
             if self.session._pool is not None:
                 self.session._pool.pending
         selection = self._selection(obligation, config, "tuned", assignment)
-        before = self.session._allocated()
+        with self._timing.span("memory_accounting"):
+            before = self.session._allocated()
         state, call, guard, retained = self._call(obligation, selection, request.benchmark_call)
-        resident = max(0, self.session._allocated() - before)
+        with self._timing.span("memory_accounting"):
+            resident = max(0, self.session._allocated() - before)
         self._candidates_prepared += 1
         yield "gpu"
         return _Trial(index, assignment, config, call, guard, retained, state, resident)
@@ -974,7 +1041,8 @@ class PreparationJob:
             if race is not None:
                 closers.append(race.close)
             closers.append(self.session._synchronize)
-            _close_all(closers)
+            with self._timing.span("race_cleanup"):
+                _close_all(closers)
 
     def _race(self, obligation):
         request = obligation.request
@@ -1031,6 +1099,11 @@ class PreparationJob:
             while pending or carried is not None:
                 if self.session._stop.is_set():
                     return None
+                self._phase = "preparing candidates"
+                self._batch_index += 1
+                self._batch_candidates = 0
+                self._completed_rounds = self._total_rounds = self._active_count = 0
+                self._latest_round_us = ()
                 batch, resident = [], 0 if champion is None else champion.resident
                 if carried is not None:
                     batch.append(carried)
@@ -1048,6 +1121,13 @@ class PreparationJob:
                         carried = batch.pop()
                         break
                 trials = ([] if champion is None else [champion]) + batch
+                self._batch_candidates = len(trials)
+                self._timing.record(
+                    "batch_begin", request=request.name, batch=self._batch_index,
+                    candidate_indices=[trial.index for trial in trials],
+                    carried_champion=None if champion is None else champion.index,
+                    local_candidates=len(local_candidates), remaining=len(pending),
+                )
                 measurement = yield from self._measure(trials, champion=champion is not None)
                 if measurement is None:
                     return None
@@ -1059,12 +1139,19 @@ class PreparationJob:
                 )
                 self._benchmarked += len(batch)
                 self._overlaps += measurement.overlapped_samples
-                for position, trial in enumerate(trials):
-                    if position != best:
-                        trial.close()
-                        live.remove(trial)
+                with self._timing.span("trial_release"):
+                    for position, trial in enumerate(trials):
+                        if position != best:
+                            trial.close()
+                            live.remove(trial)
                 champion = trials[best]
                 champion.latency_us = float(measurement.latencies_us[best])
+                self._timing.record(
+                    "batch_end", request=request.name, batch=self._batch_index,
+                    candidate_indices=[trial.index for trial in trials],
+                    latencies_us=list(measurement.latencies_us),
+                    winner=champion.index,
+                )
             obligation.coverage["measured_count"] = len(local_candidates)
             assignment, config = champion.assignment, champion.config
             candidate_index, latency_us = champion.index, champion.latency_us
@@ -1130,16 +1217,17 @@ class PreparationJob:
             return PreparationResult(plans={})
         if self.session.state == "FROZEN":
             requests, composites = self._expand()
+            self._total_requests = len(_coalesce_requests(requests))
             for request in requests:
                 plan = request.plan
                 self._plans_by_name[request.name] = plan
-                self._completed_requests += 1
                 if request.retain_benchmark_call:
                     if request.collective is not None:
                         yield request.collective
                     yield from self._retain_benchmark(request, plan.selection, plan.prepared.programs)
             for name, (request, children) in composites.items():
                 self._plans_by_name[name] = request.plan
+            self._completed_requests = self._total_requests
             result = PreparationResult(
                 plans=self._plans_by_name, benchmark_calls=self._benchmark_calls,
                 benchmark_closers=self._benchmark_closers,
@@ -1149,23 +1237,31 @@ class PreparationJob:
             _close_all(reversed(closers))
             return result
         requests, composites = self._expand()
-        self._total_requests = len(requests)
-        obligations = yield from self._configure(requests)
+        groups = _coalesce_requests(requests)
+        self._total_requests = len(groups)
+        obligations = yield from self._configure(groups)
         selections = {}
         for obligation in obligations:
             request = obligation.request
             plan = request.plan
             self._active_request = request
             self._phase = "selecting"
+            self._batch_index = self._batch_candidates = 0
+            self._candidate_sharded = False
+            self._timing.record(
+                "request_begin", request=request.name, component=plan.component_id,
+                candidates=len(obligation.candidates), ready=obligation.ready,
+                query=obligation.configuration.encoded_query.to_dict(),
+                bindings=len(obligation.requests),
+            )
             self._candidate_count = len(obligation.candidates)
             self._candidates_prepared = self._completed_rounds = self._active_count = 0
             self._total_rounds = 0
             self._latest_round_us = ()
             if obligation.ready:
                 selection = obligation.selection
-                selections[request.name] = (selection, plan.contract)
-                self._dependency_programs[request.name] = plan.prepared.programs
-                self._plans_by_name[request.name] = plan
+                programs = plan.prepared.programs
+                obligation.programs[plan.contract.config_payload(selection.config)] = programs
             else:
                 if obligation.selection is None:
                     self._lookup(obligation, selections)
@@ -1179,40 +1275,51 @@ class PreparationJob:
                     if obligation.selection is None:
                         obligation.selection = self._selection(obligation, obligation.configuration.default, "default")
                 selection = obligation.selection
-                selections[request.name] = (selection, plan.contract)
                 programs = yield from self._compile(obligation, selection.config, required=True)
                 yield from self._wait_programs(programs)
                 if obligation.cache_pending:
-                    self.session._selection_cache().save(
-                        obligation.key,
-                        assignment=selection.assignment,
-                        config=plan.contract.config_payload(selection.config),
-                        coverage=obligation.coverage,
-                        programs=programs,
-                    )
-                programs = programs | frozenset(
-                    program for name in request.dependencies for program in self._dependency_programs[name]
+                    with self._timing.span("cache_save"):
+                        self.session._selection_cache().save(
+                            obligation.key,
+                            assignment=selection.assignment,
+                            config=plan.contract.config_payload(selection.config),
+                            coverage=obligation.coverage,
+                            programs=programs,
+                        )
+            for item in obligation.requests:
+                self._active_request = item
+                item_plan = item.plan
+                selections[item.name] = (selection, item_plan.contract)
+                expected = programs | frozenset(
+                    program for name in item.dependencies for program in self._dependency_programs[name]
                 )
-                self._dependency_programs[request.name] = programs
-                if self._alias_shared(obligation):
-                    self._plans_by_name[request.name] = plan
-                else:
-                    if request.collective is not None:
-                        yield request.collective
-                    self._phase = "priming"
-                    state, call, guard, retained = self._call(obligation, selection, request.prepare_call)
-                    # The invocation and its transient outputs are priming
-                    # resources, not serving state. Restore borrowed inputs now;
-                    # the call's close runs when the plan is released.
-                    self._publish(request, selection, state, call, retained, programs)
-                    self._temporaries.remove(guard.finish)
-                    guard.restore()
-                    del call, guard
-                    yield "gpu"
-            self._coverage[request.name] = obligation.coverage
+                self._dependency_programs[item.name] = expected
+                prepared = item_plan.prepared
+                if prepared is None or prepared.selection != selection:
+                    alias = _Obligation(item, obligation.configuration)
+                    if not self._alias_shared(alias):
+                        if item.collective is not None:
+                            yield item.collective
+                        self._phase = "priming"
+                        state, call, guard, retained = self._call(
+                            obligation, selection, item.prepare_call, request=item,
+                        )
+                        self._publish(item, selection, state, call, retained, expected)
+                        self._temporaries.remove(guard.finish)
+                        guard.restore()
+                        del call, guard
+                        yield "gpu"
+                self._plans_by_name[item.name] = item_plan
+                self._coverage[item.name] = obligation.coverage
+                if item.retain_benchmark_call:
+                    if item.collective is not None:
+                        yield item.collective
+                    yield from self._retain_benchmark(item, selection, expected)
+            self._timing.record(
+                "request_end", request=request.name, source=selection.source,
+                coverage=obligation.coverage,
+            )
             self._completed_requests += 1
-            if request.retain_benchmark_call:
-                yield from self._retain_benchmark(request, selection, self._dependency_programs[request.name])
         for name, (request, children) in composites.items():
             plan = request.plan
             child_plans = {count: child.plan for count, child in children.items()}

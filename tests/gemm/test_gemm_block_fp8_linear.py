@@ -298,3 +298,57 @@ def test_block_fp8_linear_v41_rejects_lossy_weight_scale_repacking() -> None:
     scales = torch.full((2, 4), 0.3, device="cuda")
     with pytest.raises(ValueError, match="exact UE8M0"):
         bfl.pack_weight(weight, scales, block_size=(32, 32))
+
+
+@torch.no_grad()
+def test_shared_declarations_bind_distinct_weights_and_replay_after_alias_release():
+    require_b12x()
+    device = torch.device("cuda", torch.cuda.current_device())
+    source = torch.randn(8, 256, dtype=torch.bfloat16, device=device) / 4
+    weights = [_make_block_fp8_weight(384, 256, block_size=32) for _ in range(2)]
+    packed = [bfl.pack_weight(weight, scale, block_size=(32, 32)) for weight, scale in weights]
+    caps = bfl.Caps(device=device, max_tokens=8, in_features=256, out_features=384,
+                    output_dtype=torch.bfloat16, block_size=(32, 32))
+    plans = [bfl.plan(caps) for _ in range(2)]
+    primed = []
+
+    def prepare(state):
+        primed.append(state)
+        spec, = state.scratch.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        output = torch.empty((8, 384, 1), dtype=torch.bfloat16, device=device)
+        binding = state.bind(scratch=scratch, source=source, packed_weight=packed[0], output=output)
+        return PreparedCall(run=lambda: state.run_binding(binding), output=output)
+
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        progress = []
+        session.prepare(tuple(plan.request(name=f"layer.{index}", prepare_call=prepare)
+                              for index, plan in enumerate(plans)), progress=progress.append)
+        assert len(primed) == 1
+        assert progress[-1].total_requests == progress[-1].completed_requests == 1
+        assert plans[0].prepared is plans[1].prepared
+        storage = [_storage(plan, source, weight) for plan, weight in zip(plans, packed)]
+        for (binding, scratch, output), (weight, scale) in zip(storage, weights):
+            bfl.run(binding=binding)
+            _assert_v41_accumulation_matches_reference(source, weight, scale, output[:, :, 0])
+            assert torch.count_nonzero(output) > 0
+        assert not torch.equal(storage[0][2], storage[1][2])
+        session.release(plans[0])
+        session.freeze()
+        binding, scratch, output = storage[1]
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with session.capture(), torch.cuda.graph(graph):
+                bfl.run(binding=binding)
+            source.neg_()
+            scratch.fill_(255)
+            output.fill_(float("nan"))
+            pointer = output.data_ptr()
+            allocated = torch.cuda.memory_allocated(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert output.data_ptr() == pointer and torch.cuda.memory_allocated(device) == allocated
+            _assert_v41_accumulation_matches_reference(source, *weights[1], output[:, :, 0])
+            assert torch.count_nonzero(output) > 0
+        finally:
+            graph.reset()

@@ -173,6 +173,7 @@ class PreparationDisplay:
             progress.candidate_count, progress.candidates_prepared, progress.completed_rounds,
             progress.measured_candidates, progress.cache_hits, progress.compilations,
             progress.active_compilations, progress.tuning_stopped, progress.done,
+            progress.batch_index, progress.batch_candidates, progress.tuning_rank,
         )
         if signature == self._signature and now - self._frame_at < 0.25 and not progress.done:
             return
@@ -231,7 +232,9 @@ class PreparationDisplay:
             self._reset_race()
         self._request_candidates = max(self._request_candidates, progress.candidate_count)
         self._request_raced = self._request_raced or progress.phase in _RACE_PHASES
-        if progress.completed_rounds < self._race_rounds:
+        if (progress.batch_index != previous.batch_index
+                or progress.tuning_rank != previous.tuning_rank
+                or progress.completed_rounds < self._race_rounds):
             self._reset_race()
         if progress.completed_rounds > self._race_rounds:
             values = progress.latest_round_us
@@ -277,11 +280,12 @@ class PreparationDisplay:
         phase = "failed" if self._frame.failed else p.phase
         component = f" {p.component_id}" if p.component_id else ""
         candidates = f", candidates {p.candidates_prepared}/{p.candidate_count} prepared" if p.candidate_count else ""
-        rounds = f", round {p.completed_rounds}/{p.total_rounds}" if p.completed_rounds else ""
+        batch = f", rank {p.tuning_rank} batch {p.batch_index}" if p.batch_index else ""
+        rounds = f", round {p.completed_rounds}/{p.total_rounds}" if p.total_rounds else ""
         stopped = ", tuning stopped; completing required preparation" if p.tuning_stopped and not p.done else ""
         line = (
             f"b12x {phase}{component}: {p.completed_requests}/{p.total_requests} ready"
-            f"{candidates}{rounds}, {p.measured_candidates} measured, {p.cache_hits} cached, "
+            f"{candidates}{batch}{rounds}, {p.measured_candidates} measured, {p.cache_hits} cached, "
             f"{p.compilations} compilations, {_duration(self._elapsed())}{stopped}"
         )
         self._stream.write(_plain(line) + "\n")
@@ -373,15 +377,18 @@ class PreparationDisplay:
             return text
         detail = ""
         if p.phase == "autotuning":
-            detail = f"round {p.completed_rounds} / {p.total_rounds}  ·  {p.candidate_count} candidates"
-            if p.active_count and p.active_count < p.candidate_count:
+            count = p.batch_candidates or p.candidate_count
+            detail = f"round {p.completed_rounds} / {p.total_rounds}  ·  {count} candidates"
+            if p.active_count and p.active_count < count:
                 detail += f"  ·  {p.active_count} timed"
         elif p.phase == "preparing candidates":
             detail = f"{p.candidates_prepared} / {p.candidate_count} prepared"
         elif p.phase == "calibrating":
-            detail = f"{p.candidate_count} candidates"
+            detail = f"{p.batch_candidates or p.candidate_count} candidates"
         elif p.phase == "compiling":
             detail = f"{p.active_compilations} active  ·  {p.compilations} built"
+        if p.batch_index and p.phase in _RACE_PHASES:
+            detail = f"rank {p.tuning_rank} batch {p.batch_index}  ·  {detail}"
         return self._field("STATUS", _PHASE_LABEL.get(p.phase, p.phase), detail)
 
     def _detail_row(self, frame):

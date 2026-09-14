@@ -176,3 +176,17 @@ def test_bar_and_number_helpers():
     assert _bar(1.0, 7).plain == "█" * 7
     assert _bar(0.0, 4).plain == "━━━━"
     assert _us(41.26) == "41.3 µs" and _us(512.0) == "512 µs" and _us(2500.0) == "2.50 ms"
+
+
+def test_batch_change_resets_measurements_when_intermediate_rounds_are_not_reported():
+    display, console = _attach(160, 40)
+    common = dict(
+        phase="autotuning", component_id="norm.mhc", request_name="mhc.post_pre.m24",
+        candidate_count=272, batch_candidates=33, completed_rounds=2, total_rounds=3,
+        tuning_rank=2,
+    )
+    display.update(_progress(batch_index=2, latest_round_us=(10.0, 20.0), **common))
+    display.update(_progress(batch_index=3, latest_round_us=(40.0, 30.0), **common))
+    assert display._frame.lanes[0].history == (30.0,)
+    assert display._frame.lanes[1].history == (40.0,)
+    assert "rank 2 batch 3" in _render_text(display, console)

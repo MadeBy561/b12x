@@ -298,6 +298,9 @@ class PreparationProgress:
     tuning_stopped: bool = False
     ready_tuning: tuple[TuningRequirement, ...] = ()
     candidate_sharded: bool = False
+    batch_index: int = 0
+    batch_candidates: int = 0
+    tuning_rank: int = 0
 
 
 @dataclass(kw_only=True)

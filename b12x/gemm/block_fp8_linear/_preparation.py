@@ -355,7 +355,7 @@ def plan(caps: BlockFP8LinearScratchCaps, *, invocation=FrozenMapping(), overrid
 
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override,
                 _compile_jobs=compile_jobs, _memory_requirements=memory,
-                _materialize=materialize, _device=caps.device)
+                _materialize=materialize, _device=caps.device, shared=True)
 
 
 __all__ = ["plan", "compile_block_fp8"]

@@ -1625,6 +1625,7 @@ def _compile_environment_key() -> tuple[tuple[str, str], ...]:
         "B12X_LOG_CUTE_COMPILE_STACK",
         "B12X_LOG_CUTE_COMPILE_STACK_DEPTH",
         "B12X_PRINT_COMPILE_PROGRESS",
+        "B12X_PREPARATION_TRACE_DIR",
         "B12X_TIMING",
         "B12X_TIMING_THRESHOLD_MS",
         "CUTE_DSL_CACHE_DIR",
