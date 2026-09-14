@@ -300,8 +300,6 @@ class PreparationDisplay:
         width, height = self._console.width, self._console.height
         if width < 76 or height < 10:
             return self._render_line(frame, width)
-        stage = "FAILED" if frame.failed else frame.stage
-        color = _STAGE_STYLE[stage]
         inner = width - 6
         rows = [
             self._rail_row(frame),
@@ -320,8 +318,7 @@ class PreparationDisplay:
         return Panel(
             grid, box=box.SQUARE, border_style=_TRACK, padding=(0, 2), expand=True,
             title=Text(" b12x / kernel autotuning ", style=f"bold {_INK}"),
-            title_align="left", subtitle=Text(f" {stage} ", style=f"bold {color}"),
-            subtitle_align="right",
+            title_align="left",
         )
 
     def _two(self, left, right):
