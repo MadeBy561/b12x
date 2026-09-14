@@ -9,7 +9,7 @@ import torch
 from b12x.preparation import (
     CollectiveRequirement, DetectedDevice, MemoryRequirements,
     PersistentMemory, Plan, PreparationSession, PreparedCall, current_plan,
-    plan_from_handle, require_prepared,
+    current_prepared_state, plan_from_handle, require_prepared,
 )
 from b12x.preparation._cache import SelectionCache
 from b12x.preparation.types import _CompositePlan
@@ -403,6 +403,141 @@ def test_candidate_memory_envelope_covers_every_legal_config(tmp_path):
 
     assert envelope.scratch[0].shape == (1024,)
     assert plan.scratch_specs()[0].shape == (1,)
+
+
+def test_prepared_scratch_reuses_selection_and_preserves_live_residency(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    monkeypatch.setattr("b12x.preparation.device.detect_device", lambda device=None: DetectedDevice(None, None))
+    sized = []
+
+    def memory(config, device):
+        state = current_prepared_state()
+        sized.append((current_plan(), state))
+        return MemoryRequirements(
+            scratch=(ScratchBufferSpec(
+                name="workspace", shape=(config.width,),
+                dtype=torch.uint8, device=torch.device("cpu"),
+            ),),
+            persistent=(PersistentMemory(
+                current_plan(), 16, 0 if state is None else state.resident,
+            ),),
+        )
+
+    plan = Plan(
+        contract=contract(), query=Query(3),
+        _compile_jobs=lambda config, device: (), _memory_requirements=memory,
+        _materialize=lambda selection, device: SimpleNamespace(
+            value=selection.config.width * 3, resident=8,
+        ),
+    )
+    req = plan.request(
+        name="workspace",
+        prepare_call=lambda state: PreparedCall(run=lambda: state.value),
+        benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+    )
+    assert plan.scratch_specs()[0].shape == (7,)
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        default_specs = plan.scratch_specs()
+        assert default_specs[0].shape == (7,)
+        engine.prepare((req,))
+        selected_specs = plan.scratch_specs()
+        assert selected_specs[0].shape == (2,)
+        assert selected_specs is not default_specs
+        assert sized[-1] == (plan, plan.prepared.state)
+        assert plan.memory_requirements().pending_persistent_nbytes == 8
+        plan.prepared.state.resident = 16
+        assert plan.memory_requirements().pending_persistent_nbytes == 0
+        count = len(sized)
+        engine.freeze()
+        with engine.capture():
+            for _ in range(10):
+                assert plan.scratch_specs() is selected_specs
+        assert len(sized) == count
+    assert plan.scratch_specs()[0].shape == (7,)
+    assert plan.memory_requirements().pending_persistent_nbytes == 16
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        assert plan.scratch_specs()[0].shape == (7,)
+        assert plan.scratch_specs() is not selected_specs
+
+
+def test_composite_scratch_retains_all_exact_variants_without_replanning(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    monkeypatch.setattr("b12x.preparation.device.detect_device", lambda device=None: DetectedDevice(None, None))
+    sized = []
+    counts = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 4096)
+
+    def child(rows):
+        def memory(config, device):
+            sized.append(rows)
+            return MemoryRequirements(scratch=(ScratchBufferSpec(
+                name="workspace", shape=(rows * config.width,),
+                dtype=torch.uint8, device=torch.device("cpu"),
+            ),))
+
+        return Plan(
+            contract=contract(), query=Query(rows),
+            _compile_jobs=lambda config, device: (), _memory_requirements=memory,
+            _materialize=lambda selection, device: SimpleNamespace(value=selection.config.width * 3),
+        )
+
+    children = {rows: child(rows) for rows in counts}
+    plan = _CompositePlan(
+        component_id="test.arithmetic", capacity_metadata={}, variants=children,
+        _assemble=lambda states, device: dict(states),
+    )
+    req = plan.request(
+        name="workspace",
+        prepare_calls={rows: lambda state: PreparedCall(run=lambda: state.value) for rows in counts},
+        benchmark_calls={rows: lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None) for rows in counts},
+    )
+    assert plan.scratch_specs()[0].shape == (4096 * 7,)
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        assert plan.scratch_specs()[0].shape == (4096 * 7,)
+        engine.prepare((req,))
+        specs = plan.scratch_specs()
+        assert specs[0].shape == (4096 * 2,)
+        assert tuple(plan.prepared.state) == counts
+        assert all(state.value == 6 for state in plan.prepared.state.values())
+        count = len(sized)
+        engine.freeze()
+        with engine.capture():
+            for _ in range(80):
+                assert plan.scratch_specs() is specs
+        assert len(sized) == count
+    assert plan.scratch_specs()[0].shape == (4096 * 7,)
+
+
+def test_failed_prepared_scratch_snapshot_preserves_previous_payload(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    closed = []
+
+    def memory(config, device):
+        state = current_prepared_state()
+        if state is not None and state.value == 6:
+            raise ValueError("selected workspace is invalid")
+        return MemoryRequirements()
+
+    plan = replace(declaration(tuning=contract()), _memory_requirements=memory)
+    req = plan.request(
+        name="workspace",
+        prepare_call=lambda state: PreparedCall(
+            run=lambda: state.value, close=lambda: closed.append(state.value),
+        ),
+        benchmark_call=lambda state: PreparedCall(run=lambda: state.value, produce=lambda: None),
+    )
+    with session(tmp_path) as engine:
+        engine.prepare((req,), autotune=False)
+        previous = plan.prepared
+        with pytest.raises(ValueError, match="selected workspace is invalid"):
+            engine.prepare((req,))
+        assert plan.prepared is previous
+        assert require_prepared(plan, "test.arithmetic").value == 21
+        assert plan.scratch_specs() == ()
+        assert closed == [6]
+    assert closed == [6, 21]
 
 
 def test_stop_mid_race_discards_partial_winner_and_restores_trials(tmp_path, monkeypatch):
