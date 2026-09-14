@@ -13,113 +13,93 @@ from b12x._lib.runtime_control import (
 from ..conftest import require_b12x
 
 
-@pytest.mark.parametrize("fail_read", [False, True])
-def test_disk_prefetch_host_lifetime_drains_before_reuse(monkeypatch, fail_read):
-    """CPU state test: even a failed read must release its retained transaction."""
-    from concurrent.futures import ThreadPoolExecutor
-    from contextlib import contextmanager, nullcontext
-    from threading import Event
-    from b12x.sequence._shared.disk_table import DiskPrefetch
-
-    started, finish = Event(), Event()
-    stream = object()
-    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_: stream)
+@pytest.mark.parametrize("resident_scales", [False, True])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_disk_legacy_prefetch_uses_synchronous_lookup(
+    resident_scales, prefetch, monkeypatch,
+):
+    """CPU lifecycle check for callers using the old two-phase prepare API."""
+    import sys
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from b12x.sequence._shared import disk_table
+    from b12x.sequence.engram import api
 
     class Cache:
-        device = "cuda:0"
-        _transaction_stream = stream
-        active = False
+        def __init__(self, **kwargs):
+            self.weight = torch.zeros((72, 256), dtype=torch.uint8)
+            self.scale = torch.zeros((72, 8), dtype=torch.uint8)
+            self.active = False
+            self.rows = None
+            self.fail_read = False
 
         @contextmanager
         def transaction(self):
             assert not self.active
             self.active = True
             try:
-                yield self
-            finally:
-                self.active = False
-
-        def _stage_ids(self, ids, count):
-            assert self.active
-
-        def _read_staged(self, count):
-            assert self.active
-            started.set()
-            assert finish.wait(timeout=5)
-            if fail_read:
-                raise OSError("injected I/O error")
-
-    cache, ids = Cache(), object()
-    prefetch = DiskPrefetch(cache)
-    try:
-        prefetch.begin(ids, 6)
-        assert started.wait(timeout=5)
-        assert cache.active and prefetch.pending
-        with pytest.raises(RuntimeError, match="unconsumed"):
-            prefetch.begin(ids, 6)
-        with (
-            pytest.raises(ValueError, match="do not match"),
-            prefetch.consume(ids, 5),
-        ):
-            pytest.fail("wrong count was accepted")
-        with (
-            ThreadPoolExecutor(max_workers=1) as pool,
-            pytest.raises(RuntimeError, match="preparing thread"),
-        ):
-            pool.submit(prefetch.abort).result(timeout=5)
-        finish.set()
-        if fail_read:
-            with pytest.raises(OSError, match="injected"):
-                prefetch.abort()
-        else:
-            with prefetch.consume(ids, 6):
-                assert cache.active
-        assert not cache.active and not prefetch.pending
-        fail_read = False
-        prefetch.begin(ids, 6)
-        with prefetch.consume(ids, 6):
-            assert cache.active
-        assert not cache.active
-    finally:
-        finish.set()
-        prefetch.close()
-
-
-def test_disk_prefetch_submission_failure_releases_transaction(monkeypatch):
-    from contextlib import contextmanager
-    from b12x.sequence._shared.disk_table import DiskPrefetch
-
-    class Cache:
-        active = False
-
-        @contextmanager
-        def transaction(self):
-            self.active = True
-            try:
                 yield
             finally:
                 self.active = False
 
-        def _stage_ids(self, *args):
+        def read_rows(self, ids, count):
             assert self.active
+            if self.fail_read:
+                raise OSError("injected read failure")
+            self.rows = ids.view(-1)[:count].clone()
 
-        def _read_staged(self, *args):
-            pytest.fail("failed submission must not execute the reader")
+    def mapped_scales(shape, dtype, device):
+        host = torch.zeros(shape, dtype=dtype)
+        return SimpleNamespace(host_view=host, device_view=host)
 
-    def fail_submit(*args):
-        raise RuntimeError("injected submit error")
+    monkeypatch.setattr(disk_table, "DiskRowCache", Cache)
+    monkeypatch.setattr(disk_table, "MappedHostAllocation", mapped_scales)
+    monkeypatch.setattr(api, "_require_disk_eager", lambda _: None)
+    plan = object.__new__(engram.Plan)
+    for name, value in dict(
+        caps=SimpleNamespace(device=torch.device("cuda:0"), max_tokens=3),
+        table_rows=6, shard_start=0, shard_end=6, shard_rows=6,
+    ).items():
+        object.__setattr__(plan, name, value)
+    table = engram.DiskTable(plan, resident_scales=resident_scales, prefetch=prefetch)
+    cache = table._cache
+    ids = torch.arange(72).reshape(3, 24)
+    out = torch.full((3,), -1, dtype=torch.int64)
+    binding = engram.LookupBinding(
+        plan=plan, disk_table=table, weight=table.weight,
+        scale_bytes=table.scale_bytes, hash_ids=ids,
+        num_tokens=torch.tensor([2], dtype=torch.int32), out=out,
+    )
 
-    cache = Cache()
-    prefetch = DiskPrefetch(cache)
-    try:
-        monkeypatch.setattr(prefetch._executor, "submit", fail_submit)
-        with pytest.raises(RuntimeError, match="injected"):
-            prefetch.begin(object(), 6)
-        assert not cache.active and not prefetch.pending
-    finally:
-        prefetch.close()
+    def lookup(weight, scales, hash_ids, num_tokens, result, *args, **kwargs):
+        assert cache.active
+        assert kwargs["resident_scales"] == resident_scales
+        assert kwargs["clear_tail"] is False
+        count = kwargs["prepared_tokens"]
+        result[:count].copy_(cache.rows.view(count, 24)[:, 0])
+
+    monkeypatch.setitem(
+        sys.modules, "b12x.sequence.engram._kernels",
+        SimpleNamespace(lookup_op=lookup),
+    )
+    table.prefetch(binding, token_count=2)
+    assert cache.rows is None and not table.prefetch_pending
+    engram.run_lookup(binding, token_count=2, clear_tail=False)
+    torch.testing.assert_close(out, torch.tensor([0, 24, -1]))
+    assert not cache.active and not table.prefetch_pending
+
+    cache.fail_read = True
+    table.prefetch(binding, token_count=2)
+    with pytest.raises(OSError, match="injected"):
+        engram.run_lookup(binding, token_count=2, clear_tail=False)
+    assert not cache.active and not table.prefetch_pending
+    table.abort_prefetch()
+    table.close()
+    cache.fail_read = False
+    ids.add_(1)
+    engram.run_lookup(binding, token_count=2, clear_tail=False)
+    torch.testing.assert_close(out, torch.tensor([1, 25, -1]))
+    assert not cache.active
 
 
 def _plan(device, *, layer=1, tokens=7, rank=0, tp=2, base=101):
@@ -419,7 +399,7 @@ def test_e8m0_extreme_bytes_and_missing_nan_row():
 
 def _disk_lookup_pair(
     plan, tmp_path, *, shard_rows=None, extreme_scales=False,
-    resident_scales=False, prefetch=False,
+    resident_scales=False,
 ):
     rows = torch.arange(plan.table_rows)
     weight = ((rows[:, None] % 7 + 1) * torch.tensor([1, -1]).repeat(128)[None, :]).to(
@@ -437,7 +417,7 @@ def _disk_lookup_pair(
     )
     table = engram.DiskTable(
         plan, shard_rows=shard_rows, queue_depth=4,
-        resident_scales=resident_scales, prefetch=prefetch,
+        resident_scales=resident_scales,
     )
     source_rows = plan.table_rows if shard_rows is None else shard_rows
     for scale, payload, offset in ((False, weight, 4093), (True, scales, 19)):
@@ -541,43 +521,28 @@ def test_disk_separate_planes_duplicates_tp_edges_and_raw_e8m0(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("resident_scales", [False, True])
-def test_disk_prefetch_matches_sync_and_recovers_after_read_failure(
+def test_disk_lookup_recovers_after_read_failure(
     resident_scales, tmp_path, monkeypatch,
 ):
     device = require_b12x()
     p = _plan(device, tokens=3, tp=4, base=2)
     resident, disk = _disk_lookup_pair(
-        p, tmp_path, resident_scales=resident_scales, prefetch=True,
+        p, tmp_path, resident_scales=resident_scales,
     )
-    table = disk.disk_table
     disk.hash_ids.fill_(p.shard_start)
     expected = engram.run_lookup(resident).clone()
-    try:
-        table.prefetch(disk, token_count=3)
-        with pytest.raises(RuntimeError, match="unconsumed"):
-            table.prefetch(disk, token_count=3)
-        with pytest.raises(ValueError, match="count do not match"):
-            engram.run_lookup(disk, token_count=2)
-        torch.testing.assert_close(engram.run_lookup(disk), expected, rtol=0, atol=0)
-        table.prefetch(disk, token_count=3)
-        table.abort_prefetch()
-        disk.hash_ids.fill_(p.shard_start + 5)
-        expected = engram.run_lookup(resident).clone()
-        table.prefetch(disk, token_count=3)
-        torch.testing.assert_close(engram.run_lookup(disk), expected, rtol=0, atol=0)
+    torch.testing.assert_close(engram.run_lookup(disk), expected, rtol=0, atol=0)
 
-        def fail_read(*args):
-            raise OSError("injected read failure")
+    def fail_read(*args):
+        raise OSError("injected read failure")
 
-        with monkeypatch.context() as patch:
-            patch.setattr(table._cache, "_read_staged", fail_read)
-            table.prefetch(disk, token_count=3)
-            with pytest.raises(OSError, match="injected"):
-                engram.run_lookup(disk)
-        table.prefetch(disk, token_count=3)
-        torch.testing.assert_close(engram.run_lookup(disk), expected, rtol=0, atol=0)
-    finally:
-        table.close()
+    with monkeypatch.context() as patch:
+        patch.setattr(disk.disk_table._cache, "_read_staged", fail_read)
+        with pytest.raises(OSError, match="injected"):
+            engram.run_lookup(disk)
+    disk.hash_ids.fill_(p.shard_start + 5)
+    expected = engram.run_lookup(resident).clone()
+    torch.testing.assert_close(engram.run_lookup(disk), expected, rtol=0, atol=0)
 
 
 @torch.inference_mode()
