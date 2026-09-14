@@ -5,7 +5,7 @@ import time
 import pytest
 
 from b12x.preparation.types import PreparationProgress
-from b12x.preparation._progress import PreparationDisplay, _gradient_bar, _spark, _us
+from b12x.preparation._progress import PreparationDisplay, _bar, _us
 
 rich = pytest.importorskip("rich")
 from rich.console import Console  # noqa: E402
@@ -172,10 +172,7 @@ def test_display_guards():
 
 
 def test_bar_and_number_helpers():
-    assert _gradient_bar(0.5, 10, ("#000000", "#ffffff")).cell_len == 10
-    assert _gradient_bar(1.0, 7, ("#000000", "#ffffff")).plain == "█" * 7
-    assert _gradient_bar(0.0, 4, ("#000000", "#ffffff")).plain == "····"
+    assert _bar(0.5, 10).cell_len == 10
+    assert _bar(1.0, 7).plain == "█" * 7
+    assert _bar(0.0, 4).plain == "━━━━"
     assert _us(41.26) == "41.3 µs" and _us(512.0) == "512 µs" and _us(2500.0) == "2.50 ms"
-    assert _spark((1.0, 2.0, 3.0, 4.0), width=4) == "▁▃▅█"
-    assert _spark((2.0, 2.0), width=8) == "▄▄"
-    assert _spark((), width=8) == ""
