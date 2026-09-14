@@ -301,6 +301,9 @@ class PreparationProgress:
     batch_index: int = 0
     batch_candidates: int = 0
     tuning_rank: int = 0
+    total_candidates: int | None = None
+    global_candidate_count: int = 0
+    selection_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(kw_only=True)
