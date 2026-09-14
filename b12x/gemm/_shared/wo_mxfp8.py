@@ -4,6 +4,7 @@ import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from threading import RLock
 
 import torch
 import triton
@@ -22,11 +23,9 @@ from b12x._lib.scratch import (
     scratch_tensor,
 )
 from b12x._lib.utils import cuda_stream_to_int, get_num_sm
-from b12x.gemm.wo_projection._policy import (
-    WO_PROJECTION_POLICY,
-    WoProjectionQuery,
-)
-from b12x.policy import PolicyContext, get_auto_policy
+from b12x.gemm.wo_projection._tuning import WoProjectionConfig
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import register_program_cache
 
 from ..._lib.scratch_layout import (
     layout_wo_projection as _layout_wo_projection,
@@ -55,6 +54,10 @@ if _WO_QUANT_CHUNKS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32):
         f"{_WO_QUANT_CHUNKS_PER_PROGRAM}"
     )
 _ALPHA_ONE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
+
+_WO_QUANTIZER_CACHE: dict[tuple[object, ...], "_WOQuantizers"] = {}
+_WO_QUANTIZER_CACHE_LOCK = RLock()
+register_program_cache(_WO_QUANTIZER_CACHE, lock=_WO_QUANTIZER_CACHE_LOCK)
 
 
 def _should_use_exact_b16_wo(*, tokens: int, sm_count: int) -> bool:
@@ -99,8 +102,6 @@ class WOProjectionMXFP8Weights:
     rank: int
     hidden: int
     sfb_k_replicated: bool = False
-    decode_tile_n: int = 0
-    decode_policy_resolution: object | None = None
 
 
 @dataclass(frozen=True)
@@ -123,10 +124,14 @@ class WOProjectionBinding:
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection (N=hidden,
     # the n>1536 path). None keeps the M-independent default tile.
     expected_m: int | None = None
-    decode_tile_n: int = 0
+    # Set only by the private prepared-state binder.  This remains untyped here
+    # to keep this shared storage/packing module independent of preparation.
+    plan: object | None = None
 
     def run(self, *, stream: object = None) -> torch.Tensor:
-        return wo_projection_mxfp8(binding=self, stream=stream)
+        from b12x.preparation.types import require_prepared
+        state = require_prepared(self.plan, "gemm.wo_projection", self.source_tgd.device)
+        return state.run(self, stream=stream)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -145,10 +150,12 @@ class WOProjectionInvRopeBinding:
     return_3d: bool = False
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection.
     expected_m: int | None = None
-    decode_tile_n: int = 0
+    plan: object | None = None
 
     def run(self, *, stream: object = None) -> torch.Tensor:
-        return wo_projection_inv_rope_mxfp8(binding=self, stream=stream)
+        from b12x.preparation.types import require_prepared
+        state = require_prepared(self.plan, "gemm.wo_projection", self.o.device)
+        return state.run_inv_rope(self, stream=stream)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -181,11 +188,11 @@ class WOProjectionScratchCaps:
 
 
 @dataclass(frozen=True)
-class WOProjectionScratchPlan:
+class _WOProjectionState:
     caps: WOProjectionScratchCaps
     layout: object
     _scratch_specs: tuple[ScratchBufferSpec, ...]
-    policy_resolution: object | None = None
+    config: WoProjectionConfig
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -214,7 +221,6 @@ class WOProjectionScratchPlan:
             weights=weights,
             return_3d=return_3d,
             expected_m=expected_m,
-            decode_tile_n=self.policy_resolution.config.decode_tile_n,
         )
 
     def bind_inv_rope(
@@ -254,7 +260,6 @@ class WOProjectionScratchPlan:
             rope_dim=rope_dim,
             return_3d=return_3d,
             expected_m=expected_m,
-            decode_tile_n=self.policy_resolution.config.decode_tile_n,
         )
 
     def _views_from_scratch(
@@ -442,13 +447,15 @@ def _check_mxfp8_k(k: int) -> None:
         )
 
 
-def _wo_quant_chunks_per_program(k: int) -> int:
+def _wo_quant_chunks_per_program(k: int, *, maximum: int = _WO_QUANT_CHUNKS_PER_PROGRAM) -> int:
+    if maximum not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("WO quantization chunk limit must be a supported power of two")
     chunks = k // MXFP8_SCALE_VEC_SIZE
     # tl.arange requires a power-of-two extent. K is only required to be a
     # multiple of 128, so first round down before finding a divisor (for
     # example, K=384 has 12 scale chunks and must use four per program).
     chunks_per_program = min(
-        _WO_QUANT_CHUNKS_PER_PROGRAM,
+        maximum,
         1 << (chunks.bit_length() - 1),
     )
     while chunks % chunks_per_program:
@@ -732,6 +739,146 @@ def _quantize_group_major_trg_to_tk_kernel(
         + scale_mma_s5 * 0,
         scale_u8,
     )
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    try:
+        dtype = getattr(torch, name.removeprefix("torch."))
+    except AttributeError as error:
+        raise ValueError(f"unsupported WO quantizer dtype {name!r}") from error
+    if dtype not in (torch.bfloat16, torch.float16, torch.int32, torch.int64, torch.float32):
+        raise ValueError(f"unsupported WO quantizer dtype {name!r}")
+    return dtype
+
+
+@dataclass
+class _WOQuantizers:
+    """Retained Triton launchers for one exact prepared WO invocation."""
+
+    query_key: tuple[object, ...]
+    grouped: object | None
+    inv_rope: object | None
+    group_major: object
+    a_chunks: int
+    b_chunks: int
+    fast_b16_scale: bool
+
+    def quantize_a(self, source_tgd: torch.Tensor, out: MXFP8Rows) -> None:
+        chunks = self.a_chunks
+        self.grouped[
+            (int(source_tgd.shape[0]), int(source_tgd.shape[1]), int(source_tgd.shape[2]) // 32 // chunks)
+        ](
+            source_tgd, out.values, out.scale_rows.view(torch.uint8), out.scale_mma.view(torch.uint8),
+            int(source_tgd.shape[0]), int(source_tgd.shape[1]), int(source_tgd.shape[2]),
+            source_tgd.stride(0), source_tgd.stride(1), source_tgd.stride(2),
+            out.values.stride(0), out.values.stride(1),
+            out.values.stride(2) if out.values.ndim == 3 else 0,
+            out.scale_mma.stride(0), out.scale_mma.stride(1), out.scale_mma.stride(2),
+            out.scale_mma.stride(3), out.scale_mma.stride(4), out.scale_mma.stride(5),
+            chunks,
+        )
+
+    def quantize_a_inv_rope(
+        self, o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor,
+        out: MXFP8Rows, *, groups: int, heads_per_group: int, nope_dim: int, rope_dim: int,
+    ) -> None:
+        group_width = int(out.values.shape[1])
+        chunks = self.a_chunks
+        tokens = int(o.shape[0])
+        self.inv_rope[(tokens, groups, group_width // 32 // chunks)](
+            o, positions, cos_sin_cache, out.values, out.scale_rows.view(torch.uint8),
+            out.scale_mma.view(torch.uint8), out.values, tokens, groups, heads_per_group, group_width,
+            o.stride(0), o.stride(1), o.stride(2), cos_sin_cache.stride(0),
+            out.values.stride(0), out.values.stride(1),
+            out.values.stride(2) if out.values.ndim == 3 else 0,
+            out.scale_mma.stride(0), out.scale_mma.stride(1), out.scale_mma.stride(2),
+            out.scale_mma.stride(3), out.scale_mma.stride(4), out.scale_mma.stride(5),
+            0, 0, nope_dim + rope_dim, nope_dim, rope_dim // 2,
+            chunks, self.fast_b16_scale, False, 0, 1,
+        )
+
+    def quantize_b(self, source_trg: torch.Tensor, out: MXFP8Rows) -> None:
+        tokens, rank, groups = map(int, source_trg.shape)
+        width = rank * groups
+        chunks = self.b_chunks
+        self.group_major[(tokens, width // 32 // chunks, 1)](
+            source_trg, out.values, out.scale_rows.view(torch.uint8), out.scale_mma.view(torch.uint8),
+            tokens, rank, groups, source_trg.stride(0), source_trg.stride(1), source_trg.stride(2),
+            out.scale_mma.stride(0), out.scale_mma.stride(1), out.scale_mma.stride(2),
+            out.scale_mma.stride(3), out.scale_mma.stride(4), out.scale_mma.stride(5),
+            chunks,
+        )
+
+
+def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
+    """Compile the exact standalone Triton quantizers from declaration metadata."""
+
+    query = dict(query_payload)
+    operation = str(query["operation"])
+    key = (
+        operation, str(query["dtype"]), int(query["max_tokens"]), int(query["groups"]),
+        int(query["group_width"]), int(query["rank"]), int(query["hidden"]),
+        int(query["heads_per_group"] or 0), int(query["nope_dim"] or 0),
+        int(query["rope_dim"] or 0), str(query["positions_dtype"]), str(query["cos_sin_dtype"]),
+        int(dict(query["codegen"])["quant_chunks_per_program"]),
+        int(ordinal),
+    )
+    with _WO_QUANTIZER_CACHE_LOCK:
+        cached = _WO_QUANTIZER_CACHE.get(key)
+        if cached is not None:
+            return cached
+    source_dtype = _dtype_from_name(str(query["dtype"]))
+    tokens, groups, group_width = (int(query[name]) for name in ("max_tokens", "groups", "group_width"))
+    maximum = int(dict(query["codegen"])["quant_chunks_per_program"])
+    chunks = _wo_quant_chunks_per_program(group_width, maximum=maximum)
+    fast_b16_scale = (
+        tokens == 16 and groups == 4 and query["heads_per_group"] == 8
+        and group_width == 4096 and query["nope_dim"] == 448
+        and query["rope_dim"] == 64 and chunks == 16
+    )
+    scale_shape = _wo_mxfp8_scale_physical_shape(m=tokens, k=group_width, num_groups=groups)
+    scale_strides = torch.empty(
+        scale_shape, device="meta", dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu).permute(3, 4, 1, 5, 2, 0).stride()
+    with torch.cuda.device(ordinal):
+        grouped = _quantize_grouped_tgd_to_tdg_kernel.warmup(
+            source_dtype, torch.float8_e4m3fn, torch.uint8, torch.uint8, tokens, groups, group_width,
+            groups * group_width, group_width, 1, group_width, 1,
+            0 if groups == 1 else tokens * group_width,
+            *scale_strides, CHUNKS_PER_PROGRAM=chunks, num_warps=4,
+            grid=(tokens, groups, group_width // 32 // chunks),
+        )
+        group_major_width = int(query["rank"]) * groups
+        b_chunks = _wo_quant_chunks_per_program(group_major_width, maximum=maximum)
+        group_major_scale = _wo_mxfp8_scale_physical_shape(m=tokens, k=group_major_width, num_groups=1)
+        group_major_strides = torch.empty(group_major_scale, device="meta", dtype=torch.uint8).view(
+            torch.float8_e8m0fnu
+        ).permute(3, 4, 1, 5, 2, 0).stride()
+        group_major = _quantize_group_major_trg_to_tk_kernel.warmup(
+            torch.bfloat16, torch.float8_e4m3fn, torch.uint8, torch.uint8, tokens,
+            int(query["rank"]), groups, int(query["rank"]), 1,
+            1 if groups == 1 else tokens * int(query["rank"]),
+            *group_major_strides, CHUNKS_PER_PROGRAM=b_chunks,
+            num_warps=4, grid=(tokens, group_major_width // 32 // b_chunks, 1),
+        )
+        inv_rope = None
+        if operation == "inv_rope":
+            inv_rope = _quantize_attention_inv_rope_to_tdg_kernel.warmup(
+                source_dtype, _dtype_from_name(str(query["positions_dtype"])),
+                _dtype_from_name(str(query["cos_sin_dtype"])), torch.float8_e4m3fn, torch.uint8,
+                torch.uint8, torch.float8_e4m3fn, tokens, groups, int(query["heads_per_group"]), group_width,
+                groups * int(query["heads_per_group"]) * (int(query["nope_dim"]) + int(query["rope_dim"])),
+                int(query["nope_dim"]) + int(query["rope_dim"]), 1, int(query["rope_dim"]),
+                group_width, 1, 0 if groups == 1 else tokens * group_width,
+                *scale_strides, 0, 0,
+                HEAD_DIM=int(query["nope_dim"]) + int(query["rope_dim"]), NOPE_DIM=int(query["nope_dim"]),
+                HALF_ROPE_DIM=int(query["rope_dim"]) // 2, CHUNKS_PER_PROGRAM=chunks,
+                FAST_B16_SCALE=fast_b16_scale, CLEAR_OUTPUT=False, CLEAR_HIDDEN=0, CLEAR_BLOCK_SIZE=1,
+                num_warps=2 if tokens == 16 else 4, grid=(tokens, groups, group_width // 32 // chunks),
+            )
+    launchers = _WOQuantizers(key, grouped, inv_rope, group_major, chunks, b_chunks, fast_b16_scale)
+    attach_programs(launchers, grouped, group_major, inv_rope)
+    with _WO_QUANTIZER_CACHE_LOCK:
+        return _WO_QUANTIZER_CACHE.setdefault(key, launchers)
 
 
 def empty_dense_gemm_mnl_view(
@@ -1229,11 +1376,9 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
     rank: int,
     hidden: int,
     block_size: tuple[int, int] = (128, 128),
-    policy: PolicyContext | None = None,
 ) -> WOProjectionMXFP8Weights:
-    """Pack local DSV4/DSV4.1 FP8 WO-A/WO-B checkpoint weights."""
+    """Pack WO-A/WO-B weights with 128x128 or native 32x32 block scales."""
 
-    block_size = tuple(block_size)
     wo_a = pack_fp8_block_scaled_weight_mxfp8(
         wo_a_weight,
         wo_a_scale,
@@ -1250,23 +1395,6 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         num_groups=1,
         block_size=block_size,
     )
-    policy = policy or get_auto_policy(wo_a_weight.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(wo_a_weight.device)
-    # This fixed capacity describes the supported fused-quant decode band,
-    # not a live request. Resolve once while packing immutable model weights.
-    resolution = policy.resolve(
-        WO_PROJECTION_POLICY,
-        WoProjectionQuery(
-            dtype="bfloat16",
-            max_tokens=8,
-            groups=groups,
-            group_width=group_width,
-            rank=rank,
-            hidden=hidden,
-        ),
-    )
     return WOProjectionMXFP8Weights(
         wo_a=wo_a,
         wo_b=wo_b,
@@ -1274,9 +1402,7 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         group_width=group_width,
         rank=rank,
         hidden=hidden,
-        sfb_k_replicated=block_size == (128, 128),
-        decode_tile_n=resolution.config.decode_tile_n,
-        decode_policy_resolution=resolution,
+        sfb_k_replicated=tuple(block_size) == (128, 128),
     )
 
 
@@ -2198,7 +2324,6 @@ def _build_wo_projection_binding_from_views(
     weights: WOProjectionMXFP8Weights,
     return_3d: bool = False,
     expected_m: int | None = None,
-    decode_tile_n: int = 0,
 ) -> WOProjectionBinding:
     tokens = _validate_wo_projection_inputs(source_tgd, weights)
     _check_wo_projection_views(
@@ -2218,7 +2343,6 @@ def _build_wo_projection_binding_from_views(
         output=output,
         return_3d=bool(return_3d),
         expected_m=expected_m,
-        decode_tile_n=decode_tile_n,
     )
 
 
@@ -2287,7 +2411,6 @@ def _build_wo_projection_inv_rope_binding_from_views(
     rope_dim: int = 64,
     return_3d: bool = False,
     expected_m: int | None = None,
-    decode_tile_n: int = 0,
 ) -> WOProjectionInvRopeBinding:
     tokens = _validate_wo_projection_inv_rope_inputs(
         o=o,
@@ -2320,32 +2443,18 @@ def _build_wo_projection_inv_rope_binding_from_views(
         rope_dim=int(rope_dim),
         return_3d=bool(return_3d),
         expected_m=expected_m,
-        decode_tile_n=decode_tile_n,
     )
 
 
-def plan_wo_projection_scratch(
+def _materialize_wo_projection_scratch(
     caps: WOProjectionScratchCaps,
     *,
-    policy: PolicyContext | None = None,
-) -> WOProjectionScratchPlan:
+    config: WoProjectionConfig,
+) -> _WOProjectionState:
     if not isinstance(caps, WOProjectionScratchCaps):
         raise TypeError("caps must be WOProjectionScratchCaps")
-    policy = policy or get_auto_policy(caps.device)
-    if not isinstance(policy, PolicyContext):
-        raise TypeError("policy must be a PolicyContext")
-    policy.require_device(caps.device)
-    resolution = policy.resolve(
-        WO_PROJECTION_POLICY,
-        WoProjectionQuery(
-            dtype=str(caps.dtype).removeprefix("torch."),
-            max_tokens=caps.max_tokens,
-            groups=caps.groups,
-            group_width=caps.group_width,
-            rank=caps.rank,
-            hidden=caps.hidden,
-        ),
-    )
+    if not isinstance(config, WoProjectionConfig) or config.backend != "mxfp8":
+        raise ValueError("WO projection requires a validated MXFP8 configuration")
     layout = _layout_wo_projection(
         offset_bytes=0,
         tokens=caps.max_tokens,
@@ -2354,7 +2463,7 @@ def plan_wo_projection_scratch(
         rank=caps.rank,
         hidden=caps.hidden,
     )
-    return WOProjectionScratchPlan(
+    return _WOProjectionState(
         caps=caps,
         layout=layout,
         _scratch_specs=(
@@ -2364,7 +2473,7 @@ def plan_wo_projection_scratch(
                 device=caps.device,
             ),
         ),
-        policy_resolution=resolution,
+        config=config,
     )
 
 
@@ -2590,7 +2699,6 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
     out: torch.Tensor | None = None,
     expected_m: int | None = None,
     sfb_k_replicated: bool = False,
-    decode_tile_n: int = 0,
     _atomic_output_precleared: bool = False,
     stream: object = None,
 ) -> torch.Tensor:
@@ -2629,8 +2737,8 @@ def wo_b_dense_gemm_fused_quant_mxfp8(
         if expected_m is not None and 1 <= expected_m <= 8
         else None
     )
-    mma_tiler_mn = (16, decode_tile_n) if decode_tile_n else None
-    if mma_tiler_mn is None and rhs_values_tiled is not None:
+    mma_tiler_mn = None
+    if rhs_values_tiled is not None:
         mma_tiler_mn = _wo_b_fused_tiled_plan(
             tokens, hidden, width, source.device, expected_m
         )
@@ -2764,7 +2872,6 @@ def wo_projection_mxfp8(
             out=output,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
-            decode_tile_n=binding.decode_tile_n,
             stream=stream,
         )
     else:
@@ -2809,7 +2916,6 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
-    decode_tile_n: int = 0,
 ) -> torch.Tensor:
     # Fully opaque fused inv-rope WO: the entire quantize -> wo_a gemm -> quantize
     # -> wo_b gemm chain runs INSIDE this one op, so every token-shaped activation
@@ -2958,7 +3064,6 @@ def _wo_projection_inv_rope_mxfp8_fused_op(
             out=output,
             expected_m=expected_m,
             sfb_k_replicated=weights.sfb_k_replicated,
-            decode_tile_n=decode_tile_n,
             _atomic_output_precleared=atomic_output_precleared,
             stream=stream_int,
         )
@@ -2996,7 +3101,6 @@ def _wo_projection_inv_rope_mxfp8_fused_fake(
     expected_m: int,
     sfb_k_replicated: bool,
     stream_int: int | None,
-    decode_tile_n: int = 0,
 ) -> torch.Tensor:
     del stream_int
     return torch.empty((o.shape[0], hidden, 1), dtype=o.dtype, device=o.device)
@@ -3106,7 +3210,6 @@ def wo_projection_inv_rope_mxfp8(
         expected_m,
         weights.sfb_k_replicated,
         cuda_stream_to_int(stream),
-        binding.decode_tile_n if binding is not None else weights.decode_tile_n,
     )
     if return_3d:
         return output
@@ -3122,7 +3225,6 @@ __all__ = [
     "WOProjectionInvRopeBinding",
     "WOProjectionMXFP8Weights",
     "WOProjectionScratchCaps",
-    "WOProjectionScratchPlan",
     "build_wo_projection_binding",
     "build_wo_projection_inv_rope_binding",
     "dequantize_mxfp8_rows_torch",
@@ -3131,7 +3233,6 @@ __all__ = [
     "pack_fp8_block_scaled_weight_mxfp8",
     "pack_mxfp8_scales_for_dense_gemm",
     "pack_wo_projection_fp8_block_scaled_weights_mxfp8",
-    "plan_wo_projection_scratch",
     "quantize_mxfp8_rows_torch",
     "quantize_wo_a_input_inv_rope_mxfp8",
     "quantize_wo_a_input_mxfp8",

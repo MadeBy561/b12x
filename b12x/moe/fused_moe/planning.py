@@ -349,6 +349,7 @@ def prepare_weights(
             w2_global_scale=weights.w2_global_scales,
             w1_blockscale=weights.w13_block_scales,
             w2_blockscale=weights.w2_block_scales,
+            immutable_input_scales=weights.immutable_input_scales,
             a1_gscale=input_scale,
             a2_gscale=intermediate_scale,
         )

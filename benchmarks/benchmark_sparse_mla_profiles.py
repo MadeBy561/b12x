@@ -18,7 +18,9 @@ sys.path.insert(0, str(ROOT))
 
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession
+from b12x.attention.compressed_sparse_mla._tuning import TUNING, _split_config
+from benchmarks.attention_preparation import prepare_compressed
 from b12x.attention import compressed_sparse_mla as mla
 from b12x.attention._shared.mla.compressed_reference import (
     compressed_sparse_mla_reference,
@@ -262,6 +264,7 @@ def run_form(args, profile, form):
             cache_format=profile.cache_format,
         )
 
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
     plans, scratch = {}, {}
     v41 = profile.cache_format == "deepseek_v41"
     # V4's integration plans each declared capture shape; V4.1 plans a fixed
@@ -300,31 +303,40 @@ def run_form(args, profile, form):
                 num_q_heads=profile.attention_heads,
                 max_q_rows=capacity,
                 max_width=form.swa_width + indexed_width,
-                page_size=swa_page,
+                mode=mode, swa_width=form.swa_width, indexed_width=indexed_width,
+                swa_page_size=swa_page, indexed_page_size=indexed_page,
+                max_page_table_width=planned_pages, cache_format=profile.cache_format,
                 max_chunks_per_row=chunks,
                 decode_row_capacity=decode_capacity,
             )
-        base_plan = mla.plan(caps)
-        for compute in args.compute_modes:
-            arm_key = (mode, capacity, compute)
-            if compute == "auto":
-                selected_plan = base_plan
+        bind_args = dict(q=q[:capacity], swa_indices=swa_indices[:capacity], swa_lengths=swa_lengths[:capacity])
+        if logical is not None:
+            if v41:
+                indices = logical[:capacity]
+                bind_args["indexed_page_table"] = table[:capacity]
             else:
-                config = base_plan.policy_resolution.config
-                config = replace(
-                    config,
+                indices = (indexed_base * indexed_page + req[:capacity, None] * indexed_tokens + logical[:capacity]).int()
+            bind_args.update(indexed_indices=indices, indexed_lengths=indexed_lengths[:capacity])
+        run_args = dict(swa_k_cache=swa, indexed_k_cache=indexed, sm_scale=512**-0.5,
+                        attn_sink=sink, out=out[:capacity])
+        invocation = mla.invocation_from_tensors(q=q[:capacity], swa_k_cache=swa,
+                                                indexed_k_cache=indexed, attn_sink=sink, out=out[:capacity])
+        base_plan = mla.plan(caps, invocation=invocation)
+        default = TUNING.configure(base_plan.query, device=session.device.identity).default
+        if caps.max_chunks_per_row is not None and not default.single_pass:
+            split = _split_config(base_plan.query, caps.max_chunks_per_row)
+            default = replace(default, max_chunks_per_row=split.num_chunks, split_chunk_size=split.chunk_size)
+        for compute in args.compute_modes:
+            config = default
+            if compute != "auto":
+                config = replace(default,
                     v41_compute_mode="bf16" if compute == "bf16" else "fp8",
-                    v41_heads_per_block=(
-                        8 if compute == "fp8-h8" else
-                        16 if compute == "fp8-h16" else config.v41_heads_per_block
-                    ),
-                )
-                selected_plan = mla.plan(caps, config=config)
+                    v41_heads_per_block=(8 if compute == "fp8-h8" and mode == "decode" else 16))
+            arm_key = (mode, capacity, compute)
+            selected_plan, binding = prepare_compressed(session, caps,
+                bind_args=bind_args, run_args=run_args, config=config)
             plans[arm_key] = selected_plan
-            scratch[arm_key] = tuple(
-                torch.empty(shape, dtype=dtype, device=device)
-                for shape, dtype in selected_plan.shapes_and_dtypes()
-            )
+            scratch[arm_key] = (binding.scratch.shared_scratch,)
 
     def bind(mode, rows, compute="auto"):
         key = (mode, capacities[mode] if v41 else rows, compute)
@@ -350,8 +362,6 @@ def run_form(args, profile, form):
             swa_lengths=swa_lengths[:rows],
             **kwargs,
         )
-        if profile.cache_format == "deepseek_v4":
-            binding.scratch.mode = mode
         return binding
 
     def execute(binding, rows):
@@ -371,9 +381,7 @@ def run_form(args, profile, form):
         for compute in args.compute_modes:
             execute(bind(mode, capacity, compute), capacity)
     torch.cuda.synchronize(device)
-    freeze_kernel_resolution(
-        "declared profile plans prewarmed; V4.1 reuses capacity across live counts"
-    )
+    session.freeze()
 
     def validate_reference(actual, expected, fp8):
         assert bool(torch.isfinite(actual).all())
@@ -388,8 +396,12 @@ def run_form(args, profile, form):
             assert error.item() < limit, (error.item(), limit)
 
     records = []
+    graphs, timing_graphs = {}, {}
     try:
         for rows in row_counts:
+            for graph in (*graphs.values(), *timing_graphs.values()):
+                graph.reset()
+            timing_graphs = {}
             expected = oracle(rows)
             graphs, bindings, cosine, relative_l2, active_splits = {}, {}, {}, {}, {}
             arm_modes, arm_keys = {}, {}
@@ -408,7 +420,7 @@ def run_form(args, profile, form):
                 out[:rows].fill_(float("nan"))
                 actual = execute(binding, rows)
                 arm_fp8[arm] = v41 and (
-                    plans[arm_keys[arm]].policy_resolution.config.v41_compute_mode == "fp8"
+                    plans[arm_keys[arm]].prepared.state.config.v41_compute_mode == "fp8"
                 )
                 active_splits[arm] = int(binding.scratch.num_chunks_ptr.item())
                 eager_outputs[arm] = actual.clone()
@@ -536,7 +548,7 @@ def run_form(args, profile, form):
                     "heads": profile.attention_heads,
                     "planning_contract": "fixed scheduler capacity"
                     if v41
-                    else "one prewarmed plan per declared capture shape",
+                    else "one prepared plan per declared capture shape",
                     "swa_width": form.swa_width,
                     "indexed_width": indexed_width,
                     "swa_page_size": swa_page,
@@ -556,7 +568,7 @@ def run_form(args, profile, form):
                     },
                     "active_splits": active_splits,
                     "policy": {
-                        arm: repr(plans[key].policy_resolution)
+                        arm: repr(plans[key].prepared.state.config)
                         for arm, key in arm_keys.items()
                     },
                     "raw_samples_us": samples,
@@ -584,7 +596,9 @@ def run_form(args, profile, form):
                 flush=True,
             )
     finally:
-        unfreeze_kernel_resolution()
+        for graph in (*graphs.values(), *timing_graphs.values()):
+            graph.reset()
+        session.close()
     return records
 
 

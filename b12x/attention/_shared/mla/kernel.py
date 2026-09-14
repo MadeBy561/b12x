@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -31,7 +31,9 @@ from b12x._lib.compiler import (
 )
 from b12x._lib.compiler import (
     launch as b12x_launch,
+    run_compiled,
 )
+from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import shared_ptr_to_u32, st_shared_u32
 
 from .decode_math import (
@@ -131,7 +133,6 @@ _MLA_SM120_GLM_H8_NATIVE_ENV = "B12X_MLA_SM120_GLM_H8_NATIVE"
 # Opt-in while being validated: unset/0 -> off; 1/true/on/yes -> on.
 _MLA_SM120_DSV4_H16_NATIVE_ENV = "B12X_MLA_SM120_DSV4_H16_NATIVE"
 
-
 # FlashInfer's decode-dsv4 chunks_per_block wave-balance cap
 # (csrc/sparse_mla_sm120_decode_dsv4.cu:85). cpb candidates whose last-wave tail
 # gap looks small but require more than this many integer waves are rejected.
@@ -161,7 +162,6 @@ def _env_num_splits_override() -> int:
 def _env_glm_h8_native_enabled() -> bool:
     raw = os.environ.get(_MLA_SM120_GLM_H8_NATIVE_ENV)
     return raw is None or raw.strip().lower() not in {"0", "false", "off", "no"}
-
 
 
 def _env_dsv4_h16_native_mode() -> bool | None:
@@ -1926,6 +1926,21 @@ class UnifiedDecodeKernel:
 
 
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
+    if compile_only_launches_enabled() and hasattr(x, "fake_mode"):
+        from cutlass.cute.runtime import make_fake_tensor
+
+        leading_dim = next(
+            (idx for idx, stride in enumerate(x.stride()) if stride == 1), None
+        )
+        if dynamic_layout and x.ndim >= 1 and leading_dim is not None:
+            shape = tuple(cute.sym_int(32) for _ in x.shape)
+            strides = tuple(
+                1 if idx == leading_dim else cute.sym_int(64)
+                for idx in range(x.ndim)
+            )
+        else:
+            shape, strides = tuple(x.shape), tuple(x.stride())
+        return make_fake_tensor(dtype, shape, strides, assumed_align=align)
     c = from_dlpack(x, assumed_align=align)
     c.element_type = dtype
     if dynamic_layout and x.ndim >= 1:
@@ -2029,78 +2044,62 @@ def _sparse_mla_decode_grid_flat_launch(
     latent_scale_per_token: bool = False,
     v41_fp8_internal: bool = False,
     v41_heads_per_block: int = 16,
+    native_glm_h8_override: bool | None = None,
+    native_dsv4_h8_override: bool | None = None,
+    native_dsv4_h16_override: bool | None = None,
+    native_dsv41_fp8_override: bool | None = None,
+    vector_q_override: bool | None = None,
+    _prepared=None,
 ) -> None:
     q_head_dim = int(q_all.shape[-1])
     rows = int(q_all.shape[0])
     heads = int(q_all.shape[1])
-    native_glm_h8 = bool(
-        int(model_type) == int(ModelType.GLM_NSA)
-        and heads == 8
-        and int(valid_hpb) == 8
-        and int(grid_h_blocks) == 1
-        and int(head_block_offset) == 0
-        and not bool(has_extra)
-        # NVFP4 records are validated on the generic HPB=16 arm only.
-        and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
-        and _env_glm_h8_native_enabled()
+    native_glm_h8 = (
+        bool(native_glm_h8_override)
+        if native_glm_h8_override is not None
+        else bool(
+            int(model_type) == int(ModelType.GLM_NSA)
+            and heads == 8 and int(valid_hpb) == 8
+            and int(grid_h_blocks) == 1 and int(head_block_offset) == 0
+            and not bool(has_extra)
+            and int(scale_format) != int(ScaleFormat.NVFP4_E4M3)
+            and _env_glm_h8_native_enabled()
+        )
     )
-    native_dsv4_h8 = bool(
-        int(model_type) == int(ModelType.DSV4) and int(valid_hpb) == 8
+    native_dsv4_h8 = (
+        bool(native_dsv4_h8_override)
+        if native_dsv4_h8_override is not None
+        else bool(int(model_type) == int(ModelType.DSV4) and int(valid_hpb) == 8)
     )
-    native_dsv4_h16 = bool(
-        int(model_type) == int(ModelType.DSV4)
-        and int(valid_hpb) == 16
-        and int(head_block_offset) == 0
-        and (int(topk) + _CAND_WINDOW - 1) // _CAND_WINDOW
-        + (int(extra_topk) + _CAND_WINDOW - 1) // _CAND_WINDOW
-        <= _DSV4_H8_MAX_CHUNKS
-        and bool(per_token_len)
-        and _env_dsv4_h16_native_mode() is not False
+    native_dsv4_h16 = (
+        bool(native_dsv4_h16_override)
+        if native_dsv4_h16_override is not None
+        else bool(
+            int(model_type) == int(ModelType.DSV4)
+            and int(valid_hpb) == 16 and int(head_block_offset) == 0
+            and (int(topk) + _CAND_WINDOW - 1) // _CAND_WINDOW
+            + (int(extra_topk) + _CAND_WINDOW - 1) // _CAND_WINDOW <= _DSV4_H8_MAX_CHUNKS
+            and bool(per_token_len) and _env_dsv4_h16_native_mode() is not False
+        )
     )
-    native_dsv41_fp8 = bool(
-        int(model_type) == int(ModelType.DSV41) and bool(v41_fp8_internal)
+    native_dsv41_fp8 = (
+        bool(native_dsv41_fp8_override)
+        if native_dsv41_fp8_override is not None
+        else bool(
+            int(model_type) == int(ModelType.DSV41)
+            and bool(v41_fp8_internal)
+        )
     )
     native_h8 = native_glm_h8 or native_dsv4_h8 or (
         native_dsv41_fp8 and int(v41_heads_per_block) == 8
     )
     # Sixteen-byte Q staging needs unit dim stride and 16-byte-aligned rows.
-    vector_q = bool(
+    vector_q = bool(vector_q_override) if vector_q_override is not None else bool(
         int(q_all.stride(2)) == 1
         and (int(q_all.stride(1)) * 2) % 16 == 0
         and (int(q_all.stride(0)) * 2) % 16 == 0
         and int(q_all.data_ptr()) % 16 == 0
     )
-    traits = make_unified_traits(
-        int(model_type),
-        int(compute_mode),
-        int(scale_format),
-        fp8_rope=bool(fp8_rope),
-        latent_scale_per_token=bool(latent_scale_per_token),
-    )
-    if native_dsv41_fp8:
-        traits = replace(
-            traits, compute_mode=ComputeMode.FP8, fp8_internal=True,
-            q_nope_stride=528, kv_smem_stride=624,
-        )
-    if native_h8:
-        # Four warps cover 4*16 candidates in swapped QK.  PV keeps the same
-        # output coverage with twice the H16 N-tiles per warp.
-        traits = replace(
-            traits,
-            nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2,
-            math_threads=128,
-            block_threads=160,
-        )
-    elif native_dsv4_h16 or native_dsv41_fp8:
-        # Two H8 groups of four warps each share the producer but retain
-        # group-private Q/reduction/P/W staging.
-        traits = replace(
-            traits,
-            nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2,
-        )
-    layout = make_smem_layout(traits)
-    hpb = int(traits.hpb)
-    d_v = int(traits.d_v)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if per_token_len:
@@ -2151,6 +2150,43 @@ def _sparse_mla_decode_grid_flat_launch(
             )
         else:
             args = base_args + (Int32(rows), stream)
+
+    # A published launch already owns the exact executable.  Its runtime ABI is
+    # the pointer/scalar tuple above; do not rebuild traits, layouts, kernels, or
+    # compile keys on serving replay.
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
+
+    traits = make_unified_traits(
+        int(model_type),
+        int(compute_mode),
+        int(scale_format),
+        fp8_rope=bool(fp8_rope),
+        latent_scale_per_token=bool(latent_scale_per_token),
+    )
+    if native_dsv41_fp8:
+        traits = replace(
+            traits,
+            compute_mode=ComputeMode.FP8,
+            fp8_internal=True,
+            q_nope_stride=528,
+            kv_smem_stride=624,
+        )
+    if native_h8:
+        # Four warps cover 4*16 candidates in swapped QK.  PV keeps the same
+        # output coverage with twice the H16 N-tiles per warp.
+        traits = replace(
+            traits,
+            nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2,
+            math_threads=128,
+            block_threads=160,
+        )
+    elif native_dsv4_h16 or native_dsv41_fp8:
+        # Two H8 groups retain group-private Q/reduction/P/W staging.
+        traits = replace(traits, nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2)
+    layout = make_smem_layout(traits)
+    hpb = int(traits.hpb)
+    d_v = int(traits.d_v)
 
     kernel = UnifiedDecodeKernel(
         traits,
@@ -2296,7 +2332,9 @@ def _sparse_mla_decode_grid_flat_launch(
         entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
     else:
         entry = kernel.call_extra if has_extra else kernel
-    b12x_launch(
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
+    return b12x_launch(
         entry,
         compile_spec=compile_spec,
         compile_args=args,
@@ -2416,6 +2454,204 @@ def _sparse_mla_decode_grid_fake(
     return None
 
 
+@dataclass(frozen=True)
+class UnifiedDecodeLaunch:
+    """Immutable decode lowering and resident launchers selected during preparation."""
+
+    traits: UnifiedMLATraits
+    rows: int
+    heads: int
+    topk: int
+    extra_topk: int
+    swa_page_size: int
+    indexed_page_size: int | None
+    max_chunks: int
+    num_chunks: int
+    num_splits: int
+    chunks_per_split: int
+    native_dsv4_h8: bool
+    native_dsv4_h16: bool
+    native_glm_h8: bool
+    native_dsv41_fp8: bool
+    v41_heads_per_block: int
+    hpb: int
+    h_blocks: int
+    h_blocks_full: int
+    rem_heads: int
+    has_extra: bool
+    has_attn_sink: bool
+    return_lse: bool
+    sm_count: int
+    vector_q: bool
+    grid_programs: tuple[object, ...] = ()
+    merge_program: object | None = None
+    lse_program: object | None = None
+
+
+def prepare_unified_decode_launch(
+    *,
+    q_all: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    workspace,
+    swa_page_size: int,
+    sm_count: int,
+    q_alignment: int | None = None,
+    indexed_k_cache: torch.Tensor | None = None,
+    indexed_indices: torch.Tensor | None = None,
+    indexed_page_size: int | None = None,
+    attn_sink: torch.Tensor | None = None,
+    forced_num_splits: int | None = None,
+    scale_format_override: int | None = None,
+    model_type_override: int | None = None,
+    fp8_rope_override: bool | None = None,
+    latent_scale_per_token: bool = False,
+    v41_compute_mode: str = "fp8",
+    v41_heads_per_block: int | None = None,
+    traits_override: UnifiedMLATraits | None = None,
+    return_lse: bool = False,
+    controls=None,
+) -> UnifiedDecodeLaunch:
+    has_extra = indexed_k_cache is not None or indexed_indices is not None
+    if has_extra != (indexed_k_cache is not None and indexed_indices is not None and indexed_page_size is not None):
+        raise ValueError("prepared unified decode requires the complete indexed-cache tuple")
+    rows, heads, q_head_dim = map(int, q_all.shape)
+    if q_head_dim not in (_DSV4_HEAD_DIM, _GLM_HEAD_DIM) or rows <= 0 or heads <= 0:
+        raise ValueError("invalid prepared unified decode q geometry")
+    traits = (
+        traits_override
+        if traits_override is not None
+        else resolve_unplanned_traits(
+            q_head_dim, swa_k_cache.dtype, int(swa_k_cache.shape[-1]),
+            model_type=model_type_override, scale_format=scale_format_override,
+            fp8_rope=fp8_rope_override,
+            latent_scale_per_token=bool(latent_scale_per_token),
+        )
+    )
+    if int(traits.model_type) == int(ModelType.DSV41):
+        if v41_compute_mode not in ("bf16", "fp8"):
+            raise ValueError("v41_compute_mode must be 'bf16' or 'fp8'")
+        if v41_heads_per_block is None:
+            v41_heads_per_block = 16 if heads % 16 == 0 else 8
+        if int(v41_heads_per_block) not in (8, 16):
+            raise ValueError("V4.1 heads_per_block must be 8 or 16")
+        if v41_compute_mode == "fp8":
+            traits = replace(traits, compute_mode=ComputeMode.FP8, fp8_internal=True)
+    else:
+        if v41_compute_mode != "fp8" or v41_heads_per_block is not None:
+            raise ValueError("V4.1 execution controls require ModelType.DSV41")
+    topk = int(swa_indices.shape[1])
+    extra_topk = int(indexed_indices.shape[1]) if has_extra else 0
+    max_chunks = int(workspace.max_chunks_per_row)
+    if traits.model_type == ModelType.DSV41 and forced_num_splits is None:
+        forced_num_splits = int(workspace.num_chunks_value)
+    dsv4_h16_allowed = bool(
+        int(traits.model_type) == int(ModelType.DSV4)
+        and heads % 16 == 0
+        and (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+        + (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW <= _DSV4_H8_MAX_CHUNKS
+    )
+    h8_chunks, h8_splits, _ = plan_unified_decode_splits(
+        topk=topk, extra_topk=extra_topk, max_chunks=max_chunks,
+        forced_num_splits=forced_num_splits, num_tokens=rows,
+        h_blocks=max(1, heads // 8), sm_count=sm_count,
+    )
+    h16_mode = _env_dsv4_h16_native_mode()
+    native_dsv4_h16 = bool(
+        dsv4_h16_allowed
+        and (_dsv4_h16_auto(rows=rows, heads=heads, num_chunks=h8_chunks,
+                             h8_num_splits=h8_splits, sm_count=sm_count)
+             if h16_mode is None else h16_mode)
+    )
+    native_dsv4_h8 = bool(
+        int(traits.model_type) == int(ModelType.DSV4)
+        and heads % 8 == 0
+        and h8_chunks <= _DSV4_H8_MAX_CHUNKS
+        and not native_dsv4_h16
+    )
+    native_glm_h8 = bool(
+        int(traits.model_type) == int(ModelType.GLM_NSA)
+        and heads == 8
+        and not has_extra
+        and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
+        and _env_glm_h8_native_enabled()
+    )
+    native_dsv41_fp8 = bool(
+        int(traits.model_type) == int(ModelType.DSV41) and traits.fp8_internal
+    )
+    hpb = int(v41_heads_per_block) if native_dsv41_fp8 else (8 if native_dsv4_h8 else 16)
+    h_blocks_full, rem_heads = divmod(heads, hpb)
+    h_blocks = h_blocks_full + bool(rem_heads)
+    preferred = _dsv4_spark_short_gather_num_splits(
+        rows=rows, heads=heads, num_chunks=h8_chunks, sm_count=sm_count,
+        native_dsv4_h16=native_dsv4_h16,
+    ) if int(traits.model_type) == int(ModelType.DSV4) else None
+    num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
+        topk=topk, extra_topk=extra_topk, max_chunks=max_chunks,
+        forced_num_splits=forced_num_splits, num_tokens=rows,
+        h_blocks=h_blocks, sm_count=sm_count, preferred_num_splits=preferred,
+    )
+    return UnifiedDecodeLaunch(
+        traits=traits, rows=rows, heads=heads, topk=topk, extra_topk=extra_topk,
+        swa_page_size=int(swa_page_size), indexed_page_size=indexed_page_size,
+        max_chunks=max_chunks, num_chunks=num_chunks, num_splits=num_splits,
+        chunks_per_split=chunks_per_split, native_dsv4_h8=native_dsv4_h8,
+        native_dsv4_h16=native_dsv4_h16, native_glm_h8=native_glm_h8,
+        native_dsv41_fp8=native_dsv41_fp8,
+        v41_heads_per_block=int(v41_heads_per_block or 16),
+        hpb=hpb, h_blocks=h_blocks, h_blocks_full=h_blocks_full,
+        rem_heads=rem_heads, has_extra=has_extra,
+        has_attn_sink=attn_sink is not None, return_lse=bool(return_lse),
+        sm_count=int(sm_count),
+        vector_q=bool(
+            int(q_all.stride(2)) == 1
+            and (int(q_all.stride(1)) * 2) % 16 == 0
+            and (int(q_all.stride(0)) * 2) % 16 == 0
+            and (int(q_all.data_ptr()) if q_alignment is None else q_alignment) % 16 == 0
+        ),
+    )
+
+def compile_unified_decode_launch(
+    *, prepared: UnifiedDecodeLaunch, **run_kwargs
+) -> UnifiedDecodeLaunch:
+    """Resolve every native decode path and retain its executable launchers.
+
+    ``run_kwargs`` is deliberately the exact ``run_unified_decode`` invocation
+    ABI.  This keeps optional length, sink, tail-head, merge, and final-LSE
+    routes coupled to the metadata that will execute at replay.
+    """
+    if not isinstance(prepared, UnifiedDecodeLaunch):
+        raise TypeError("prepared must be a UnifiedDecodeLaunch")
+    from b12x._lib.compile_plan import compile_only_launches
+
+    resolved: list[object] = []
+    with compile_only_launches():
+        run_unified_decode(
+            prepared=prepared, resolved_programs=resolved, **run_kwargs
+        )
+    grid_count = int(prepared.h_blocks_full > 0) + int(prepared.rem_heads > 0)
+    expected = grid_count + 1 + int(prepared.return_lse)
+    if len(resolved) != expected:
+        raise RuntimeError(
+            "unified decode preparation did not resolve every declared launcher: "
+            f"expected {expected}, got {len(resolved)}"
+        )
+    from b12x._lib.compile_plan import attach_programs
+
+    launch = replace(
+        prepared,
+        grid_programs=tuple(resolved[:grid_count]),
+        merge_program=resolved[grid_count],
+        lse_program=resolved[-1] if prepared.return_lse else None,
+    )
+    return attach_programs(launch, *resolved)
+
+
+def run_prepared_unified_decode(*, prepared: UnifiedDecodeLaunch, **kwargs):
+    """Execute one prepared lowering without resolving traits, controls, or splits."""
+    return run_unified_decode(prepared=prepared, **kwargs)
+
+
 def run_unified_decode(
     *,
     q_all: torch.Tensor,
@@ -2440,8 +2676,11 @@ def run_unified_decode(
     model_type_override: int | None = None,
     fp8_rope_override: bool | None = None,
     latent_scale_per_token: bool = False,
+    v41_compute_mode: str = "fp8",
+    v41_heads_per_block: int | None = None,
     traits_override: UnifiedMLATraits | None = None,
-    v41_heads_per_block: int = 16,
+    prepared: UnifiedDecodeLaunch | None = None,
+    resolved_programs: list[object] | None = None,
 ):
     """Active SM120 sparse-MLA decode: kernel (split-K partials) + merge.
 
@@ -2548,87 +2787,124 @@ def run_unified_decode(
     rem_heads = heads % hpb
     h_blocks = h_blocks_full + (1 if rem_heads else 0)
 
-    if traits_override is None:
-        traits = resolve_unplanned_traits(
-            q_head_dim,
-            swa_k_cache.dtype,
-            int(swa_k_cache.shape[-1]),
-            model_type=model_type_override,
-            scale_format=scale_format_override,
-            fp8_rope=fp8_rope_override,
-            latent_scale_per_token=bool(latent_scale_per_token),
-        )
+    if prepared is not None:
+        if traits_override is not None or any(
+            value is not None for value in (
+                forced_num_splits, scale_format_override, model_type_override,
+                fp8_rope_override,
+            )
+        ):
+            raise ValueError("prepared unified decode does not accept runtime lowering controls")
+        if (
+            rows > prepared.rows
+            or heads != prepared.heads
+            or int(swa_indices.shape[1]) != prepared.topk
+            or bool(has_extra) != prepared.has_extra
+            or (has_extra and int(indexed_indices.shape[1]) != prepared.extra_topk)
+            or int(swa_page_size) != prepared.swa_page_size
+            or (has_extra and int(indexed_page_size) != int(prepared.indexed_page_size))
+            or int(workspace.max_chunks_per_row) != prepared.max_chunks
+            or bool(attn_sink is not None) != prepared.has_attn_sink
+            or bool(return_lse) != prepared.return_lse
+        ):
+            raise ValueError("runtime unified decode metadata differs from its prepared launch")
+        if not compile_only_launches_enabled():
+            expected_grids = int(prepared.h_blocks_full > 0) + int(prepared.rem_heads > 0)
+            if len(prepared.grid_programs) != expected_grids:
+                raise RuntimeError("prepared unified decode is missing resident grid launchers")
+            if prepared.merge_program is None:
+                raise RuntimeError("prepared unified decode is missing its merge launcher")
+            if prepared.return_lse and prepared.lse_program is None:
+                raise RuntimeError("prepared unified decode is missing its final-LSE launcher")
+        traits = prepared.traits
         model_type = int(traits.model_type)
+        hpb = prepared.hpb
+        h_blocks_full = prepared.h_blocks_full
+        rem_heads = prepared.rem_heads
+        h_blocks = prepared.h_blocks
+        native_dsv4_h16 = prepared.native_dsv4_h16
+        native_dsv4_h8 = prepared.native_dsv4_h8
+        if model_type == ModelType.DSV41 and (
+            v41_compute_mode != ("fp8" if prepared.native_dsv41_fp8 else "bf16")
+            or (
+                v41_heads_per_block is not None
+                and int(v41_heads_per_block) != prepared.v41_heads_per_block
+            )
+        ):
+            raise ValueError("runtime V4.1 controls differ from the prepared launch")
+        sm_count = prepared.sm_count
     else:
-        traits = traits_override
-        model_type = int(traits.model_type)
-    if int(model_type) == int(ModelType.DSV41) and int(
-        v41_heads_per_block
-    ) not in (8, 16):
-        raise ValueError("DSV41 heads_per_block must be 8 or 16")
-    d_v = int(traits.d_v)  # output O dim (512 for both; V == nope for GLM)
-
+        if traits_override is None:
+            traits = resolve_unplanned_traits(
+                q_head_dim,
+                swa_k_cache.dtype,
+                int(swa_k_cache.shape[-1]),
+                model_type=model_type_override,
+                scale_format=scale_format_override,
+                fp8_rope=fp8_rope_override,
+                latent_scale_per_token=bool(latent_scale_per_token),
+            )
+            model_type = int(traits.model_type)
+        else:
+            traits = traits_override
+            model_type = int(traits.model_type)
+        if int(model_type) == int(ModelType.DSV41):
+            if v41_compute_mode not in ("bf16", "fp8"):
+                raise ValueError("v41_compute_mode must be 'bf16' or 'fp8'")
+            if v41_heads_per_block is None:
+                v41_heads_per_block = 16 if heads % 16 == 0 else 8
+            if int(v41_heads_per_block) not in (8, 16):
+                raise ValueError("V4.1 heads_per_block must be 8 or 16")
+            if v41_compute_mode == "fp8":
+                traits = replace(traits, compute_mode=ComputeMode.FP8, fp8_internal=True)
+        d_v = int(traits.d_v)
+        topk = int(swa_indices.shape[1])
+        extra_topk = int(indexed_indices.shape[1]) if has_extra else 0
+        num_main_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+        num_extra_chunks = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
+        max_chunks = int(workspace.max_chunks_per_row)
+        if model_type == ModelType.DSV41 and forced_num_splits is None:
+            forced_num_splits = int(workspace.num_chunks_value)
+        sm_count = (
+            int(torch.cuda.get_device_properties(q_all.device).multi_processor_count)
+            if q_all.is_cuda else None
+        )
+        h16_allowed = bool(
+            int(model_type) == int(ModelType.DSV4)
+            and heads % 16 == 0
+            and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
+        )
+        h16_mode = _env_dsv4_h16_native_mode()
+        if h16_allowed and h16_mode is None:
+            _nc8, _ns8, _ = plan_unified_decode_splits(
+                topk=topk, max_chunks=max_chunks, forced_num_splits=forced_num_splits,
+                num_tokens=rows, h_blocks=heads // 8, sm_count=sm_count,
+                extra_topk=extra_topk,
+            )
+            native_dsv4_h16 = _dsv4_h16_auto(
+                rows=rows, heads=heads, num_chunks=_nc8, h8_num_splits=_ns8,
+                sm_count=sm_count,
+            )
+        else:
+            native_dsv4_h16 = bool(h16_allowed and h16_mode)
+        native_dsv4_h8 = bool(
+            int(model_type) == int(ModelType.DSV4)
+            and heads % 8 == 0
+            and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
+            and not native_dsv4_h16
+        )
+        native_dsv41_fp8 = int(model_type) == int(ModelType.DSV41) and bool(traits.fp8_internal)
+        if native_dsv4_h8 or native_dsv41_fp8:
+            hpb = int(v41_heads_per_block) if native_dsv41_fp8 else 8
+            h_blocks_full = heads // hpb
+            rem_heads = heads % hpb
+            h_blocks = h_blocks_full + (1 if rem_heads else 0)
+    d_v = int(traits.d_v)
     topk = int(swa_indices.shape[1])
     extra_topk = int(indexed_indices.shape[1]) if has_extra else 0
     num_main_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
     num_extra_chunks = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
-    # The swapped H8 DSV4 kernel is validated across the traced C1/C4/C128
-    # regimes, including C128's three chunks per split. This is a shape-only
-    # policy decision, so capture and replay use the same kernel and workspace.
     max_chunks = int(workspace.max_chunks_per_row)
-    if model_type == ModelType.DSV41 and forced_num_splits is None:
-        forced_num_splits = int(workspace.num_chunks_value)
-    # SM count read early: both the H8/H16 policy and the split plan need it.
-    sm_count = None
-    if q_all.is_cuda:
-        sm_count = int(
-            torch.cuda.get_device_properties(q_all.device).multi_processor_count
-        )
-
-    h16_allowed = bool(
-        int(model_type) == int(ModelType.DSV4)
-        and heads % 16 == 0
-        and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
-    )
-    h16_mode = _env_dsv4_h16_native_mode()
-    if h16_allowed and h16_mode is None:
-        # AUTO policy: pre-plan the H8 grid, then choose by regime (see
-        # _dsv4_h16_auto): gather-bound many-chunk shapes and >1.4-wave H8
-        # grids go H16; the sub-wave latency regime keeps H8.
-        _nc8, _ns8, _ = plan_unified_decode_splits(
-            topk=topk,
-            max_chunks=max_chunks,
-            forced_num_splits=forced_num_splits,
-            num_tokens=rows,
-            h_blocks=heads // 8,
-            sm_count=sm_count,
-            extra_topk=extra_topk,
-        )
-        native_dsv4_h16 = _dsv4_h16_auto(
-            rows=rows, heads=heads, num_chunks=_nc8, h8_num_splits=_ns8
-        )
-    else:
-        native_dsv4_h16 = bool(h16_allowed and h16_mode)
-    native_dsv4_h8 = bool(
-        int(model_type) == int(ModelType.DSV4)
-        and heads % 8 == 0
-        and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
-        and not native_dsv4_h16
-    )
-    native_dsv41_fp8 = bool(
-        int(model_type) == int(ModelType.DSV41) and bool(traits.fp8_internal)
-    )
-    native_dsv41_h16 = (
-        native_dsv41_fp8 and int(v41_heads_per_block) == 16
-    )
-    native_dsv41_h8 = (
-        native_dsv41_fp8 and int(v41_heads_per_block) == 8
-    )
-    if native_dsv4_h8 or native_dsv41_fp8:
-        hpb = 16 if native_dsv41_h16 else 8
-        h_blocks_full = heads // hpb
-        rem_heads = heads % hpb
-        h_blocks = h_blocks_full + (1 if rem_heads else 0)
 
     # ── P10b PER-TOKEN topk_length threading ──────────────────────────────────
     # Decide whether to route to the per-token kernel (section_len read per CTA
@@ -2693,56 +2969,45 @@ def run_unified_decode(
             extra_len_t = torch.full(
                 (rows,), extra_topk, dtype=torch.int32, device=q_all.device
             )
-    preferred_num_splits = None
-    if int(model_type) == int(ModelType.DSV4):
-        preferred_num_splits = _dsv4_spark_short_gather_num_splits(
-            rows=rows,
-            heads=heads,
-            num_chunks=num_main_chunks + num_extra_chunks,
-            sm_count=sm_count,
-            native_dsv4_h16=native_dsv4_h16,
+    if prepared is not None:
+        num_chunks = prepared.num_chunks
+        num_splits = prepared.num_splits
+        chunks_per_split = prepared.chunks_per_split
+        native_glm_h8 = prepared.native_glm_h8
+    else:
+        preferred_num_splits = None
+        if int(model_type) == int(ModelType.DSV4):
+            preferred_num_splits = _dsv4_spark_short_gather_num_splits(
+                rows=rows, heads=heads, num_chunks=num_main_chunks + num_extra_chunks,
+                sm_count=sm_count, native_dsv4_h16=native_dsv4_h16,
+            )
+        num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
+            topk=topk, max_chunks=max_chunks, forced_num_splits=forced_num_splits,
+            num_tokens=rows, h_blocks=h_blocks, sm_count=sm_count,
+            extra_topk=extra_topk, preferred_num_splits=preferred_num_splits,
         )
-    num_chunks, num_splits, chunks_per_split = plan_unified_decode_splits(
-        topk=topk,
-        max_chunks=max_chunks,
-        forced_num_splits=forced_num_splits,
-        num_tokens=rows,
-        h_blocks=h_blocks,
-        sm_count=sm_count,
-        extra_topk=extra_topk,
-        preferred_num_splits=preferred_num_splits,
-    )
-    # Binding only maps caller-owned views; initialize stream-ordered control
-    # words here so freshly bound storage is valid in eager and graph launches.
-    workspace.num_chunks_ptr.fill_(num_splits)
-    # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
-    # LAST_DECODE_PLAN["num_splits"]). Informational only.
-    native_glm_h8 = bool(
-        int(model_type) == int(ModelType.GLM_NSA)
-        and int(heads) == 8
-        and not has_extra
-        # NVFP4 records (432B, packed E2M1+E4M3) are validated on the generic
-        # HPB=16 arm only; the packed-656B H8 staging would misread them.
-        and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
-        and _env_glm_h8_native_enabled()
-    )
-    native_h16 = native_dsv4_h16 or native_dsv41_h16
-    native_h8 = native_glm_h8 or native_dsv4_h8 or native_dsv41_h8
+        native_glm_h8 = bool(
+            int(model_type) == int(ModelType.GLM_NSA)
+            and int(heads) == 8
+            and not has_extra
+            and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
+            and _env_glm_h8_native_enabled()
+        )
+    native_h8 = native_glm_h8 or native_dsv4_h8
     LAST_DECODE_PLAN.clear()
     LAST_DECODE_PLAN.update(
         model_type=str(model_type),
-        native_dsv41_h8=native_dsv41_h8,
-        native_dsv41_h16=native_dsv41_h16,
         native_glm_h8=native_glm_h8,
         native_dsv4_h8=native_dsv4_h8,
         native_dsv4_h16=native_dsv4_h16,
-        native_dsv41_fp8=native_dsv41_fp8,
         heads_per_block=(8 if native_h8 else 16),
         math_warps=(4 if native_h8 else 8),
         block_threads=(
-            160 if native_h8 else (320 if native_h16 else int(traits.block_threads))
+            160
+            if native_h8
+            else (320 if native_dsv4_h16 else int(traits.block_threads))
         ),
-        io_warps=(2 if native_h16 else 1),
+        io_warps=(2 if native_dsv4_h16 else 1),
         kv_stage_packed=native_h8 or native_dsv4_h16,
         kv_smem_stride=(
             _GLM_KV_GMEM_STRIDE
@@ -2755,9 +3020,8 @@ def run_unified_decode(
         ),
         kv_gmem_stride=int(traits.kv_gmem_stride),
         fp8_rope=bool(traits.fp8_rope),
-        qk_candidates_per_warp=(16 if (native_h8 or native_h16) else 8),
-        qk_swap_ab=native_h8 or native_h16,
-        dsv41_tagged_records=native_dsv41_fp8,
+        qk_candidates_per_warp=(16 if (native_h8 or native_dsv4_h16) else 8),
+        qk_swap_ab=native_h8 or native_dsv4_h16,
         topk=int(topk),
         extra_topk=int(extra_topk),
         has_extra=bool(has_extra),
@@ -2785,8 +3049,12 @@ def run_unified_decode(
     # mid_out / mid_lse views over the workspace split buffers (the merge's
     # exact tmp_output[rows,heads,chunks,dim] / tmp_lse[rows,heads,chunks]). The
     # partial O dim is d_v (512) for both models.
-    mid_out = workspace.tmp_output[:rows, :heads, :num_splits, :d_v]
-    mid_lse = workspace.tmp_lse[:rows, :heads, :num_splits]
+    mid_out = workspace.tmp_output.as_strided(
+        (rows, heads, num_splits, d_v), workspace.tmp_output.stride()
+    )
+    mid_lse = workspace.tmp_lse.as_strided(
+        (rows, heads, num_splits), workspace.tmp_lse.stride()
+    )
 
     stride_kv_block = _cache_block_stride_bytes(
         swa_k_cache,
@@ -2834,68 +3102,61 @@ def run_unified_decode(
             raise ValueError("SM120 sparse MLA decode out must be contiguous")
         output = out
     else:
-        output = workspace.output_buffer[:rows, :heads, :d_v]
+        output = workspace.output_buffer.as_strided(
+            (rows, heads, d_v), workspace.output_buffer.stride()
+        )
 
     kv_flat = _cache_base_tensor(swa_k_cache)
     swa_len_for_op = swa_len_t if swa_len_t is not None else swa_indices
     extra_len_for_op = extra_len_t if extra_len_t is not None else swa_indices
 
     def _launch_grid(grid_h_blocks: int, valid_hpb: int, head_block_offset: int):
-        torch.ops.b12x.sparse_mla_sm120_decode_grid(
-            q_all,
-            kv_flat,
-            swa_indices,
-            mid_out,
-            mid_lse,
-            swa_len_for_op,
-            extra_kv_flat,
-            extra_indices_t,
-            extra_len_for_op,
-            float(sm_scale),
-            float(latent_scale),
-            int(model_type),
-            int(traits.compute_mode),
-            int(traits.scale_format),
-            bool(traits.fp8_rope),
-            int(swa_page_size),
-            int(topk),
-            int(extra_topk),
-            int(num_main_chunks),
-            int(num_splits),
-            int(chunks_per_split),
-            int(stride_kv_block),
-            int(pbs_extra),
-            int(stride_extra_kv_block),
-            int(grid_h_blocks),
-            int(valid_hpb),
-            int(head_block_offset),
-            bool(has_extra),
-            bool(per_token_len),
+        args = (
+            q_all, kv_flat, swa_indices, mid_out, mid_lse, swa_len_for_op,
+            extra_kv_flat, extra_indices_t, extra_len_for_op, float(sm_scale),
+            float(latent_scale), int(model_type), int(traits.compute_mode),
+            int(traits.scale_format), bool(traits.fp8_rope), int(swa_page_size),
+            int(topk), int(extra_topk), int(num_main_chunks), int(num_splits),
+            int(chunks_per_split), int(stride_kv_block), int(pbs_extra),
+            int(stride_extra_kv_block), int(grid_h_blocks), int(valid_hpb),
+            int(head_block_offset), bool(has_extra), bool(per_token_len),
             bool(traits.latent_scale_per_token),
             bool(traits.fp8_internal),
-            int(v41_heads_per_block),
+            int(prepared.v41_heads_per_block if prepared is not None else v41_heads_per_block or 16),
         )
+        prepared_program = None
+        if prepared is not None and not compile_only_launches_enabled():
+            program_index = 1 if head_block_offset else 0
+            prepared_program = prepared.grid_programs[program_index]
+        if compile_only_launches_enabled() or prepared is not None:
+            launched = _sparse_mla_decode_grid_flat_launch(
+                *args,
+                native_glm_h8_override=None if prepared is None else prepared.native_glm_h8,
+                native_dsv4_h8_override=None if prepared is None else prepared.native_dsv4_h8,
+                native_dsv4_h16_override=None if prepared is None else prepared.native_dsv4_h16,
+                native_dsv41_fp8_override=None if prepared is None else prepared.native_dsv41_fp8,
+                vector_q_override=None if prepared is None else prepared.vector_q,
+                _prepared=prepared_program,
+            )
+            if resolved_programs is not None:
+                if launched is None:
+                    raise RuntimeError("unified decode grid preparation did not return a launcher")
+                resolved_programs.append(launched)
+            return launched
+        return torch.ops.b12x.sparse_mla_sm120_decode_grid(*args)
 
     if h_blocks_full > 0:
-        # FULL HPB=16 head-blocks (the base path when heads is a multiple of 16).
+        # FULL HPB head-blocks (the base path when heads is a multiple of HPB).
         _launch_grid(h_blocks_full, hpb, 0)
     if rem_heads:
-        # REMAINDER tail head-block: a 1-block grid with valid_hpb=rem_heads at
-        # head_block offset h_blocks_full (so head_base = h_blocks_full*16).
+        # REMAINDER tail head-block: preserve the physical tail block offset.
         _launch_grid(1, rem_heads, h_blocks_full)
 
-    # ── REUSED base-2 merge over the split axis -> final O. num_splits=1 is the
-    #    trivial 1-split merge (partial == final O). ──
     from .merge import (
         build_sparse_mla_split_decode_merge_binding,
         run_sparse_mla_split_decode_merge,
     )
 
-    # When attn_sink is supplied, the merge SELECTS the sink-folding merge kernel
-    # (merge.py SparseMLASplitDecodeSinkMergeKernel) which applies the FlashMLA V4
-    # fold output *= sigmoid(lse_e - sink) directly into O (exactly upstream's
-    # sink-in-merge design, sparse_mla_sm120_decode_dsv4.cu:128-129). With no sink
-    # it is the plain base-2 merge -> PTX/numerics byte-identical to the base path.
     merge_binding = build_sparse_mla_split_decode_merge_binding(
         tmp_output=mid_out,
         tmp_lse=mid_lse,
@@ -2905,16 +3166,18 @@ def run_unified_decode(
         attn_sink=attn_sink,
         scratch=workspace,
     )
-    run_sparse_mla_split_decode_merge(binding=merge_binding)
+    merge_program = run_sparse_mla_split_decode_merge(
+        binding=merge_binding,
+        _prepared=None if prepared is None else prepared.merge_program,
+    )
+    if resolved_programs is not None:
+        if merge_program is None:
+            raise RuntimeError("unified decode merge preparation did not return a launcher")
+        resolved_programs.append(merge_program)
     if not return_lse:
         return output
 
-    # return_lse: reconstruct the FINAL LSE from the per-split base-2 mid_lse
-    # (logsumexp over the split axis, base2->natural). mid_lse aliases
-    # workspace.tmp_lse[:rows,:heads,:num_splits], so reuse the shared helper.
-    from b12x.attention._shared.mla.api import (
-        _final_lse_from_split_workspace,
-    )
+    from b12x.attention._shared.mla.api import _final_lse_from_split_workspace
 
     lse = _final_lse_from_split_workspace(
         workspace=workspace,
@@ -2922,6 +3185,8 @@ def run_unified_decode(
         num_heads=heads,
         launch_num_chunks=num_splits,
         scale=("natural" if attn_sink is not None else lse_scale),
+        _prepared=None if prepared is None else prepared.lse_program,
+        resolved_programs=resolved_programs,
     )
     if attn_sink is not None:
         # Fold the per-head sink into the LSE in the natural-log domain (the merge

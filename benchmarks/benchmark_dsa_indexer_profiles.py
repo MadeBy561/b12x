@@ -32,7 +32,8 @@ from b12x.attention.dsa_indexer.reference import (
 )
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession, PreparedCall
+from benchmarks.attention_preparation import prepare_mxfp4
 from b12x.attention import dsa_indexer as api
 from benchmarks.benchmark_mxfp4_indexer import (
     check_selection,
@@ -208,10 +209,6 @@ def _run_mxfp4_form(args, profile, form):
         torch.empty_like(source_packed),
         torch.empty_like(source_scales),
     )
-    api.quantize_q_mxfp4(q, q_mxfp4=native_q, q_scales=native_scales)
-    api.quantize_q_mxfp4(source_q, q_mxfp4=native_source, q_scales=native_source_scales)
-    torch.testing.assert_close(native_q, packed, rtol=0, atol=0)
-    torch.testing.assert_close(native_scales, scales, rtol=0, atol=0)
     page_bytes = api.index_mxfp4_page_bytes(form.page_size)
     page_stride = args.page_stride or ((page_bytes + 255) // 256 * 256)
     backing, pool, physical, table, base = _pool_and_table(
@@ -228,9 +225,6 @@ def _run_mxfp4_form(args, profile, form):
         physical[torch.arange(max_live, device=device) // form.page_size].long()
         * form.page_size
         + torch.arange(max_live, device=device) % form.page_size
-    )
-    api.quantize_write_index_k_mxfp4(
-        keys, index_k_cache=pool, slot_mapping=slots, page_size=form.page_size
     )
     active = torch.full((1,), capacity, dtype=torch.int32, device=device)
     lengths = torch.full((rows_capacity,), max_live, dtype=torch.int32, device=device)
@@ -276,10 +270,9 @@ def _run_mxfp4_form(args, profile, form):
             source_spec.shape, dtype=source_spec.dtype, device=device
         )
 
-    def bind_publisher(rows):
+    def publisher_args(rows):
         assert source_plan is not None and source_scratch is not None
-        return api.bind(
-            source_plan,
+        return dict(
             scratch=source_scratch,
             q_mxfp4=native_source[:rows],
             q_scales=native_source_scales[:rows],
@@ -294,7 +287,7 @@ def _run_mxfp4_form(args, profile, form):
             candidate_output_lengths=candidate_lengths[:rows],
         )
 
-    def bind(rows, *, source=False):
+    def bind_args(rows, *, source=False):
         kwargs = dict(
             scratch=scratch,
             q_mxfp4=(native_source if source else native_q)[:rows],
@@ -317,8 +310,25 @@ def _run_mxfp4_form(args, profile, form):
                 candidate_indices=candidate_output[:rows],
                 candidate_lengths=candidate_lengths[:rows],
             )
-        return api.bind(plan, **kwargs)
+        return kwargs
 
+    def bind_publisher(rows):
+        return api.bind(source_plan, **publisher_args(rows))
+
+    def bind(rows, *, source=False):
+        return api.bind(plan, **bind_args(rows, source=source))
+
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    if reindex_form:
+        prepare_mxfp4(session, source_plan, q=source_q, keys=keys, slots=slots,
+                      arguments=publisher_args(rows_capacity))
+        api.run(bind_publisher(rows_capacity))
+    prepare_mxfp4(session, plan, q=source_q if source_form else q, keys=keys, slots=slots,
+                  arguments=bind_args(rows_capacity, source=source_form))
+    api.quantize_q_mxfp4(plan, q, q_mxfp4=native_q, q_scales=native_scales)
+    api.quantize_q_mxfp4(plan, source_q, q_mxfp4=native_source, q_scales=native_source_scales)
+    torch.testing.assert_close(native_q, packed, rtol=0, atol=0)
+    torch.testing.assert_close(native_scales, scales, rtol=0, atol=0)
     records = []
     # Resolve once at the fixed capacity.  Each later live-row binding is a view
     # over the same storage and reuses the frozen selected kernels.
@@ -330,7 +340,8 @@ def _run_mxfp4_form(args, profile, form):
     api.score(warm)
     api.select(warm)
     torch.cuda.synchronize(device)
-    freeze_kernel_resolution("DeepSeek profile benchmark fixed-capacity graph replay")
+    session.freeze()
+    graphs = {}
     try:
         for live_context, visible in zip(args.contexts, live_contexts, strict=True):
             lengths.fill_(visible)
@@ -585,8 +596,12 @@ def _run_mxfp4_form(args, profile, form):
                     "Input weights, empty row and partial visible prefix changed under captured execution and independently checked."
                 )
                 records[-1]["high_pid_qualified"] = args.high_pid
+                for graph in graphs.values():
+                    graph.reset()
     finally:
-        unfreeze_kernel_resolution()
+        for graph in graphs.values():
+            graph.reset()
+        session.close()
     return records
 
 
@@ -644,10 +659,10 @@ def _run_v4_c4(args, profile, form):
     active = torch.full((1,), capacity, dtype=torch.int32, device=device)
     lengths = torch.full((rows_capacity,), max_live, dtype=torch.int32, device=device)
     out = torch.empty((rows_capacity, form.topk), dtype=torch.int32, device=device)
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
     plans, workspaces = {}, {}
     for rows in args.rows:
-        plan = api.plan(
-            api.Caps(
+        caps = api.Caps(
                 device=device,
                 num_q_heads=form.heads,
                 max_q_rows=rows,
@@ -655,11 +670,27 @@ def _run_v4_c4(args, profile, form):
                 topk=form.topk,
                 mode="prefill" if args.mode == "extend" else args.mode,
                 cache_format="fp8",
-            )
         )
+        tensors = dict(q_fp8=q[:rows], query_weights=weights[:rows], index_k_cache=pool,
+                       page_table=table[:rows] if args.mode == "decode" else table,
+                       cache_lengths=lengths[:rows], active_width=active, output_indices=out[:rows])
+        plan = api.plan(caps, invocation=api.invocation_from_tensors(caps, **tensors))
+        def prepare(state):
+            scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                            for spec in state.layout.scratch_specs())
+            trial_output = torch.empty_like(out[:rows])
+            binding = state.bind(scratch=scratch, real_page_table=tensors["page_table"],
+                                 cache_seqlens_int32=tensors["cache_lengths"], active_width=active,
+                                 expected_num_q_heads=form.heads,
+                                 shared_page_table=plan.query.shared_page_table,
+                                 output_physical_slots=False)
+            return PreparedCall(run=lambda: state.run(binding, q_fp8=tensors["q_fp8"],
+                                query_weights=tensors["query_weights"], index_k_cache=pool,
+                                output_indices=trial_output), owners=(scratch, binding, trial_output))
+        session.prepare((plan.request(name="fp8-indexer", prepare_call=prepare),))
         scratch = tuple(
-            torch.empty(shape, dtype=dtype, device=device)
-            for shape, dtype in plan.shapes_and_dtypes()
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in plan.scratch_specs()
         )
         plans[rows], workspaces[rows] = plan, scratch
         warm = api.bind(
@@ -676,7 +707,8 @@ def _run_v4_c4(args, profile, form):
         api.run(warm)
     records = []
     torch.cuda.synchronize(device)
-    freeze_kernel_resolution("DeepSeek V4 C4 declared capture plans prewarmed")
+    session.freeze()
+    graph = torch.cuda.CUDAGraph()
     try:
         for live_context, visible in zip(args.contexts, live_contexts, strict=True):
             lengths.fill_(visible)
@@ -783,11 +815,13 @@ def _run_v4_c4(args, profile, form):
                 )
                 records[-1]["planned_row_capacity"] = rows
                 records[-1]["planning_contract"] = (
-                    "one prewarmed plan per declared capture shape"
+                    "one prepared plan per declared capture shape"
                 )
                 records[-1]["high_pid_qualified"] = args.high_pid
+                graph.reset()
     finally:
-        unfreeze_kernel_resolution()
+        graph.reset()
+        session.close()
     return records
 
 

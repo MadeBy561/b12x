@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import functools
+from b12x._lib.program_cache import program_cache
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -34,7 +34,7 @@ def _align_up(x: int, alignment: int = _ALIGN) -> int:
     return _ceil_div(x, alignment) * alignment
 
 
-@functools.cache
+@program_cache
 def _layout(
     max_tokens: int, num_topk: int, k: int, n: int
 ) -> dict[str, tuple[int, int]]:
@@ -228,7 +228,7 @@ class _DirectW4A8CompactLaunch:
         )
 
 
-@functools.cache
+@program_cache
 def _compiled_direct_w4a8_compact(
     device_index: int,
     max_tokens: int,
@@ -341,6 +341,9 @@ def launch_w4a8_compact_micro(
     num_topk: int,
     swiglu_limit: float | None,
     fast_math: bool,
+    _prepared_kernel=None,
+    _prepared_quantize=None,
+    _sm_count: int | None = None,
 ) -> torch.Tensor:
     """Run quantized projections, routed activation, and direct FC2 from fixed scratch."""
     if a.dtype != torch.bfloat16 or a.ndim != 2 or not a.is_contiguous():
@@ -380,9 +383,12 @@ def launch_w4a8_compact_micro(
     intermediate = region("intermediate")
     projections = region("projections")
     route = region("route_output").view(torch.bfloat16).view(cap * num_topk, k)
-    quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
+    if _prepared_quantize is None:
+        quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
+    else:
+        _prepared_quantize(a, values, scale_rows, scale_mma)
 
-    compiled = _compiled_direct_w4a8_compact(
+    compiled = _prepared_kernel or _compiled_direct_w4a8_compact(
         int(a.device.index or 0),
         cap,
         int(num_topk),
@@ -418,7 +424,7 @@ def launch_w4a8_compact_micro(
         _ptr(cutlass.Float32, alpha2),
         _ptr(cutlass.Float32, down_scale),
         num_tokens * int(num_topk),
-        get_num_sm(a.device),
+        get_num_sm(a.device) if _sm_count is None else _sm_count,
         current_cuda_stream(),
     )
     return route.narrow(0, 0, num_tokens * int(num_topk))

@@ -7,10 +7,11 @@ import pytest
 import torch
 
 from benchmarks.common import require_sm120
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 from b12x.norm import mhc
 
-from .test_mhc import _lagged_reference, _make_inputs, _mhc_pre_reference, _mhc_post_reference
+from .test_mhc_lagged import _lagged_reference
+from b12x.testing.mhc import make_inputs as _make_inputs, pre_reference as _mhc_pre_reference, post_reference as _mhc_post_reference
+from ._mhc import declaration, prepare, bind, mhc_session
 
 
 T = TypeVar("T")
@@ -26,38 +27,6 @@ def _source_reference(call: Callable[[], T]) -> T:
         return call()
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
-
-
-def _lagged_binding(
-    *,
-    tokens: int,
-    hidden_size: int,
-    device: torch.device,
-    pre_out: torch.Tensor,
-    y: torch.Tensor | None = None,
-) -> object:
-    plan = mhc.plan(mhc.Caps(
-        device=device, max_tokens=tokens, hidden_size=hidden_size
-    ))
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
-    return mhc.bind(
-        plan,
-        scratch=scratch,
-        tokens=tokens,
-        expected_m=tokens,
-        y=(
-            torch.empty((tokens, hidden_size), dtype=torch.bfloat16, device=device)
-            if y is None
-            else y
-        ),
-        post=torch.empty((tokens, 4), dtype=torch.float32, device=device),
-        comb=torch.empty((tokens, 4, 4), dtype=torch.float32, device=device),
-        out=torch.empty((tokens, 4, hidden_size), dtype=torch.bfloat16, device=device),
-        pre_out=pre_out,
-    )
 
 
 def _poison(binding: object) -> None:
@@ -96,7 +65,7 @@ def _nonuniform_mix(rows: int, device: torch.device) -> torch.Tensor:
     return base + row * slope
 
 
-def test_mhc_lagged_parallel_rejects_y_output_alias() -> None:
+def test_mhc_lagged_parallel_rejects_y_output_alias(mhc_session) -> None:
     """The producer writes y before consumers finish reading the residual."""
     device = require_sm120()
     hidden = 5120
@@ -107,13 +76,9 @@ def test_mhc_lagged_parallel_rejects_y_output_alias() -> None:
     pre_out = torch.empty_like(incoming)
     y_alias = residual[:, 0, :]
     assert y_alias.is_contiguous()
-    binding = _lagged_binding(
-        tokens=1,
-        hidden_size=hidden,
-        device=device,
-        pre_out=pre_out,
-        y=y_alias,
-    )
+    options = dict(pre_mix=incoming, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    plan = prepare(mhc_session, "pre", (residual, fn, scale, bias), options)
+    binding = bind(plan, pre_out=pre_out, y=y_alias)
     with pytest.raises(ValueError, match="must not alias"):
         mhc.run_pre(
             residual,
@@ -130,7 +95,7 @@ def test_mhc_lagged_parallel_rejects_y_output_alias() -> None:
 
 
 def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
-    request: pytest.FixtureRequest,
+    mhc_session,
 ) -> None:
     """Unbound prepared pre keeps its producer/finalizer mode across live rows."""
     device = require_sm120()
@@ -149,13 +114,17 @@ def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
     post_out = torch.empty((capacity, 4), dtype=torch.float32, device=device)
     comb_out = torch.empty((capacity, 4, 4), dtype=torch.float32, device=device)
 
+    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
+                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    plan = prepare(mhc_session, "pre", (residual, fn, scale, bias), options)
+
     def run(live: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return mhc.run_pre(
             residual[:live],
             fn,
             scale,
             bias,
-            residual_out=residual_out[:live],
+            plan=plan, residual_out=residual_out[:live],
             y_out=y_out[:live],
             post_out=post_out[:live],
             comb_out=comb_out[:live],
@@ -173,8 +142,7 @@ def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
         actual, pre_out[:3], residual[:3], fn, scale, bias, incoming[:3], weight
     )
     torch.cuda.synchronize(device)
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("unbound lagged pre fixed capacity mode")
+    mhc_session.freeze()
 
     actual = run(capacity)
     _assert_lagged_outputs(
@@ -191,7 +159,7 @@ def test_mhc_lagged_pre_unbound_frozen_capacity_mode(
 
 @pytest.mark.parametrize("phase", ["pre", "post_pre"])
 def test_mhc_lagged_parallel_decode_frozen_live_graph(
-    phase: str, request: pytest.FixtureRequest
+    phase: str, mhc_session
 ) -> None:
     """Lagged decode consumes freshly produced BF16 collapse statistics on replay."""
     device = require_sm120()
@@ -207,13 +175,6 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
     weight = torch.linspace(0.5, 1.5, hidden, device=device).bfloat16()
     incoming = _nonuniform_mix(capacity, device)
     pre_out = torch.full_like(incoming, float("nan"))
-    binding = _lagged_binding(
-        tokens=capacity,
-        hidden_size=hidden,
-        device=device,
-        pre_out=pre_out,
-    )
-
     prev_y, prev_post, prev_comb = _source_reference(
         lambda: _mhc_pre_reference(
             residual, fn, scale, bias, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20
@@ -221,6 +182,12 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
     )
     del prev_y
     prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
+
+    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
+                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    args = (residual, fn, scale, bias) if phase == "pre" else (x, residual, prev_post, prev_comb, fn, scale, bias)
+    plan = prepare(mhc_session, phase, args, options)
+    binding = bind(plan, pre_out=pre_out)
 
     def run(live: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if phase == "pre":
@@ -235,13 +202,12 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
             rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
         )
 
-    # All live counts must be resolved before the fixed-resolution capture path.
+    # One prepared capacity accepts every live decode count.
     for live in (1, 2, 4, 8):
         _poison(binding)
         run(live)
     torch.cuda.synchronize(device)
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("lagged parallel decode regression")
+    mhc_session.freeze()
 
     for live in (1, 2, 4, 8):
         _poison(binding)
@@ -286,48 +252,41 @@ def test_mhc_lagged_parallel_decode_frozen_live_graph(
             incoming[:live], weight,
         )
 
+        graph.reset()
 
 
 def test_mhc_lagged_post_pre_static_split_reuses_frozen_capacity(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+    mhc_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A planned split producer and finalizer agree below the planned capacity."""
-    from b12x.norm.mhc import _kernels
+    from b12x.norm.mhc._preparation import _lower_native
 
     device = require_sm120()
     hidden, capacity = 4096, 8
-    select_decode_split = _kernels._selected_post_pre_decode_split_n
-
-    def select_sm121_decode_split(
-        *, num_tokens: int, hidden_size: int, compute_capability: tuple[int, int] | None = None
-    ) -> tuple[int, int]:
-        return select_decode_split(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            compute_capability=(12, 1),
-        )
-
-    monkeypatch.setattr(
-        _kernels, "_selected_post_pre_decode_split_n", select_sm121_decode_split
-    )
     residual, x, fn, scale, bias = _make_inputs(
         tokens=capacity, hidden_size=hidden, seed=923_102, device=device
     )
     incoming = _nonuniform_mix(capacity, device)
     weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
     pre_out = torch.full_like(incoming, float("nan"))
-    binding = _lagged_binding(
-        tokens=capacity,
-        hidden_size=hidden,
-        device=device,
-        pre_out=pre_out,
-    )
     _, prev_post, prev_comb = _source_reference(
         lambda: _mhc_pre_reference(
             residual, fn, scale, bias, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20
         )
     )
     prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
+
+    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
+                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    args = (x, residual, prev_post, prev_comb, fn, scale, bias)
+    with monkeypatch.context() as controls:
+        controls.setenv("B12X_MHC_DECODE_SPLITS", "4")
+        controls.setenv("B12X_MHC_DECODE_TILE_N", "6")
+        plan = declaration("post_pre", args, options, lagged_prepare=False)
+    plan = prepare(mhc_session, "post_pre", args, options, plan=plan)
+    native = _lower_native(plan.query, plan.prepared.selection.config, plan.prepared.device)
+    assert native.source_splits == 4 and native.decode_tile_n == 6
+    binding = bind(plan, pre_out=pre_out)
 
     def run(live: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return mhc.run_post_pre(
@@ -351,8 +310,7 @@ def test_mhc_lagged_post_pre_static_split_reuses_frozen_capacity(
     _poison(binding)
     run(capacity)
     torch.cuda.synchronize(device)
-    request.addfinalizer(unfreeze_kernel_resolution)
-    freeze_kernel_resolution("lagged post_pre static split capacity reuse")
+    mhc_session.freeze()
 
     _poison(binding)
     binding.pre_out.fill_(float("nan"))

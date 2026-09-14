@@ -204,10 +204,31 @@ class DiskRowCache:
         self._ids_ready = torch.cuda.Event()
         self._cache_done = torch.cuda.Event()
         self._cache_used = False
+        self._closed = False
+
+    def _require_open(self):
+        if self._closed:
+            raise RuntimeError("disk row cache is closed")
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            if self._transaction_thread is not None:
+                raise RuntimeError("cannot close a disk row cache during a transaction")
+            if self._cache_used:
+                with torch.cuda.device(self.device):
+                    self._cache_done.synchronize()
+            for allocation in (self._scale_allocation, self._weight_allocation):
+                if allocation is not None:
+                    allocation.close()
+            self._reader = self._native = None
+            self._closed = True
 
     def add_shard(
         self, shard_index: int, path: str, offset: int, *, scale: bool = False
     ) -> None:
+        self._require_open()
         with self._lock:
             if self._frozen:
                 raise RuntimeError("cannot change disk shards after binding")
@@ -232,6 +253,7 @@ class DiskRowCache:
             self._sources.add(key)
 
     def require_complete(self) -> None:
+        self._require_open()
         with self._lock:
             first = self.shard_start // self.shard_rows
             last = (self.shard_end + self.shard_rows - 1) // self.shard_rows
@@ -248,6 +270,7 @@ class DiskRowCache:
 
     @contextmanager
     def transaction(self) -> Iterator[DiskRowCache]:
+        self._require_open()
         if torch.compiler.is_compiling():
             raise RuntimeError("disk table preparation cannot run under torch.compile")
         with torch.cuda.device(self.device):
@@ -307,6 +330,7 @@ class DiskRowCache:
             )
 
     def stats(self) -> dict[str, int | float]:
+        self._require_open()
         with self._lock:
             result = dict(self._native.ple_reader_stats(self._reader))
             result["ids_host_bytes"] = (

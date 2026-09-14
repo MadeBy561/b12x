@@ -27,6 +27,25 @@ from b12x.gemm._shared.wo_mxfp8 import (
 from ..conftest import require_b12x
 
 
+def test_regime_plan_combines_static_shapes_with_dynamic_capacity() -> None:
+    query = blockscaled.BlockscaledQuery(
+        recipe="mxfp8",
+        num_tokens=128,
+        in_features=128,
+        padded_in_features=128,
+        out_features=64,
+        expected_m=None,
+    )
+
+    plan = blockscaled.plan_regimes(query, exact_m=(1, 2, 4, 8))
+
+    assert plan.token_counts == (1, 2, 4, 8, 128)
+    assert dict(plan.capacity_metadata) == {
+        "max_rows": 128,
+        "exact_m": (1, 2, 4, 8),
+    }
+
+
 def _quantize_mxfp4_rows(
     source: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -522,3 +541,37 @@ def test_blockscaled_public_surface_and_compatibility_aliases() -> None:
     assert tensor_fp8_linear.prewarm is blockscaled.prewarm
     assert not hasattr(blockscaled, "mm_fused_quant_a")
     assert not hasattr(blockscaled, "mm_fused_quant_a_grouped")
+
+
+def test_nvfp4_a16_preserves_logical_k_inside_padded_weight() -> None:
+    from dataclasses import replace
+
+    device = require_b12x()
+    m, n, logical_k, stored_k = 4, 128, 136, 256
+    source = torch.randn((m, logical_k), dtype=torch.bfloat16, device=device)
+    codes = torch.randint(0, 256, (n, stored_k // 2), dtype=torch.uint8, device=device)
+    scales = torch.full(
+        (n, stored_k // 16), 0.5, dtype=torch.float8_e4m3fn, device=device
+    )
+    gain = torch.tensor([0.03125], dtype=torch.float32, device=device)
+    weight = blockscaled.pack_weight(
+        codes,
+        swizzle_block_scale(scales),
+        recipe="nvfp4",
+        global_scale=gain,
+    )
+    weight = replace(weight, in_features=logical_k)
+    output = blockscaled.mm(source, weight, mode="a16", _config=(64, 64, 2))
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=device,
+    )
+    decoded = torch.stack(
+        (lut[(codes & 15).long()], lut[(codes >> 4).long()]), -1
+    ).flatten(-2)
+    expected = source.float() @ (decoded[:, :logical_k] * 0.5 * gain).T
+    cosine = torch.nn.functional.cosine_similarity(
+        output.float().flatten(), expected.flatten(), dim=0
+    )
+    assert cosine.item() >= 0.999

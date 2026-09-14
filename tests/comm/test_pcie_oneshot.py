@@ -454,7 +454,7 @@ def test_prepare_plain_graph_all_reduce_retains_immutable_plan(monkeypatch) -> N
     backend._states[7] = state
     inp = torch.empty((6, 4096), dtype=torch.bfloat16)
 
-    backend.prepare_all_reduce(7, inp)
+    backend._prepare_all_reduce(7, inp)
 
     key = backend._plain_graph_plan_key(inp)
     plan = state.plain_graph_plans[key]

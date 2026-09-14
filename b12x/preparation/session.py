@@ -1,0 +1,1337 @@
+"""One serial preparation lifecycle with cooperative compilation and tuning.
+
+The session fills each plan's prepared slot in place. Plans that are already
+prepared are skipped, so a later batch is incremental. Candidate races are
+timed in bounded batches; the running best candidate is carried into every
+later batch so each candidate is compared head to head with it.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections.abc import Mapping
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from b12x._lib.compile_plan import (
+    compiled_program_available, observe_programs, retain_compiled_programs,
+)
+from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in_process
+from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
+from ._cache import SelectionCache, cache_identity, digest
+from ._measurement import SURVIVOR_ROUNDS
+from .device import DetectedDevice, detect_device
+from .types import (
+    CollectiveRequirement, FrozenMapping, MemoryRequirements, Plan,
+    PreparationProgress, PreparationRequest, PreparationResult, PreparedCall,
+    Selection, TuningRequirement, _CompositePlan, _Prepared, _close_all,
+    _plan_scope, _prime, _set_lazy_preparer, call_scope,
+)
+
+logger = logging.getLogger("b12x.preparation")
+
+
+@dataclass
+class _Obligation:
+    request: PreparationRequest
+    configuration: object
+    candidates: list = field(default_factory=list)
+    coverage: dict = field(default_factory=dict)
+    selection: Selection | None = None
+    key: str | None = None
+    programs: dict = field(default_factory=dict)
+    compiled: dict = field(default_factory=dict)
+    compile_assignments: dict = field(default_factory=dict)
+    cache_pending: bool = False
+    ready: bool = False
+
+
+class _CallGuard:
+    """Run a prepared call's restore and close callbacks at most once each."""
+
+    def __init__(self, call):
+        if not isinstance(call, PreparedCall):
+            raise TypeError("call factory must return PreparedCall")
+        self.call = call
+        self._restored = self._closed = False
+
+    def restore(self):
+        if not self._restored:
+            self._restored = True
+            if self.call.restore is not None:
+                with call_scope():
+                    self.call.restore()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            if self.call.close is not None:
+                self.call.close()
+
+    def finish(self):
+        _close_all((self.restore, self.close))
+
+
+@dataclass
+class _Trial:
+    index: int
+    assignment: object
+    config: object
+    call: PreparedCall
+    guard: _CallGuard
+    retained: object
+    state: object
+    resident: int
+    latency_us: float | None = None
+
+    def close(self):
+        self.guard.finish()
+
+
+# Metadata steps carry no signal, so this bounds how long one advance() call
+# withholds progress reporting and collective coordination from the caller.
+_ADVANCE_SECONDS = 0.1
+
+
+def _declaration_key(plan):
+    if isinstance(plan, _CompositePlan):
+        return (
+            plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
+            tuple((count, _declaration_key(child)) for count, child in plan.variants.items()),
+        )
+    contract = plan.contract
+    return (
+        contract.component_id, contract.query_schema_version, contract.config_schema_version,
+        contract.semantic_version, contract.candidate_contract_version,
+        FrozenMapping(contract.encode_query(plan.query)), plan.invocation,
+        None if plan.override is None else contract.config_payload(plan.override),
+        plan._device,
+    )
+
+
+def _topological(requests):
+    by_name = {}
+    for request in requests:
+        if not isinstance(request, PreparationRequest):
+            raise TypeError("preparation batches contain PreparationRequest values")
+        if request.name in by_name:
+            raise ValueError(f"duplicate preparation name {request.name!r}")
+        by_name[request.name] = request
+    missing = {name for request in requests for name in request.dependencies} - by_name.keys()
+    if missing:
+        raise ValueError(f"unknown preparation dependencies: {sorted(missing)}")
+    ordered, visiting, visited = [], set(), set()
+
+    def visit(name):
+        if name in visiting:
+            raise ValueError("preparation dependencies contain a cycle")
+        if name in visited:
+            return
+        visiting.add(name)
+        for dependency in by_name[name].dependencies:
+            visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(by_name[name])
+
+    for name in by_name:
+        visit(name)
+    return ordered
+
+
+def _child_requests(request):
+    plan = request.plan
+    return {
+        count: child.request(
+            name=f"{request.name}/m{count}",
+            prepare_call=request.prepare_call[count],
+            benchmark_call=None if request.benchmark_call is None else request.benchmark_call[count],
+            dependencies=request.dependencies, collective=request.collective,
+            retain_benchmark_call=request.retain_benchmark_call,
+        )
+        for count, child in plan.variants.items()
+    }
+
+
+def _expand_requests(requests):
+    requests = list(_topological(requests))
+    expanded, composites = [], {}
+    for request in requests:
+        if request.plan.shared and (request.dependencies or request.collective is not None):
+            raise ValueError(f"shared plan {request.name!r} cannot declare dependencies or collectives")
+        if isinstance(request.plan, _CompositePlan):
+            children = _child_requests(request)
+            composites[request.name] = (request, children)
+            expanded.extend(children.values())
+        else:
+            expanded.append(request)
+
+    from dataclasses import replace
+
+    normalized = []
+    for request in expanded:
+        dependencies = []
+        for name in request.dependencies:
+            if name in composites:
+                dependencies.extend(child.name for child in composites[name][1].values())
+            else:
+                dependencies.append(name)
+        normalized.append(replace(request, dependencies=tuple(dict.fromkeys(dependencies))))
+    return _topological(normalized), composites
+
+
+def _plans_of(request):
+    plan = request.plan
+    if isinstance(plan, _CompositePlan):
+        return (plan, *plan.variants.values())
+    return (plan,)
+
+
+class PreparationSession:
+    def __init__(
+        self, *, device=None, autotune=True, cache_dir=None, namespace=None,
+        compile_workers=8, rounds=SURVIVOR_ROUNDS, samples=8, cache_only=False,
+        race_batch=32, race_budget=None,
+    ):
+        for name, value in (
+            ("compile_workers", compile_workers), ("rounds", rounds), ("samples", samples),
+            ("race_batch", race_batch),
+        ):
+            minimum = 0 if name == "compile_workers" else 1
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"{name} must be an integer of at least {minimum}")
+        if race_budget is not None and (type(race_budget) is not int or race_budget <= 0):
+            raise ValueError("race_budget must be a positive byte count or None")
+        if type(autotune) is not bool or type(cache_only) is not bool:
+            raise TypeError("autotune and cache_only must be boolean")
+        self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
+        self.autotune, self.cache_only = autotune, cache_only
+        self.compile_workers, self.rounds, self.samples = compile_workers, rounds, samples
+        self.race_batch, self.race_budget = race_batch, race_budget
+        self.namespace = FrozenMapping(namespace or {})
+        self.cache_dir = None if cache_dir is None else Path(cache_dir)
+        self._cache = None
+        self._stop = threading.Event()
+        self._thread = threading.get_ident()
+        self._pool = None
+        self._job = None
+        self._plans = []
+        self._shared = {}
+        self._guard = None
+        self._tuning_rank = 0
+        self._tuning_ranks = (0,)
+        self.state = "OPEN"
+
+    def configure_tuning_shard(self, rank: int, ranks: tuple[int, ...]) -> None:
+        """Assign this process a disjoint share of non-collective candidates."""
+        self._check_thread()
+        if self._job is not None:
+            raise RuntimeError("cannot change tuning ranks during preparation")
+        ranks = tuple(ranks)
+        if (
+            type(rank) is not int
+            or rank < 0
+            or not ranks
+            or any(type(item) is not int or item < 0 for item in ranks)
+            or ranks != tuple(sorted(set(ranks)))
+            or rank not in ranks
+        ):
+            raise ValueError(
+                "tuning ranks must be sorted, unique, and include this rank"
+            )
+        self._tuning_rank = rank
+        self._tuning_ranks = ranks
+
+    def _check_thread(self):
+        if threading.get_ident() != self._thread:
+            raise RuntimeError("only cancel_tuning may run on another thread")
+        if self.state == "CLOSED":
+            raise RuntimeError("preparation session is closed")
+
+    def _selection_cache(self):
+        if self._cache is None:
+            if self.device.ordinal is None:
+                raise RuntimeError("selection caching requires a CUDA device")
+            root = self.cache_dir
+            if root is None:
+                from b12x._lib.compiler import _cute_compile_cache_dir
+                root = _cute_compile_cache_dir() / "preparation"
+            self._cache = SelectionCache(root, cache_identity(self.namespace.to_dict(), self.device.ordinal))
+        return self._cache
+
+    def _gpu_scope(self):
+        if self.device.ordinal is None:
+            return nullcontext()
+        import torch
+        return torch.cuda.device(self.device.ordinal)
+
+    def _synchronize(self):
+        if self.device.ordinal is not None:
+            import torch
+            torch.cuda.synchronize(self.device.ordinal)
+
+    def _allocated(self):
+        if self.device.ordinal is None:
+            return 0
+        import torch
+        return int(torch.cuda.memory_allocated(self.device.ordinal))
+
+    def _race_budget(self):
+        if self.race_budget is not None:
+            return self.race_budget
+        if self.device.ordinal is None:
+            return None
+        import torch
+        free, _ = torch.cuda.mem_get_info(self.device.ordinal)
+        return max(int(free) // 2, 1)
+
+    def begin(self, requests, *, autotune=None):
+        self._check_thread()
+        if self._job is not None:
+            raise RuntimeError("one preparation job may be active")
+        if autotune is not None and type(autotune) is not bool:
+            raise TypeError("job autotune override must be boolean or None")
+        requests = tuple(requests)
+        _topological(requests)
+        if self.state == "FROZEN":
+            for request in requests:
+                if any(plan.prepared is None for plan in _plans_of(request)):
+                    raise KernelResolutionFrozenError("new preparation obligation after session freeze")
+        job = PreparationJob(
+            self,
+            requests,
+            autotune=self.autotune if autotune is None else autotune,
+        )
+        self._job = job
+        if self.state != "FROZEN":
+            self.state = "PREPARING"
+        return job
+
+    def prepare(
+        self, requests, *, coordinator=None, progress=None, autotune=None
+    ):
+        requests = tuple(requests)
+        if coordinator is None and any(request.collective is not None for request in requests):
+            raise ValueError("collective preparation requires a coordinator")
+        job = self.begin(requests, autotune=autotune)
+        authorization = None
+        while True:
+            state = job.advance(collective_key=authorization)
+            if progress is not None:
+                progress(state)
+            if state.done:
+                return job.result()
+            authorization = coordinator(state) if coordinator is not None else None
+            if state.pending_compilation and self._pool is not None:
+                self._pool.wait_for_progress()
+
+    def candidate_memory_envelope(self, requests):
+        """Return the largest scratch envelope across every legal config."""
+        self._check_thread()
+        if self._job is not None:
+            raise RuntimeError("cannot inspect memory while preparation is active")
+        expanded, _ = _expand_requests(tuple(requests))
+        requirements = []
+        for request in expanded:
+            plan = request.plan
+            configuration = plan.contract.configure(
+                plan.query,
+                device=self.device.identity,
+                override=plan.override,
+            )
+            if configuration.pinned is not None:
+                configs = (configuration.pinned,)
+            else:
+                configs = (
+                    configuration.default,
+                    *(config for _, config in plan.contract.iterate(configuration)),
+                )
+            seen = set()
+            for config in configs:
+                payload = plan.contract.config_payload(config)
+                if payload in seen:
+                    continue
+                seen.add(payload)
+                with _plan_scope(plan):
+                    requirements.append(
+                        plan._memory_requirements(config, self.device)
+                    )
+        return MemoryRequirements.sequential(requirements)
+
+    def cancel_tuning(self):
+        self._stop.set()
+        pool = self._pool
+        if pool is not None:
+            pool.wake()
+
+    def _compiler(self):
+        if self._pool is None:
+            if (
+                self.device.ordinal is None
+                or self.device.identity is None
+                or self.device.uuid is None
+                or self.device.max_shared_memory_per_block is None
+                or self.device.max_shared_memory_per_multiprocessor is None
+            ):
+                raise RuntimeError("kernel compilation requires a CUDA device")
+            self._pool = CompilePool(
+                device_ordinal=self.device.ordinal,
+                compute_capability=self.device.identity.compute_capability,
+                device_uuid=self.device.uuid,
+                product_name=self.device.identity.product_name,
+                sm_count=self.device.identity.sm_count,
+                max_shared_memory_per_block=self.device.max_shared_memory_per_block,
+                max_shared_memory_per_multiprocessor=(
+                    self.device.max_shared_memory_per_multiprocessor
+                ),
+                workers=self.compile_workers,
+            )
+        return self._pool
+
+    def _drain(self):
+        if self._pool is not None:
+            if self._stop.is_set():
+                self._pool.cancel_optional()
+            while self._pool.pending:
+                yield "compile"
+            summary = self._pool.summary()
+            self._pool.close()
+            self._pool = None
+            return summary
+        return None
+
+    def _release_payload(self, plan, prepared):
+        if plan in prepared.users:
+            prepared.users.remove(plan)
+        if plan._prepared is prepared:
+            plan._clear()
+        if plan in self._plans and plan._prepared is None:
+            self._plans.remove(plan)
+        if plan.shared:
+            key = _declaration_key(plan)
+            if self._shared.get(key) is plan:
+                self._shared.pop(key)
+        if prepared.users or prepared.closed:
+            return
+        prepared.closed = True
+        closers, prepared.closers = prepared.closers, ()
+        try:
+            _close_all(closers)
+        finally:
+            prepared.retained = None
+            prepared.state = None
+            prepared.owners = ()
+
+    def release(self, plan):
+        """Drop a plan's prepared state; destroy graphs that replay it first."""
+        self._check_thread()
+        if self._job is not None:
+            raise RuntimeError("cannot release resources during preparation")
+        prepared = plan._prepared
+        if prepared is None:
+            return
+        if isinstance(plan, _CompositePlan):
+            self._release_payload(plan, prepared)
+            for child in plan.variants.values():
+                self.release(child)
+        else:
+            self._release_payload(plan, prepared)
+
+    @contextmanager
+    def capture(self):
+        """Refuse kernel resolution for the duration of a CUDA graph capture."""
+        self._check_thread()
+        if self._job is not None or self._pool is not None:
+            raise RuntimeError("capture requires drained preparation")
+        with kernel_resolution_guard("prepared CUDA graph capture"):
+            yield
+
+    def freeze(self):
+        self._check_thread()
+        if self._job is not None or self._pool is not None:
+            raise RuntimeError("freeze requires drained preparation")
+        if self._guard is None:
+            self._guard = kernel_resolution_guard("prepared serving session")
+            self._guard.__enter__()
+        self.state = "FROZEN"
+
+    def close(self):
+        if self.state == "CLOSED":
+            return
+        self._check_thread()
+        closers = []
+        if self._job is not None:
+            closers.append(self._job.close)
+        if self._pool is not None:
+            pool, self._pool = self._pool, None
+            pool.cancel_optional()
+            closers.append(pool.close)
+        for plan in reversed(tuple(self._plans)):
+            prepared = plan._prepared
+            if prepared is not None:
+                closers.append(lambda plan=plan, prepared=prepared: self._release_payload(plan, prepared))
+        if self._guard is not None:
+            guard, self._guard = self._guard, None
+            closers.append(lambda: guard.__exit__(None, None, None))
+        self.state = "CLOSED"
+        _close_all(closers)
+        self._plans.clear()
+        self._shared.clear()
+
+    def __enter__(self):
+        self._check_thread()
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        try:
+            self.close()
+        except BaseException as error:
+            if value is None:
+                raise
+            value.add_note(f"session cleanup failed: {error!r}")
+
+
+class PreparationJob:
+    def __init__(self, session, requests, *, autotune):
+        self.session, self.requests = session, requests
+        self.autotune = autotune
+        self._steps = self._run()
+        self._blocked = None
+        self._result = None
+        self._error = None
+        self._closed = False
+        self._temporaries = []
+        self._new_plans = []
+        self._benchmark_closers = []
+        self._cache_hits = self._benchmarked = self._overlaps = 0
+        self._all_programs = set()
+        self._dependency_programs = {}
+        self._coverage = {}
+        self._benchmark_calls = {}
+        self._plans_by_name = {}
+        self._started = time.monotonic()
+        self._phase = "planning"
+        self._active_request = None
+        self._total_requests = len(requests)
+        self._completed_requests = 0
+        self._candidate_count = self._candidates_prepared = 0
+        self._candidate_sharded = False
+        self._completed_rounds = self._total_rounds = self._active_count = 0
+        self._latest_round_us = ()
+        self._compilations = 0
+        self._stack_limit = None
+        if session.device.ordinal is not None:
+            from b12x._lib.program_cache import stack_limit_bytes
+            with session._gpu_scope():
+                self._stack_limit = stack_limit_bytes()
+
+    def _progress(
+        self,
+        running,
+        pending_compilation,
+        ready_collectives,
+        done,
+        ready_tuning=(),
+    ):
+        active_compilations = 0
+        if self.session._pool is not None:
+            summary = self.session._pool.summary()
+            self._compilations = summary.cute_compilations + summary.triton_compilations
+            active_compilations = self.session._pool.active_compilations
+        phase = (
+            "ready" if done else "waiting for ranks" if ready_collectives or ready_tuning
+            else "compiling" if pending_compilation else self._phase
+        )
+        request = self._active_request
+        return PreparationProgress(
+            running, pending_compilation, ready_collectives, done,
+            phase=phase, component_id="" if request is None else request.plan.component_id,
+            request_name="" if request is None else request.name,
+            completed_requests=self._completed_requests, total_requests=self._total_requests,
+            candidate_count=self._candidate_count, candidates_prepared=self._candidates_prepared,
+            measured_candidates=self._benchmarked, completed_rounds=self._completed_rounds,
+            total_rounds=self._total_rounds if phase == "autotuning" else 0,
+            active_count=self._active_count,
+            latest_round_us=self._latest_round_us, cache_hits=self._cache_hits,
+            compilations=self._compilations, active_compilations=active_compilations,
+            elapsed_seconds=time.monotonic() - self._started,
+            tuning_stopped=self.session._stop.is_set(),
+            ready_tuning=tuple(ready_tuning),
+            candidate_sharded=self._candidate_sharded,
+        )
+
+    def advance(self, *, collective_key=None, tuning=None):
+        self.session._check_thread()
+        if self._error is not None:
+            raise self._error
+        if self._result is not None:
+            return self._progress(False, False, (), True)
+        if self._closed:
+            raise RuntimeError("preparation job is closed")
+        if self.session._stop.is_set() and self.session._pool is not None:
+            self.session._pool.cancel_optional()
+        send_value = None
+        if isinstance(self._blocked, CollectiveRequirement):
+            if collective_key != self._blocked.key:
+                return self._progress(False, False, (self._blocked,), False)
+            self._blocked = None
+        elif isinstance(self._blocked, TuningRequirement):
+            if tuning is None:
+                return self._progress(False, False, (), False, (self._blocked,))
+            if (
+                not isinstance(tuning, TuningRequirement)
+                or tuning.key != self._blocked.key
+                or tuning.ranks != self._blocked.ranks
+                or tuning.assignment is None
+            ):
+                raise ValueError("tuning authorization does not match ready work")
+            self._blocked = None
+            send_value = tuning
+        elif collective_key is not None:
+            raise ValueError("collective authorization does not match ready work")
+        elif tuning is not None:
+            raise ValueError("tuning authorization does not match ready work")
+        try:
+            deadline = time.monotonic() + _ADVANCE_SECONDS
+            while True:
+                signal = self._steps.send(send_value)
+                send_value = None
+                if isinstance(signal, CollectiveRequirement):
+                    self._blocked = signal
+                    return self._progress(False, False, (signal,), False)
+                if isinstance(signal, TuningRequirement):
+                    self._blocked = signal
+                    return self._progress(False, False, (), False, (signal,))
+                if signal == "compile":
+                    return self._progress(False, True, (), False)
+                if signal == "gpu":
+                    return self._progress(True, False, (), False)
+                if time.monotonic() >= deadline:
+                    break
+        except StopIteration as finished:
+            self._result = finished.value
+            self.session._job = None
+            if self.session.state != "FROZEN":
+                self.session.state = "READY"
+            return self._progress(False, False, (), True)
+        except BaseException as error:
+            self._error = error
+            try:
+                self.close()
+            except BaseException as cleanup:
+                error.add_note(f"job cleanup failed: {cleanup!r}")
+            raise
+        return self._progress(True, False, (), False)
+
+    def result(self):
+        if self._error is not None:
+            raise self._error
+        if self._result is None:
+            raise RuntimeError("preparation is not complete")
+        return self._result
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        closers = [self._steps.close, *reversed(self._temporaries)]
+        self._temporaries.clear()
+        if self._result is None:
+            closers.extend(reversed(self._benchmark_closers))
+            self._benchmark_closers.clear()
+            for plan in reversed(self._new_plans):
+                prepared = plan._prepared
+                if prepared is not None:
+                    closers.append(
+                        lambda plan=plan, prepared=prepared: self.session._release_payload(plan, prepared)
+                    )
+        if self.session._pool is not None:
+            pool, self.session._pool = self.session._pool, None
+            pool.cancel_optional()
+            closers.append(lambda: pool.close(terminate=self._error is not None))
+        self.session._job = None
+        _close_all(closers)
+
+    def _choice_key(self, obligation, selections):
+        request, configuration = obligation.request, obligation.configuration
+        dependencies = []
+        for name in request.dependencies:
+            if name not in selections:
+                return None
+            selection, contract = selections[name]
+            dependencies.append({
+                "component": selection.component_id, "query": selection.query.to_dict(),
+                "config": contract.config_payload(selection.config).to_dict(),
+                "semantic_version": contract.semantic_version,
+            })
+        contract = request.plan.contract
+        return digest({
+            "component": contract.component_id,
+            "query_schema": contract.query_schema_version,
+            "config_schema": contract.config_schema_version,
+            "semantic_version": contract.semantic_version,
+            "candidate_contract_version": contract.candidate_contract_version,
+            "query": configuration.encoded_query.to_dict(),
+            "invocation": request.plan.invocation.to_dict(),
+            "pin": None if configuration.pinned is None else contract.config_payload(configuration.pinned).to_dict(),
+            "dependencies": dependencies,
+        })
+
+    def _selection(self, obligation, config, source, assignment=None):
+        return Selection(
+            obligation.request.plan.component_id, obligation.configuration.encoded_query,
+            config, source, assignment,
+        )
+
+    def _lookup(self, obligation, selections):
+        if obligation.selection is not None:
+            return
+        obligation.key = self._choice_key(obligation, selections)
+        if obligation.key is None:
+            return
+        cache = self.session._selection_cache()
+        record = cache.get(obligation.key)
+        if record is None:
+            return
+        configuration, contract = obligation.configuration, obligation.request.plan.contract
+        assignment = FrozenMapping(record["assignment"])
+        configuration.space.validate(assignment)
+        config = contract._lower(configuration.query, configuration.device, assignment)
+        if contract.config_payload(config) != record["config"]:
+            raise ValueError("cached assignment no longer lowers to its saved config")
+        obligation.selection = self._selection(obligation, config, "cached", assignment)
+        obligation.coverage = dict(record["coverage"])
+        self._cache_hits += 1
+
+    def _alias_shared(self, obligation):
+        """Install an equal shared declaration's payload; True when aliased."""
+        plan = obligation.request.plan
+        if not plan.shared:
+            return False
+        owner = self.session._shared.get(_declaration_key(plan))
+        if owner is None or owner is plan or owner.prepared is None:
+            return False
+        prepared = owner.prepared
+        prepared.users.append(plan)
+        plan._install(prepared)
+        if plan not in self.session._plans:
+            self.session._plans.append(plan)
+        self._new_plans.append(plan)
+        obligation.selection = prepared.selection
+        obligation.ready = True
+        return True
+
+    def _configure(self, requests):
+        obligations, settled, enumerations, requirements = [], {}, {}, []
+        for request in requests:
+            self._active_request = request
+            self._candidate_count = self._candidates_prepared = 0
+            self._candidate_sharded = False
+            plan = request.plan
+            caps_device = plan._device
+            if caps_device is None:
+                caps_device = getattr(plan.query, "device", None)
+            if caps_device is not None:
+                import torch
+                resolved = torch.device(caps_device)
+                if resolved.type != "cuda" or resolved.index != self.session.device.ordinal:
+                    raise ValueError("declaration and session devices differ")
+            configuration = plan.contract.configure(
+                plan.query, device=self.session.device.identity, override=plan.override,
+            )
+            obligation = _Obligation(request, configuration)
+            obligations.append(obligation)
+            prepared = plan.prepared
+            if (
+                prepared is not None
+                and (
+                    not self.autotune
+                    or self.session._stop.is_set()
+                    or prepared.selection.source != "default"
+                )
+            ):
+                obligation.selection = prepared.selection
+                obligation.ready = True
+            elif self._alias_shared(obligation):
+                pass
+            elif configuration.pinned is not None:
+                obligation.selection = self._selection(obligation, configuration.pinned, "override")
+            else:
+                single_product = all(len(knob.values) == 1 for knob in configuration.space.knobs)
+                if not single_product:
+                    self._lookup(obligation, settled)
+                if (obligation.selection is None and not single_product
+                        and not self.session.cache_only
+                        and (not self.autotune or self.session._stop.is_set())):
+                    obligation.selection = self._selection(obligation, configuration.default, "default")
+                if obligation.selection is None:
+                    declaration = _declaration_key(plan)
+                    enumerated = enumerations.get(declaration)
+                    # The candidate space is a function of the contract object and
+                    # the configuration, and two contract objects can share a key.
+                    if enumerated is not None and enumerated[0] is plan.contract:
+                        _, candidates, coverage = enumerated
+                        obligation.candidates.extend(candidates)
+                        complete = True
+                    else:
+                        iterator = plan.contract.iterate(configuration)
+                        while not iterator.done:
+                            if (not single_product and self.session._stop.is_set()
+                                    and not self.session.cache_only):
+                                break
+                            try:
+                                candidate = iterator.step()
+                            except StopIteration:
+                                break
+                            if candidate is not None:
+                                obligation.candidates.append(candidate)
+                            if self.session.cache_only and len(obligation.candidates) == 2:
+                                break
+                        complete = iterator.done
+                        coverage = {
+                            "cartesian_count": iterator.cartesian_count,
+                            "legal_count": iterator.legal_count,
+                            "effective_count": iterator.effective_count,
+                            "measured_count": 0,
+                        }
+                        # Equal declarations enumerate to the same candidates; an
+                        # interrupted enumeration describes the stop, not the space.
+                        if complete:
+                            enumerations[declaration] = (
+                                plan.contract, tuple(obligation.candidates), coverage,
+                            )
+                    self._candidate_count = len(obligation.candidates)
+                    if complete and not obligation.candidates:
+                        raise ValueError(f"no eligible configurations for {plan.component_id}")
+                    if complete and len(obligation.candidates) == 1:
+                        assignment, config = obligation.candidates[0]
+                        obligation.selection = self._selection(obligation, config, "fixed", assignment)
+                    elif self.session._stop.is_set() and not self.session.cache_only:
+                        obligation.selection = self._selection(obligation, configuration.default, "default")
+                    elif self.session.cache_only and self._choice_key(obligation, settled) is not None:
+                        raise LookupError(f"no completed selection for {request.name}")
+                    if obligation.selection is None:
+                        obligation.coverage = dict(coverage)
+            if obligation.selection is not None:
+                settled[request.name] = (obligation.selection, plan.contract)
+            if not obligation.ready:
+                # One requirement per obligation: what the combination checks is
+                # that plans sharing a persistent allocation key agree on that
+                # key's residency, which a plan declares per query, not per
+                # candidate.
+                config = (
+                    configuration.default if obligation.selection is None
+                    else obligation.selection.config
+                )
+                with _plan_scope(plan):
+                    requirements.append(plan._memory_requirements(config, self.session.device))
+            yield "metadata"
+        MemoryRequirements.sequential(requirements)
+        return obligations
+
+    def _compile(self, obligation, config, *, required):
+        contract, plan = obligation.request.plan.contract, obligation.request.plan
+        payload = contract.config_payload(config)
+        if payload not in obligation.compiled:
+            compiled = []
+            for job in plan._compile_jobs(config, self.session.device):
+                with self.session._gpu_scope():
+                    description = describe_compilation(job)
+                compiled.append(description)
+                yield "metadata"
+            obligation.compiled[payload] = tuple(compiled)
+            obligation.programs[payload] = frozenset(p for item in compiled for p in item.programs)
+        programs = obligation.programs[payload]
+        self._all_programs.update(programs)
+        missing = [item for item in obligation.compiled[payload] if any(
+            not compiled_program_available(program) for program in item.programs
+        )]
+        if missing:
+            if self.session.cache_only:
+                raise LookupError(f"missing required compiled artifact for {obligation.request.name}")
+            if self.session.compile_workers == 0:
+                # No compiler workers: compile in this process, the way a
+                # kernel compiles on first use without startup preparation.
+                with self.session._gpu_scope():
+                    compile_in_process(missing)
+            else:
+                pool = self.session._compiler()
+                pool.submit_plans(missing, required=required)
+        return programs
+
+    def _wait_programs(self, programs):
+        while not all(compiled_program_available(program) for program in programs):
+            pool = self.session._pool
+            if pool is None:
+                raise LookupError("required compiler artifacts are unavailable")
+            if pool.ready(tuple(programs)):
+                raise RuntimeError("compiler completed without publishing required artifacts")
+            yield "compile"
+        if self.session._pool is not None:
+            # Surface a factory failure even if another job published shared code.
+            self.session._pool.pending
+
+    def _instantiate(self, request, selection, factory, expected):
+        import torch
+
+        from ._measurement import no_compilation
+        with _plan_scope(request.plan), self.session._gpu_scope(), no_compilation(), retain_compiled_programs() as retained, observe_programs() as used:
+            # Prepared resources outlive the caller's profiling scope and must
+            # remain mutable during later serving warmup and graph replay.
+            try:
+                with torch.inference_mode(False), torch.no_grad():
+                    state = request.plan._materialize(selection, self.session.device)
+                    call = factory(state)
+                    guard = _CallGuard(call)
+                    self._temporaries.append(guard.finish)
+                _prime(call)
+                self.session._synchronize()
+            except Exception as error:
+                message = (
+                    f"{request.name} failed to prepare with configuration "
+                    f"{selection.config!r} ({selection.source}): {error}"
+                )
+                try:
+                    wrapped = type(error)(message)
+                except Exception:
+                    wrapped = RuntimeError(message)
+                raise wrapped from error
+        if used - expected:
+            raise RuntimeError(f"preparation used undeclared programs for {request.name}")
+        return state, call, guard, retained
+
+    def _call(self, obligation, selection, factory):
+        plan = obligation.request.plan
+        expected = obligation.programs[plan.contract.config_payload(selection.config)]
+        expected = expected | frozenset(
+            program for name in obligation.request.dependencies
+            for program in self._dependency_programs[name]
+        )
+        return self._instantiate(obligation.request, selection, factory, expected)
+
+    def _trial(self, obligation, index, assignment, config):
+        request = obligation.request
+        programs = obligation.programs[request.plan.contract.config_payload(config)]
+        while not all(compiled_program_available(program) for program in programs):
+            if self.session._stop.is_set():
+                return None
+            yield "compile"
+            if self.session._pool is not None:
+                self.session._pool.pending
+        selection = self._selection(obligation, config, "tuned", assignment)
+        before = self.session._allocated()
+        state, call, guard, retained = self._call(obligation, selection, request.benchmark_call)
+        resident = max(0, self.session._allocated() - before)
+        self._candidates_prepared += 1
+        yield "gpu"
+        return _Trial(index, assignment, config, call, guard, retained, state, resident)
+
+    def _observe(self, race):
+        self._completed_rounds = race.completed_rounds
+        self._total_rounds = race.planned_rounds
+        self._latest_round_us = race.latest_round_us
+        self._active_count = race.active_count
+
+    def _measure(self, trials, *, champion):
+        from ._measurement import prepare_race_steps, measure_race_steps
+        calls = [trial.call for trial in trials]
+        race = None
+        steps = measuring = None
+        try:
+            self._phase = "calibrating"
+            steps = prepare_race_steps(calls, device_ordinal=self.session.device.ordinal, samples=self.session.samples)
+            while not self.session._stop.is_set():
+                try:
+                    next(steps)
+                except StopIteration as finished:
+                    race = finished.value
+                    break
+                yield "gpu"
+            if race is None:
+                return None
+            self._phase = "autotuning"
+            measuring = measure_race_steps(
+                race, device_ordinal=self.session.device.ordinal, rounds=self.session.rounds,
+                compilation_active=lambda: self.session._pool is not None and self.session._pool.active_compilations,
+                eliminate=True, champion=champion,
+            )
+            while not self.session._stop.is_set():
+                try:
+                    next(measuring)
+                    self._observe(race)
+                except StopIteration as finished:
+                    self._observe(race)
+                    return finished.value
+                yield "gpu"
+            return None
+        finally:
+            closers = []
+            for generator in (steps, measuring):
+                if generator is not None:
+                    closers.append(generator.close)
+            if race is not None:
+                closers.append(race.close)
+            closers.append(self.session._synchronize)
+            _close_all(closers)
+
+    def _race(self, obligation):
+        request = obligation.request
+        self._phase = "preparing candidates"
+        rank_index = self.session._tuning_ranks.index(self.session._tuning_rank)
+        rank_count = len(self.session._tuning_ranks)
+        indexed_candidates = tuple(enumerate(obligation.candidates))
+        local_candidates = indexed_candidates[rank_index::rank_count]
+        self._candidate_count = len(local_candidates)
+        self._candidate_sharded = rank_count > 1
+        self._candidates_prepared = self._completed_rounds = self._active_count = 0
+        self._total_rounds = 0
+        self._latest_round_us = ()
+        if request.benchmark_call is None:
+            raise ValueError(f"multi-candidate preparation requires a representative benchmark: {request.name}")
+        required_programs = ()
+        if rank_count == 1:
+            required_programs = yield from self._compile(
+                obligation, obligation.configuration.default, required=True
+            )
+        for _, (assignment, config) in local_candidates:
+            if self.session._stop.is_set():
+                return None
+            yield from self._compile(obligation, config, required=False)
+            compile_assignment = obligation.configuration.space.compile_assignment(assignment)
+            actual = obligation.programs[request.plan.contract.config_payload(config)]
+            previous = obligation.compile_assignments.setdefault(compile_assignment, actual)
+            if previous != actual:
+                raise ValueError(f"runtime parameter changed actual compile keys for {request.name}")
+        yield from self._wait_programs(required_programs)
+        if not local_candidates:
+            winner = yield TuningRequirement(
+                obligation.key,
+                self.session._tuning_ranks,
+                None,
+                None,
+                None,
+            )
+            assignment = winner.assignment
+            obligation.configuration.space.validate(assignment)
+            config = request.plan.contract._lower(
+                obligation.configuration.query,
+                obligation.configuration.device,
+                assignment,
+            )
+            obligation.coverage["measured_count"] = len(obligation.candidates)
+            obligation.cache_pending = True
+            return self._selection(obligation, config, "tuned", assignment)
+        budget = self.session._race_budget()
+        pending = list(local_candidates)
+        champion = carried = None
+        live = []
+        try:
+            while pending or carried is not None:
+                if self.session._stop.is_set():
+                    return None
+                batch, resident = [], 0 if champion is None else champion.resident
+                if carried is not None:
+                    batch.append(carried)
+                    resident += carried.resident
+                    carried = None
+                while pending and len(batch) < self.session.race_batch:
+                    index, (assignment, config) = pending.pop(0)
+                    trial = yield from self._trial(obligation, index, assignment, config)
+                    if trial is None:
+                        return None
+                    live.append(trial)
+                    batch.append(trial)
+                    resident += trial.resident
+                    if budget is not None and resident > budget and len(batch) > 1:
+                        carried = batch.pop()
+                        break
+                trials = ([] if champion is None else [champion]) + batch
+                measurement = yield from self._measure(trials, champion=champion is not None)
+                if measurement is None:
+                    return None
+                # Global enumeration order breaks exact timing ties without
+                # adding a second policy to the distributed selection.
+                best = min(
+                    range(len(trials)),
+                    key=lambda position: (measurement.latencies_us[position], trials[position].index),
+                )
+                self._benchmarked += len(batch)
+                self._overlaps += measurement.overlapped_samples
+                for position, trial in enumerate(trials):
+                    if position != best:
+                        trial.close()
+                        live.remove(trial)
+                champion = trials[best]
+                champion.latency_us = float(measurement.latencies_us[best])
+            obligation.coverage["measured_count"] = len(local_candidates)
+            assignment, config = champion.assignment, champion.config
+            candidate_index, latency_us = champion.index, champion.latency_us
+            if rank_count > 1:
+                winner = yield TuningRequirement(
+                    obligation.key,
+                    self.session._tuning_ranks,
+                    assignment,
+                    latency_us,
+                    candidate_index,
+                )
+                assignment = winner.assignment
+                obligation.configuration.space.validate(assignment)
+                config = request.plan.contract._lower(
+                    obligation.configuration.query,
+                    obligation.configuration.device,
+                    assignment,
+                )
+                obligation.coverage["measured_count"] = len(obligation.candidates)
+            selection = self._selection(obligation, config, "tuned", assignment)
+            obligation.cache_pending = True
+            return selection
+        finally:
+            closers = [self.session._synchronize]
+            closers.extend(trial.close for trial in live)
+            if carried is not None and carried not in live:
+                closers.append(carried.close)
+            _close_all(closers)
+
+    def _publish(self, request, selection, state, call, retained, programs, variants=None):
+        plan = request.plan
+        prepared = _Prepared(
+            state=state, selection=selection, programs=programs, retained=retained,
+            owners=() if call is None else tuple(call.owners),
+            closers=() if call is None or call.close is None else (call.close,),
+            device=self.session.device, variants=variants,
+        )
+        prepared.users.append(plan)
+        previous = plan._prepared
+        plan._install(prepared)
+        if plan not in self.session._plans:
+            self.session._plans.append(plan)
+        if plan.shared:
+            self.session._shared[_declaration_key(plan)] = plan
+        self._new_plans.append(plan)
+        self._plans_by_name[request.name] = plan
+        if previous is not None and not previous.closed:
+            self.session._release_payload(plan, previous)
+        return prepared
+
+    def _retain_benchmark(self, request, selection, expected):
+        state, call, guard, retained = self._instantiate(
+            request, selection, request.benchmark_call, expected,
+        )
+        self._temporaries.remove(guard.finish)
+        holder = (state, retained)
+        self._benchmark_closers.append(lambda holder=holder: guard.finish())
+        self._benchmark_calls[request.name] = call
+        yield "gpu"
+
+    def _run(self):
+        if not self.requests:
+            return PreparationResult(plans={})
+        if self.session.state == "FROZEN":
+            requests, composites = self._expand()
+            for request in requests:
+                plan = request.plan
+                self._plans_by_name[request.name] = plan
+                self._completed_requests += 1
+                if request.retain_benchmark_call:
+                    if request.collective is not None:
+                        yield request.collective
+                    yield from self._retain_benchmark(request, plan.selection, plan.prepared.programs)
+            for name, (request, children) in composites.items():
+                self._plans_by_name[name] = request.plan
+            result = PreparationResult(
+                plans=self._plans_by_name, benchmark_calls=self._benchmark_calls,
+                benchmark_closers=self._benchmark_closers,
+            )
+            self._benchmark_closers = []
+            closers, self._temporaries = self._temporaries, []
+            _close_all(reversed(closers))
+            return result
+        requests, composites = self._expand()
+        self._total_requests = len(requests)
+        obligations = yield from self._configure(requests)
+        selections = {}
+        for obligation in obligations:
+            request = obligation.request
+            plan = request.plan
+            self._active_request = request
+            self._phase = "selecting"
+            self._candidate_count = len(obligation.candidates)
+            self._candidates_prepared = self._completed_rounds = self._active_count = 0
+            self._total_rounds = 0
+            self._latest_round_us = ()
+            if obligation.ready:
+                selection = obligation.selection
+                selections[request.name] = (selection, plan.contract)
+                self._dependency_programs[request.name] = plan.prepared.programs
+                self._plans_by_name[request.name] = plan
+            else:
+                if obligation.selection is None:
+                    self._lookup(obligation, selections)
+                if obligation.selection is None:
+                    if self.session.cache_only:
+                        raise LookupError(f"no completed selection for {request.name}")
+                    if not self.session._stop.is_set() and self.autotune:
+                        if request.collective is not None:
+                            raise ValueError("collective declarations must be fixed or explicitly pinned")
+                        obligation.selection = yield from self._race(obligation)
+                    if obligation.selection is None:
+                        obligation.selection = self._selection(obligation, obligation.configuration.default, "default")
+                selection = obligation.selection
+                selections[request.name] = (selection, plan.contract)
+                programs = yield from self._compile(obligation, selection.config, required=True)
+                yield from self._wait_programs(programs)
+                if obligation.cache_pending:
+                    self.session._selection_cache().save(
+                        obligation.key,
+                        assignment=selection.assignment,
+                        config=plan.contract.config_payload(selection.config),
+                        coverage=obligation.coverage,
+                        programs=programs,
+                    )
+                programs = programs | frozenset(
+                    program for name in request.dependencies for program in self._dependency_programs[name]
+                )
+                self._dependency_programs[request.name] = programs
+                if self._alias_shared(obligation):
+                    self._plans_by_name[request.name] = plan
+                else:
+                    if request.collective is not None:
+                        yield request.collective
+                    self._phase = "priming"
+                    state, call, guard, retained = self._call(obligation, selection, request.prepare_call)
+                    # The invocation and its transient outputs are priming
+                    # resources, not serving state. Restore borrowed inputs now;
+                    # the call's close runs when the plan is released.
+                    self._publish(request, selection, state, call, retained, programs)
+                    self._temporaries.remove(guard.finish)
+                    guard.restore()
+                    del call, guard
+                    yield "gpu"
+            self._coverage[request.name] = obligation.coverage
+            self._completed_requests += 1
+            if request.retain_benchmark_call:
+                yield from self._retain_benchmark(request, selection, self._dependency_programs[request.name])
+        for name, (request, children) in composites.items():
+            plan = request.plan
+            child_plans = {count: child.plan for count, child in children.items()}
+            if plan.prepared is not None and all(
+                child.prepared is not None for child in child_plans.values()
+            ) and plan.prepared.variants is not None and all(
+                plan.prepared.variants[count] is child for count, child in child_plans.items()
+            ) and not any(child in self._new_plans for child in child_plans.values()):
+                self._plans_by_name[name] = plan
+                continue
+            states = {count: child.prepared.state for count, child in child_plans.items()}
+            programs = frozenset(
+                program for child in child_plans.values() for program in child.prepared.programs
+            )
+            state = plan._assemble(states, self.session.device)
+            self._publish(request, None, state, None, None, programs, variants=plan.variants)
+            yield "metadata"
+        self._phase = "finishing"
+        summary = yield from self.session._drain()
+        if summary is not None:
+            self._compilations = summary.cute_compilations + summary.triton_compilations
+        from b12x._lib.program_cache import evict_unretained
+        keep = frozenset(
+            program for plan in self.session._plans if plan.prepared is not None
+            for program in plan.prepared.programs
+        )
+        self.session._synchronize()
+        evict_unretained(keep)
+        result = PreparationResult(
+            plans=self._plans_by_name, coverage=self._coverage,
+            benchmark_calls=self._benchmark_calls, benchmark_closers=self._benchmark_closers,
+            cache_hits=self._cache_hits, benchmarked_candidates=self._benchmarked,
+            elapsed_seconds=time.monotonic() - self._started, compilation=summary,
+            overlapped_benchmark_samples=self._overlaps,
+            program_counts={dialect: sum(program.dialect == dialect for program in self._all_programs)
+                            for dialect in ("cute", "triton")},
+        )
+        self._benchmark_closers = []
+        closers, self._temporaries = self._temporaries, []
+        _close_all(reversed(closers))
+        del closers
+        if self._benchmarked:
+            # Losing candidates were launched: their executables are now
+            # unreferenced and their local memory growth is undone.
+            from b12x._lib.program_cache import reclaim_device_memory
+            self.session._synchronize()
+            with self.session._gpu_scope():
+                reclaim_device_memory(keep, stack_limit=self._stack_limit)
+        return result
+
+    def _expand(self):
+        return _expand_requests(self.requests)
+
+
+_LAZY_SESSIONS: dict[object, PreparationSession] = {}
+
+
+def prepare_default(request):
+    """Prepare one request with its default configuration, outside any driver.
+
+    Allowed while no session is frozen and no stream is capturing. The
+    request's own prepare call primes the state, so families whose state
+    depends on the caller's storage (a KV cache, a pool) materialize it for
+    that storage. Returns the plan's prepared payload.
+    """
+    from b12x._lib.runtime_control import kernel_resolution_frozen
+
+    plan = request.plan
+    name = plan.component_id
+    if kernel_resolution_frozen():
+        raise RuntimeError(f"{name} plan is not prepared and kernel resolution is frozen")
+    try:
+        import torch
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    except Exception:
+        capturing = False
+    if capturing:
+        raise RuntimeError(
+            f"{name} plan {request.name!r} is not prepared; a shape used under CUDA "
+            "graph capture must be declared and prepared before the capture"
+        )
+    first = plan if isinstance(plan, Plan) else next(iter(plan.variants.values()))
+    device = first._device if first._device is not None else getattr(first.query, "device", None)
+    detected = detect_device(device)
+    session = _LAZY_SESSIONS.get(detected.ordinal)
+    if session is None or session.state == "CLOSED" or session._job is not None:
+        # Compiles in this process: a first-use default is a JIT kernel, not a
+        # startup pass with compiler workers.
+        session = PreparationSession(device=detected, autotune=False, compile_workers=0)
+        _LAZY_SESSIONS[detected.ordinal] = session
+    session.prepare((request,), autotune=False)
+    return plan._prepared
+
+
+def _prepare_default(plan):
+    """Materialize an unprepared plan with its default configuration, without priming.
+
+    This is the path a plan takes when it is bound or run without having been
+    prepared: the heuristic configuration, its scratch, and kernels that
+    compile on first use. A warning names the plan because a caller that
+    declares its serving shapes ahead of time never reaches it.
+    """
+    logger.warning(
+        "%s: plan %s was not prepared before its first use; materializing its "
+        "default configuration now. Declare the shape ahead of time to avoid "
+        "this cost.",
+        plan.component_id, f"{type(plan.query).__name__}#{plan.handle}",
+    )
+
+    def noop(state):
+        return PreparedCall(run=lambda: None)
+
+    if isinstance(plan, _CompositePlan):
+        request = plan.request(
+            name=f"default:{plan.handle}", prepare_calls={count: noop for count in plan.token_counts},
+        )
+    else:
+        request = plan.request(name=f"default:{plan.handle}", prepare_call=noop)
+    return prepare_default(request)
+
+
+_set_lazy_preparer(_prepare_default)

@@ -16,8 +16,8 @@ pip install b12x
 
 You need Python 3.10+, `torch >= 2.12`, and an SM120/SM121 GPU. The CuTe DSL
 compiler and its CUDA 13 libraries come in as wheel dependencies
-(`nvidia-cutlass-dsl == 4.6.2`), so there is no build step — kernels are
-JIT-compiled on first use and cached.
+(`nvidia-cutlass-dsl == 4.6.2`), so there is no separate build step. A
+`PreparationSession` compiles missing kernels before publishing execution.
 
 ## What's in here
 
@@ -28,9 +28,9 @@ kernel guts sit in `_impl.py`/`_kernel*.py`; cross-op lowering lives in
 
 **`gemm`** — `gemm.blockscaled` is the common dense interface for raw
 NVFP4/MXFP4/MXFP8/block-FP8 operands and packed MXFP8/tensor-FP8 weights; it
-owns `mm`, `pack_weight`, and serving `prewarm`. The legacy
-`gemm.mxfp8_linear` and `gemm.tensor_fp8_linear` imports are compatibility
-aliases. `gemm.block_fp8_linear` retains a separate planned interface because
+owns declarative planning, `mm`, and `pack_weight`. The fixed
+`gemm.mxfp8_linear` and `gemm.tensor_fp8_linear` interfaces also require prepared
+execution. `gemm.block_fp8_linear` retains a separate interface because
 it owns caller-provided scratch and inline requantization. The fused MLA query
 projection (`gemm.mla_query_projection`) and grouped WO projection
 (`gemm.wo_projection`) are used around MLA attention.
@@ -114,8 +114,9 @@ These are hash/D2H/disk/GPU-decode timings, not full-model or TP-collective timi
 
 `sequence.embedding` provides exact unquantized BF16/FP32 row lookup into
 caller-owned output, with Int32/Int64 IDs and Int64 table offsets. Its
-`precompile` entrypoint warms width/type specializations before capture;
-live row counts and table extents do not select compiler-cache entries.
+`EmbeddingQuery` declares capacity, geometry and pointer dtypes. A
+`PreparationSession` prepares the plan before binding or capture; live row
+counts and table extents within that capacity remain runtime values.
 
 The V4.1 serving adapter retains checkpoint-native BF16 weights and activations.
 Internal accumulation, normalization, routing scores, and ratio-two
@@ -191,62 +192,59 @@ staging buffers; other supported sizes use raw DMA instead of transferring
 padding. Outputs remain independent. All ranks prepare the same dtype bounds
 before capture; compressed wire modes and outer captures keep their existing paths.
 
-`b12x` owns planning, scratch layout, and policy, so serving stacks only supply
+`b12x` owns planning, scratch layout, and startup selection, so serving stacks only supply
 metadata and capacity limits.
 
 ## Using it
 
-Every stateful kernel lives at `b12x.<group>.<op>` and shares the **same
-shape** — `plan` the work, size scratch from the plan, `bind` your tensors as
-views, `run`. The module path carries the context, so the verbs and role
-classes (`Caps`/`Plan`/`Binding`) are uniform across families:
+Native execution follows one lifecycle: a plan declares the work, a session
+prepares it, and the family binds and runs from the prepared plan. A plan
+allocates no CUDA storage and compiles nothing. The component owns its legal
+configurations, default, compiler extraction and memory formulas.
 
 ```python
-# norm — fused RMSNorm + hyper-connection residual mixing
-from b12x.norm import mhc
+import torch
+from b12x.gemm import bf16_gemv
+from b12x.preparation import PreparationSession, PreparedCall
 
-plan    = mhc.plan(mhc.Caps(...))
-spec    = plan.scratch_specs()[0]
-scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-binding = mhc.bind(plan, scratch=scratch, ...)
-residual, post, comb, y = mhc.run_post_pre(..., binding=binding)
+def main():
+    x = torch.randn(1, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
+    plan = bf16_gemv.plan(bf16_gemv.query_from_call(x, weight))
+    request = plan.request(
+        name="small_linear",
+        prepare_call=lambda state: PreparedCall(run=lambda: state.run(x, weight)),
+    )
+    with PreparationSession(device=x.device) as session:
+        session.prepare((request,))
+        y = bf16_gemv.mm(x, weight, plan=plan)
+        torch.cuda.synchronize()
+        print(y.shape)  # torch.Size([1, 8])
+
+if __name__ == "__main__":
+    main()
 ```
 
-```python
-# moe — fused tensor-parallel routed-expert FFN (weights prepped once per model)
-from b12x.moe import fused_moe
+The callback receives the selected component's private materialized state and
+returns a `PreparedCall` that runs the real operation with actual parameters.
+Multi-candidate search needs a representative activation producer; stateful
+calls restore touched state after trials. Public `bind` and functional entry
+points take the plan.
 
-wplan   = fused_moe.plan_weights(quant_modes="nvfp4",
-                                 source_format="modelopt_nvfp4", ...)
-experts = fused_moe.prepare_weights(plan=wplan, ...)
-plan    = fused_moe.plan(fused_moe.Caps(...))
-spec    = plan.scratch_specs()[0]
-scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-binding = fused_moe.bind(plan, scratch=scratch, a=x, experts=experts,
-                         topk_weights=tw, topk_ids=ti)
-out     = fused_moe.run(binding=binding)
-```
+Cache misses autotune by default. A valid explicit config pin wins; completed
+cached choices are reused. Disabled or cancelled search still prepares the
+validated default. Fixed operations prime without a race. Families that opt
+into sharing prepare one state for equal declarations.
 
-```python
-# attention — sparse MLA from compressed KV pages (DeepSeek V4)
-from b12x.attention import compressed_sparse_mla
+An unprepared plan is materialized with its default configuration on first
+use, with a warning; after `session.freeze()` or during a CUDA graph capture
+that is an error. Exact-M paths prepare every planned count.
+Capture under `session.capture()`, keep the plans alive for the graph lifetime,
+and destroy graphs before `session.release(plan)` or closing the session.
 
-plan    = compressed_sparse_mla.plan(compressed_sparse_mla.Caps(...))
-spec    = plan.scratch_specs()[0]
-scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-binding = compressed_sparse_mla.bind(plan, scratch=scratch, q=q,
-                              swa_indices=idx, swa_lengths=lens, ...)
-out = compressed_sparse_mla.run(swa_k_cache=swa, binding=binding, sm_scale=scale, ...)
-```
-
-`plan` is host-side and may allocate; `bind` only narrows/views (never
-allocates), which is what makes captured graphs safe; `run*` executes and is
-CUDA-graph-capture safe. One-shot ops (`gemm.blockscaled.mm`,
-`quantization.mxfp8.quantize_rows`) are plain functions; `comm.pcie`
-collectives are stateful classes. `b12x.list_ops()` enumerates the full
-set; every op exports `is_supported()`. Underneath, kernels register as torch
-custom ops in the private `b12x::` namespace (torch.compile / CUDA-graph
-integration) — prefer the Python API.
+See [GPU preparation and startup autotuning](docs/gpu-profiles.md) for the
+selection, memory, cooperative startup and vLLM integration contracts. Prefer
+the Python component API over private `b12x::` custom ops.
 
 ## PCIe DMA wire modes
 
@@ -284,14 +282,17 @@ B12X_PCIE_DMA_FP8=i8_ring python -m your_server
 ```
 
 Specializations follow static geometry, dtype, planned capacity and
-device/toolchain identity, not live request counts. Before serving, precompile
-the selected specializations and exercise their runtime paths, then freeze:
+device/toolchain identity. Prepare the declared operations with real inputs,
+then freeze the session before serving:
 
 ```python
-import b12x
+from b12x.preparation import PreparationSession
 
-# ... preplan capacities and warm every selected specialization ...
-b12x.freeze_kernel_resolution("serving")
+with PreparationSession(device=device) as session:
+    session.prepare(requests)
+    session.freeze()
+    # Capture and serve using the prepared plans.
+    # Destroy their CUDA graphs before leaving the session.
 ```
 
 After the freeze, any request that would trigger a new kernel compile raises
@@ -335,8 +336,8 @@ scratch plan across the requested token counts. Graph replay is checked
 against eager output; the default timing mode flushes L2 outside timed events.
 The compact N64-tail weight layout uses the common split-materialized M16
 pipeline rather than the padded N256/K128 tiny-decode layout.
-This adds a benchmark preset and TP4 policy-generation coverage, not a newly
-tuned embedded GPU profile.
+Startup selection measures eligible configurations for the declared TP4
+geometry. Completed selections are cached for the device and toolchain.
 
 ## DeepSeek mHC benchmark
 
@@ -418,7 +419,7 @@ head geometry; narrow or remainder shards retain H8. V4.1 prefill uses BF16
 QK and FP8 P×V, including the 128-token sliding window plus indexed-cache union.
 Precision and decode head grouping are selected once by the plan's typed
 `SparseMlaConfig`; bind/run and graph replay do not consult environment switches
-or resolve policy again. An explicit `plan(..., config=...)` can select the
+or resolve policy again. An explicit `plan(..., override=...)` can select the
 BF16 reference/debug path. Benchmark separate plans with
 `--compute-modes bf16,fp8` for either decode or extend.
 The serving cache stays in its native 528/288-byte formats. The I/O producer

@@ -10,6 +10,7 @@ from __future__ import annotations
 import cutlass.cute as cute
 import pytest
 import torch
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 from b12x._lib.utils import convert_sf_from_mma_layout
 from b12x.gemm import block_fp8_linear as bfl
@@ -264,8 +265,7 @@ def test_mm_quantizer_reuses_planned_capacity_under_frozen_resolution() -> None:
     mxfp8_linear.mm(source, packed, mode="quantized", expected_m=16)
     torch.cuda.synchronize()
     misses = mxfp8_rows._get_compiled_mxfp8_rows_quant.cache_info().misses
-    b12x.freeze_kernel_resolution("packed MXFP8 capacity regression")
-    try:
+    with kernel_resolution_guard('packed MXFP8 capacity regression'):
         for tokens in (1, 8, 9, 16):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -283,8 +283,6 @@ def test_mm_quantizer_reuses_planned_capacity_under_frozen_resolution() -> None:
             torch.testing.assert_close(actual, expected[:tokens], rtol=0, atol=0)
             graph.reset()
         assert mxfp8_rows._get_compiled_mxfp8_rows_quant.cache_info().misses == misses
-    finally:
-        b12x.unfreeze_kernel_resolution()
 
 
 def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:

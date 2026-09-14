@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -9,6 +8,8 @@ import cutlass.cute as cute
 import torch
 from cutlass.cutlass_dsl import Int32, Uint8, Uint32
 
+from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import (
     KernelCompileSpec,
     compile as b12x_compile,
@@ -295,7 +296,7 @@ class _MXFP8RowsQuantLaunch:
         scale_mma[scale_mma_offset] = scale_u8
 
 
-@functools.cache
+@program_cache
 def _get_compiled_mxfp8_rows_quant(
     k: int,
     source_dtype: torch.dtype,
@@ -303,8 +304,13 @@ def _get_compiled_mxfp8_rows_quant(
     threads: int,
     value_order: str,
     min_amax: float = 0.0,
+    *,
+    device_ordinal: int | None = None,
+    sm_count: int | None = None,
 ) -> Callable:
     k = int(k)
+    device_ordinal = torch.cuda.current_device() if device_ordinal is None else device_ordinal
+    sm_count = torch.cuda.get_device_properties(device_ordinal).multi_processor_count if sm_count is None else sm_count
     if k <= 0 or k % 32 != 0:
         raise ValueError(f"MXFP8 CuTe quantizer requires K divisible by 32, got {k}")
     if source_dtype == torch.bfloat16:
@@ -357,22 +363,23 @@ def _get_compiled_mxfp8_rows_quant(
         target=launch,
         cache_key=cache_key,
     )
-    raw = b12x_compile(
-        launch,
-        make_ptr(source_type, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
-        1,
-        1,
-        1,
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "gemm.mxfp8_quant_cute",
-            4,
-            cache_key,
-        ),
-    )
+    with torch.cuda.device(device_ordinal):
+        raw = b12x_compile(
+            launch,
+            make_ptr(source_type, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+            1,
+            1,
+            1,
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "gemm.mxfp8_quant_cute",
+                4,
+                cache_key,
+            ),
+        )
 
     def launch_tensors(
         source: torch.Tensor,
@@ -387,9 +394,6 @@ def _get_compiled_mxfp8_rows_quant(
             )
             warps_per_cta = threads // 32
             natural_grid = max(1, (total_tasks + warps_per_cta - 1) // warps_per_cta)
-            sm_count = torch.cuda.get_device_properties(
-                source.device
-            ).multi_processor_count
             grid_x = min(natural_grid, sm_count * _GRID_CTAS_PER_SM)
         else:
             total_blocks = int(source.shape[0]) * (k // 32)
@@ -425,7 +429,23 @@ def _get_compiled_mxfp8_rows_quant(
             current_cuda_stream(),
         )
 
-    return launch_tensors
+    return attach_programs(launch_tensors, raw)
+
+
+def mxfp8_rows_quant_launch_options(
+    planned_rows: int,
+    value_order: str,
+) -> tuple[int, int]:
+    """Return the existing row-quantizer specialization for a declared M bound."""
+    if type(planned_rows) is not int or planned_rows <= 0:
+        raise ValueError("MXFP8 planned rows must be a positive integer")
+    if value_order == "trellis_native_mma":
+        return 8, _THREADS
+    if value_order != "linear":
+        raise ValueError(f"unsupported MXFP8 value order {value_order!r}")
+    if planned_rows <= 8:
+        return 8, 128
+    return _WARP_SUBGROUP_WIDTH, _THREADS
 
 
 def quantize_mxfp8_rows_cute(
@@ -455,15 +475,8 @@ def quantize_mxfp8_rows_cute(
         )
     if source.ndim != 2 or not source.is_contiguous():
         raise ValueError("CuTe MXFP8 quantizer requires contiguous [M,K] input")
-    threads = _THREADS
     planned_rows = int(source.shape[0]) if expected_m is None else expected_m
-    if value_order == "trellis_native_mma":
-        subgroup_width = 8
-    elif planned_rows <= 8:
-        subgroup_width = 8
-        threads = 128
-    else:
-        subgroup_width = _WARP_SUBGROUP_WIDTH
+    subgroup_width, threads = mxfp8_rows_quant_launch_options(planned_rows, value_order)
     physical_k = int(source.shape[1]) if physical_k is None else int(physical_k)
     if physical_k < int(source.shape[1]) or physical_k % 32:
         raise ValueError(
@@ -477,6 +490,7 @@ def quantize_mxfp8_rows_cute(
         threads,
         value_order,
         min_amax,
+        device_ordinal=source.device.index,
     )(
         source,
         values,

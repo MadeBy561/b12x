@@ -16,7 +16,6 @@ from b12x.gemm._shared.wo_mxfp8 import (
     pack_fp8_block_scaled_weight_mxfp8,
     pack_mxfp8_scales_for_dense_gemm,
     pack_wo_projection_fp8_block_scaled_weights_mxfp8,
-    plan_wo_projection_scratch,
     quantize_mxfp8_rows_torch,
     quantize_wo_a_input_inv_rope_mxfp8,
     quantize_wo_a_input_mxfp8,
@@ -24,11 +23,11 @@ from b12x.gemm._shared.wo_mxfp8 import (
     quantize_wo_projection_weights_mxfp8_torch,
     wo_a_dense_gemm_mxfp8,
     wo_b_dense_gemm_mxfp8,
-    wo_projection_inv_rope_mxfp8,
-    wo_projection_mxfp8,
 )
 
 from tests._reference.helpers import require_b12x
+from b12x.gemm import wo_projection as wo
+from b12x.preparation import PreparationSession, PreparedCall
 
 
 def _assert_close_bf16(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -44,7 +43,7 @@ def _assert_close_bf16(actual: torch.Tensor, expected: torch.Tensor) -> None:
 @pytest.mark.parametrize("block_size", (32, 128))
 def test_decode_wo_b_column_tiles_match_independent_quantized_oracle(rows, block_size):
     """Column tiling preserves MXFP8 group-major quantization and BF16 output."""
-    from b12x.gemm._shared.wo_mxfp8 import wo_b_dense_gemm_fused_quant_mxfp8
+    from b12x._lib.dense_gemm import dense_gemm_fused_quant_a
 
     require_b12x()
     torch.manual_seed(41732 + rows)
@@ -89,12 +88,15 @@ def test_decode_wo_b_column_tiles_match_independent_quantized_oracle(rows, block
     ).abs()
     results = []
     for tile in (0, 64, 128):
-        actual = wo_b_dense_gemm_fused_quant_mxfp8(
+        actual = dense_gemm_fused_quant_a(
             source,
-            packed,
+            packed.values.reshape(5120, 2048, 1),
+            packed.scale_mma,
             expected_m=rows,
             sfb_k_replicated=block_size == 128,
-            decode_tile_n=tile,
+            rhs_values_tiled=packed.values_tiled,
+            mma_tiler_mn=(16, tile) if tile else None,
+            a_inner_span=1024,
         )
         actual = actual[..., 0].clone()
         assert bool(torch.isfinite(actual).all())
@@ -105,34 +107,52 @@ def test_decode_wo_b_column_tiles_match_independent_quantized_oracle(rows, block
         torch.testing.assert_close(actual, results[0], atol=0, rtol=0)
 
 
-def _make_wo_projection_binding(
-    source_tgd: torch.Tensor,
-    weights,
-    *,
-    expected_m: int | None = None,
-):
-    tokens, groups, group_width = map(int, source_tgd.shape)
-    plan = plan_wo_projection_scratch(
-        WOProjectionScratchCaps(
-            device=source_tgd.device,
-            max_tokens=tokens,
-            groups=groups,
-            group_width=group_width,
-            rank=int(weights.rank),
-            hidden=int(weights.hidden),
-            dtype=source_tgd.dtype,
-        )
-    )
-    scratch = tuple(
-        torch.empty(shape, dtype=dtype, device=source_tgd.device)
-        for shape, dtype in plan.shapes_and_dtypes()
-    )
-    return plan.bind(
-        scratch=scratch,
-        source_tgd=source_tgd,
-        weights=weights,
-        expected_m=expected_m,
-    )
+@pytest.fixture
+def wo_session():
+    with PreparationSession(device=require_b12x(), autotune=False, compile_workers=2) as session:
+        yield session
+
+
+def _make_wo_projection_binding(source_tgd, weights, *, session, config=None):
+    tokens, groups, group_width = source_tgd.shape
+    plan = wo.plan(wo.Caps(device=source_tgd.device, max_tokens=tokens, groups=groups,
+                           group_width=group_width, rank=weights.rank, hidden=weights.hidden,
+                           dtype=source_tgd.dtype), override=config)
+    kwargs = dict(source_tgd=source_tgd, weights=weights)
+    def prepare(state):
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=source_tgd.device)
+                        for spec in state._scratch_state.scratch_specs())
+        binding = state.bind(scratch=scratch, **kwargs)
+        return PreparedCall(run=lambda: state.run(binding), owners=(scratch, binding))
+    session.prepare((plan.request(name="wo", prepare_call=prepare),))
+    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=source_tgd.device)
+                    for spec in plan.scratch_specs())
+    return wo.bind(plan, scratch=scratch, **kwargs)
+
+
+def _make_inv_rope_binding(o, positions, cos_sin_cache, weights, *, session,
+                           heads_per_group, nope_dim, rope_dim):
+    plan = wo.plan(wo.Caps(device=o.device, max_tokens=o.shape[0], groups=weights.groups,
+                           group_width=weights.group_width, rank=weights.rank, hidden=weights.hidden,
+                           dtype=o.dtype), invocation=dict(operation="inv_rope",
+        heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim,
+        positions_dtype=str(positions.dtype).removeprefix("torch."),
+        cos_sin_dtype=str(cos_sin_cache.dtype).removeprefix("torch.")))
+    kwargs = dict(o=o, positions=positions, cos_sin_cache=cos_sin_cache, weights=weights,
+                  heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim)
+    def prepare(state):
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=o.device)
+                        for spec in state._scratch_state.scratch_specs())
+        binding = state.bind_inv_rope(scratch=scratch, **kwargs)
+        return PreparedCall(run=lambda: state.run_inv_rope(binding), owners=(scratch, binding))
+    session.prepare((plan.request(name="wo-inv-rope", prepare_call=prepare),))
+    scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=o.device)
+                    for spec in plan.scratch_specs())
+    return wo.bind_inv_rope(plan, scratch=scratch, **kwargs)
+
+
+def _run_binding(*, binding):
+    return wo.run(binding=binding, plan=binding.plan)
 
 
 def _sglang_wo_a_input_quant_reference(source_tgd: torch.Tensor) -> MXFP8Rows:
@@ -645,7 +665,7 @@ def test_two_gemm_wo_projection_group_major_path_matches_quantized_reference() -
     _assert_close_bf16(actual[:, :, 0], expected)
 
 
-def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference() -> None:
+def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference(wo_session) -> None:
     """TP8 collapses DSV4's eight output groups to one local WO group."""
 
     require_b12x()
@@ -666,8 +686,8 @@ def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference() ->
     )
 
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
-    binding = _make_wo_projection_binding(x_tgd, weights, expected_m=tokens)
-    actual = wo_projection_mxfp8(binding=binding)
+    binding = _make_wo_projection_binding(x_tgd, weights, session=wo_session)
+    actual = _run_binding(binding=binding)
     torch.cuda.synchronize()
 
     x_q = quantize_wo_a_input_mxfp8(x_tgd)
@@ -690,7 +710,7 @@ def test_two_gemm_wo_projection_singleton_group_matches_quantized_reference() ->
     _assert_close_bf16(actual, expected)
 
 
-def test_two_gemm_wo_projection_replays_under_graph() -> None:
+def test_two_gemm_wo_projection_replays_under_graph(wo_session) -> None:
     require_b12x()
     torch.manual_seed(31003)
 
@@ -709,10 +729,10 @@ def test_two_gemm_wo_projection_replays_under_graph() -> None:
     )
 
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
-    binding = _make_wo_projection_binding(x_tgd, weights)
+    binding = _make_wo_projection_binding(x_tgd, weights, session=wo_session)
 
     def run_once() -> torch.Tensor:
-        return wo_projection_mxfp8(binding=binding)
+        return _run_binding(binding=binding)
 
     eager = run_once().clone()
     torch.cuda.synchronize()
@@ -727,11 +747,10 @@ def test_two_gemm_wo_projection_replays_under_graph() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(binding.output[:, :, 0], eager, rtol=0, atol=0)
+    graph.reset()
 
 
-def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding() -> (
-    None
-):
+def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(wo_session):
     require_b12x()
     torch.manual_seed(31007)
 
@@ -764,17 +783,11 @@ def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
     )
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a, wo_b)
 
-    def run_once() -> torch.Tensor:
-        return wo_projection_inv_rope_mxfp8(
-            o,
-            positions,
-            cos_sin_cache,
-            weights,
-            heads_per_group=heads_per_group,
-            nope_dim=nope_dim,
-            rope_dim=rope_dim,
-            expected_m=1,
-        )
+    binding = _make_inv_rope_binding(o, positions, cos_sin_cache, weights,
+        session=wo_session, heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim)
+    wo_session.freeze()
+    def run_once():
+        return wo.run_inv_rope(binding=binding, plan=binding.plan)
 
     # Warm all compilation/allocation before capture, then retain the graph-owned
     # output and verify replay observes changed inputs without allocating or
@@ -799,56 +812,42 @@ def test_inv_rope_fused_wo_replays_under_graph_with_uninitialized_scale_padding(
     assert bool(torch.isfinite(replayed).all().item())
     assert bool((replayed != 0).any().item())
     torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
+    graph.reset()
 
 
-def test_wo_projection_expected_m_hint_is_byte_identical() -> None:
-    # The DeepGEMM-style expected_m hint must thread orchestrator -> wo_b leaf ->
-    # dense_gemm and change ONLY the wo_b up-projection tile (N=hidden>1536),
-    # leaving the result byte-identical (tiling does not change the block-scaled
-    # MMA). hidden=2048 (>1536) so expected_m=64 actually selects a different
-    # wo_b tile (32x128) than the default (64x128).
+@pytest.mark.parametrize("tokens", [1, 8, 16])
+def test_wo_prepared_decode_tiles_and_prefill(tokens, wo_session):
     require_b12x()
-    torch.manual_seed(31004)
-
-    tokens, groups, group_width, rank, hidden = 32, 2, 128, 64, 2048
-    x_tgd = (
-        torch.randn((tokens, groups, group_width), device="cuda", dtype=torch.bfloat16)
-        / 4
-    )
-    wo_a_grd = (
-        torch.randn((groups, rank, group_width), device="cuda", dtype=torch.bfloat16)
-        / group_width**0.5
-    )
-    wo_b_hgr = (
-        torch.randn((hidden, groups * rank), device="cuda", dtype=torch.bfloat16)
-        / (groups * rank) ** 0.5
-    )
-    weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
-    # Different regime tiles must give byte-identical output (tiling does not
-    # change the block-scaled MMA): decode 32x128 (expected_m<=128) vs prefill
-    # 64x128 (expected_m>128).
-    out_decode = wo_projection_mxfp8(
-        binding=_make_wo_projection_binding(x_tgd, weights, expected_m=8)
-    ).clone()
-    out_prefill = wo_projection_mxfp8(
-        binding=_make_wo_projection_binding(x_tgd, weights, expected_m=4096)
-    ).clone()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out_decode, out_prefill, rtol=0, atol=0)
-
-    # WO auto-defaults expected_m to the token count: omitting it at tokens=32
-    # must match expected_m=32 (both pick the decode 32x128 tile here).
-    out_auto = wo_projection_mxfp8(
-        binding=_make_wo_projection_binding(x_tgd, weights)
-    ).clone()
-    out_explicit = wo_projection_mxfp8(
-        binding=_make_wo_projection_binding(x_tgd, weights, expected_m=32)
-    ).clone()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out_auto, out_explicit, rtol=0, atol=0)
+    torch.manual_seed(31008)
+    groups, width, rank, hidden = 2, 4096, 1024, 5120
+    source = torch.randn(tokens, groups, width, device="cuda", dtype=torch.bfloat16).mul_(0.25)
+    a = torch.randn(groups, rank, width, device="cuda", dtype=torch.bfloat16) / width**0.5
+    b = torch.randn(hidden, groups * rank, device="cuda", dtype=torch.bfloat16) / (groups * rank)**0.5
+    weights = quantize_wo_projection_weights_mxfp8_torch(a, b)
+    bindings = [_make_wo_projection_binding(source, weights, session=wo_session,
+                 config=wo.WoProjectionConfig(decode_tile_n=tile))
+                for tile in ((64, 128) if tokens <= 8 else (0,))]
+    x_q = quantize_wo_a_input_mxfp8(source)
+    tmp = wo_a_dense_gemm_mxfp8(x_q, weights.wo_a)
+    tmp_q = quantize_wo_b_input_mxfp8(tmp)
+    expected = wo_b_dense_gemm_mxfp8(tmp_q, weights.wo_b)[:, :, 0]
+    wo_session.freeze()
+    outputs = []
+    for binding in bindings:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_binding(binding=binding)
+        graph.replay()
+        torch.cuda.synchronize()
+        actual = binding.output[:, :, 0].clone()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        outputs.append(actual)
+        graph.reset()
+    for output in outputs[1:]:
+        torch.testing.assert_close(output, outputs[0], rtol=0, atol=0)
 
 
-def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
+def test_wo_projection_block_scaled_weight_pack_runs_graph(wo_session) -> None:
     require_b12x()
     torch.manual_seed(31004)
 
@@ -887,23 +886,24 @@ def test_wo_projection_block_scaled_weight_pack_runs_graph() -> None:
         rank=rank,
         hidden=hidden,
     )
-    binding = _make_wo_projection_binding(x_tgd, weights)
+    binding = _make_wo_projection_binding(x_tgd, weights, session=wo_session)
 
-    eager = wo_projection_mxfp8(binding=binding).clone()
+    eager = _run_binding(binding=binding).clone()
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        wo_projection_mxfp8(binding=binding)
+        _run_binding(binding=binding)
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
 
     assert bool(torch.isfinite(binding.output).all().item())
     torch.testing.assert_close(binding.output[:, :, 0], eager, rtol=0, atol=0)
+    graph.reset()
 
 
-def test_wo_projection_block32_pack_preserves_k_scale_bytes() -> None:
+def test_wo_projection_block32_pack_preserves_k_scale_bytes(wo_session) -> None:
     require_b12x()
     torch.manual_seed(41004)
 
@@ -947,7 +947,7 @@ def test_wo_projection_block32_pack_preserves_k_scale_bytes() -> None:
     )
     assert not weights.sfb_k_replicated
 
-    actual = wo_projection_mxfp8(binding=_make_wo_projection_binding(x_tgd, weights))
+    actual = _run_binding(binding=_make_wo_projection_binding(x_tgd, weights, session=wo_session))
     x_q = quantize_wo_a_input_mxfp8(x_tgd)
     x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
     wo_a_deq = dequantize_mxfp8_rows_torch(weights.wo_a.values, weights.wo_a.scale_rows)
@@ -1161,7 +1161,7 @@ def test_wo_a_fused_quant_inv_rope_matches_unfused() -> None:
         torch.testing.assert_close(fused, unfused, rtol=0, atol=0)
 
 
-def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes() -> None:
+def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes(wo_session) -> None:
     require_b12x()
     torch.manual_seed(31012)
 
@@ -1197,16 +1197,11 @@ def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes() -> None:
     )
     weights = quantize_wo_projection_weights_mxfp8_torch(wo_a_grd, wo_b_hgr)
 
+    binding = _make_inv_rope_binding(o, positions, cos_sin, weights,
+        session=wo_session, heads_per_group=heads_per_group, nope_dim=nope_dim, rope_dim=rope_dim)
+    wo_session.freeze()
     def run():
-        return wo_projection_inv_rope_mxfp8(
-            o,
-            positions,
-            cos_sin,
-            weights,
-            heads_per_group=heads_per_group,
-            nope_dim=nope_dim,
-            rope_dim=rope_dim,
-        )
+        return wo.run_inv_rope(binding=binding, plan=binding.plan)
 
     eager = run().clone()
     torch.cuda.synchronize()
@@ -1221,6 +1216,7 @@ def test_wo_inv_rope_route_fused_small_m_matches_reference_shapes() -> None:
 
     assert bool(torch.isfinite(actual).all().item())
     torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+    graph.reset()
 
 
 @pytest.mark.parametrize(

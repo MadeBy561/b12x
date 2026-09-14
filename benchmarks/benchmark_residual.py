@@ -27,9 +27,11 @@ from benchmarks.common import (
     require_sm120,
     nvidia_smi_gpu_mode_snapshot,
 )
-from b12x.norm.mhc._impl import B12XMHCScratchCaps, plan_mhc_scratch, b12x_mhc_post_pre
+from b12x.norm import mhc
+from b12x.norm.mhc._impl import _b12x_mhc_post_pre_impl, b12x_mhc_post_pre
+from b12x.preparation import PreparationSession, PreparedCall, FrozenMapping
 from benchmarks.mhc_profiles import MODEL_PROFILES, load_mhc_profile
-from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 
 def _mhc_pre_reference(
@@ -155,16 +157,20 @@ def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, f
 
 def _bench_graph(fn, *, warmup: int, iters: int, l2_flush, samples_out=None, check=None) -> tuple[float, float]:
     graph = capture_cuda_graph(fn, warmup=warmup)
-    graph.replay()
-    if check is not None:
-        check()
-    stats = bench_cuda_graph(graph, replays=iters, l2_flush=l2_flush)
-    samples = stats["replay_us"]
-    if check is not None:
-        check()
-    if samples_out is not None:
-        samples_out.extend(samples)
-    return statistics.median(samples), min(samples)
+    try:
+        graph.replay()
+        if check is not None:
+            check()
+        stats = bench_cuda_graph(graph, replays=iters, l2_flush=l2_flush)
+        samples = stats["replay_us"]
+        if check is not None:
+            check()
+        if samples_out is not None:
+            samples_out.extend(samples)
+        return statistics.median(samples), min(samples)
+
+    finally:
+        graph.reset()
 
 
 def _bench_eager(fn, *, warmup: int, iters: int, l2_flush, samples_out=None, check=None) -> tuple[float, float]:
@@ -327,6 +333,7 @@ def _run_benchmark(args, stack: ExitStack) -> None:
     fused_out = fused_post = fused_comb = fused_y = fused_pre = None
     runner = None
     planned_config = None
+    session = None
     if bundle is not None:
         from benchmarks.vllm_mhc import vllm_mhc_runner
 
@@ -348,21 +355,45 @@ def _run_benchmark(args, stack: ExitStack) -> None:
     else:
         if args.compare_vllm:
             _register_vllm_mhc_tilelang(args.vllm_path)
-        fused_plan = plan_mhc_scratch(B12XMHCScratchCaps(
+        caps = mhc.Caps(
             device=device, max_tokens=max(args.tokens, args.expected_m or args.tokens),
             hidden_size=args.hidden_size, split_k=args.split_k,
-        ))
-        args.split_k = fused_plan.caps.split_k
-        planned_config = fused_plan.config
-        fused_scratch = tuple(
-            torch.empty(shape, dtype=dtype, device=device)
-            for shape, dtype in fused_plan.shapes_and_dtypes()
         )
+        fused_plan = mhc.plan(caps, invocation=FrozenMapping({
+            "operation": "post_pre", "output_mode": "provided",
+            "has_norm_weight": norm_weight is not None,
+            "norm_weight_dtype": "bfloat16" if norm_weight is None else str(norm_weight.dtype).removeprefix("torch."),
+            "has_fn_bf16": fn_bf16 is not None, "rms_eps": args.rms_eps,
+            "hc_eps": args.hc_eps, "sinkhorn_iters": args.sinkhorn_iters, "norm_eps": args.norm_eps,
+            "block_k": args.block_k, "block_h": args.block_h,
+        }))
+        args.split_k = caps.split_k
+        session = stack.enter_context(PreparationSession(device=device, autotune=False, compile_workers=2))
+
+        def prime(state):
+            (spec,) = state.scratch_specs()
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            binding = state.bind(
+                scratch=scratch, tokens=args.tokens, expected_m=args.expected_m,
+                y=torch.empty_like(x), post=torch.empty_like(prev_post),
+                comb=torch.empty_like(prev_comb), out=torch.empty_like(residual),
+            )
+            return PreparedCall(run=lambda: _b12x_mhc_post_pre_impl(
+                x, residual, prev_post, prev_comb, fn, scale, bias,
+                rms_eps=args.rms_eps, hc_eps=args.hc_eps, sinkhorn_iters=args.sinkhorn_iters,
+                norm_weight=norm_weight, norm_eps=args.norm_eps, fn_bf16=fn_bf16,
+                binding=binding, _state=state,
+            ), owners=(scratch, binding))
+
+        session.prepare((fused_plan.request(name="residual-mhc", prepare_call=prime),))
+        planned_config = fused_plan.prepared.state.config
+        fused_scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                              for spec in fused_plan.scratch_specs())
         fused_y = torch.empty((args.tokens, args.hidden_size), dtype=torch.bfloat16, device=device)
         fused_post = torch.empty((args.tokens, 4), dtype=torch.float32, device=device)
         fused_comb = torch.empty((args.tokens, 4, 4), dtype=torch.float32, device=device)
         fused_out = torch.empty((args.tokens, 4, args.hidden_size), dtype=torch.bfloat16, device=device)
-        fused_binding = fused_plan.bind(
+        fused_binding = mhc.bind(fused_plan,
             scratch=fused_scratch, tokens=args.tokens, expected_m=args.expected_m,
             y=fused_y, post=fused_post, comb=fused_comb, out=fused_out,
         )
@@ -379,8 +410,7 @@ def _run_benchmark(args, stack: ExitStack) -> None:
                 x, residual, prev_post, prev_comb, fn, scale, bias,
                 rms_eps=args.rms_eps, hc_eps=args.hc_eps, sinkhorn_iters=args.sinkhorn_iters,
                 norm_weight=norm_weight, norm_eps=args.norm_eps, fn_bf16=fn_bf16,
-                binding=fused_binding, split_k=args.split_k,
-                block_k=args.block_k, block_h=args.block_h,
+                binding=fused_binding,
             )
 
     vllm_out = vllm_post = vllm_comb = vllm_y = None
@@ -432,8 +462,10 @@ def _run_benchmark(args, stack: ExitStack) -> None:
     check()
     if runner is not None:
         runner.lock_workspace()
-    freeze_kernel_resolution("mHC benchmark capture and replay")
-    stack.callback(unfreeze_kernel_resolution)
+    if session is not None:
+        session.freeze()
+    else:
+        stack.enter_context(kernel_resolution_guard("mHC benchmark capture and replay"))
     l2_flush = make_l2_flush_fn(args.l2_flush, args.l2_flush_bytes)
     samples = []
     gpu_before = nvidia_smi_gpu_mode_snapshot() if args.output else None

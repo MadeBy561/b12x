@@ -5,15 +5,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
+from b12x.preparation import PreparationSession, PreparedCall
 from b12x.gemm import block_fp8_linear as bfl
-from b12x.gemm.block_fp8_linear._policy import (
-    BLOCK_FP8_LINEAR_POLICY,
-    BlockFp8LinearConfig,
-    BlockFp8LinearQuery,
-    _validate,
+from b12x.gemm.block_fp8_linear._tuning import (
+    TUNING, BlockFp8LinearConfig, BlockFp8LinearQuery, _validate_config as _validate,
 )
-from b12x.policy import BLOCK_FP8_LINEAR, get_auto_policy
 from tests._reference.helpers import require_b12x
 from tests.gemm.test_gemm_block_fp8_linear import (
     _assert_v41_accumulation_matches_reference,
@@ -28,7 +24,7 @@ from tests.gemm.test_gemm_block_fp8_linear import (
 ])
 def test_splitk_policy_rejects_unsupported_queries(replacement, slices):
     query = BlockFp8LinearQuery(max_tokens=8, in_features=5120,
-                               out_features=1792, output_dtype="bfloat16",
+                               out_features=1792, source_dtype="bfloat16", output_dtype="bfloat16", output_mode="provided",
                                weight_block_size=32)
     config = BlockFp8LinearConfig(backend=f"mxfp8_split{slices}_fp32", tile_m=16, tile_n=64)
     _validate(query, config, None)
@@ -38,27 +34,22 @@ def test_splitk_policy_rejects_unsupported_queries(replacement, slices):
 
 def test_four_slices_require_divisible_k_tiles():
     query = BlockFp8LinearQuery(max_tokens=8, in_features=1536,
-                               out_features=1792, output_dtype="bfloat16",
+                               out_features=1792, source_dtype="bfloat16", output_dtype="bfloat16", output_mode="provided",
                                weight_block_size=32)
     config = BlockFp8LinearConfig(backend="mxfp8_split2_fp32", tile_m=16, tile_n=64)
     _validate(query, config, None)
-    with pytest.raises(ValueError, match="K divisible by 1024"):
+    with pytest.raises(ValueError, match="K divisible"):
         _validate(query, replace(config, backend="mxfp8_split4_fp32"), None)
 
 
-def test_split2_generator_preserves_schema_and_eligibility():
-    from b12x.policy.generation.providers.gemm import (
-        BlockFp8LinearGenerator, _BlockFp8Session, _block_fp8_cases,
-    )
-
-    generator = BlockFp8LinearGenerator()
-    assert generator.config_schema_version == BLOCK_FP8_LINEAR_POLICY.config_schema_version == 4
-    session = _BlockFp8Session(None)
-    for case in _block_fp8_cases():
-        query = BlockFp8LinearQuery(**dict(case.query))
-        for candidate in session.candidates(case):
-            config = BlockFp8LinearConfig.from_profile(candidate.config)
-            _validate(query, config, None)
+def test_split_candidates_are_valid():
+    query = BlockFp8LinearQuery(max_tokens=8, in_features=5120, out_features=1792,
+                               source_dtype="bfloat16", output_dtype="bfloat16",
+                               output_mode="provided", weight_block_size=32)
+    configs = [config for _, config in TUNING.eligible_plan(query, None).candidates]
+    assert {config.backend for config in configs} == {"mxfp8", "mxfp8_split2_fp32", "mxfp8_split4_fp32"}
+    for config in configs:
+        _validate(query, config, None)
 
 
 @pytest.mark.parametrize("slices", (2, 4))
@@ -79,27 +70,26 @@ def test_splitk_public_plan_frozen_live_rows_and_fp64_oracle(capacity, n, slices
     caps = bfl.Caps(device=device, max_tokens=capacity, in_features=k,
                     out_features=n, block_size=(32, 32))
     config = BlockFp8LinearConfig(backend=f"mxfp8_split{slices}_fp32", tile_m=16, tile_n=64)
-    policy = get_auto_policy(device).with_override(BLOCK_FP8_LINEAR, config)
-    plan = bfl.plan(caps, policy=policy)
+    plan = bfl.plan(caps, override=config)
     spec, = plan.scratch_specs()
     scratch = torch.empty(spec.shape, device=device, dtype=spec.dtype)
     output = torch.empty((capacity, n, 1), dtype=source.dtype, device=device)
-    props = torch.cuda.get_device_properties(device)
-    if (props.major, props.minor, props.multi_processor_count) == (12, 0, 188):
-        assert bfl.plan(caps).policy_resolution.config == replace(config, backend="mxfp8_split4_fp32")
-
     def bind(rows):
         return bfl.bind(plan, scratch=scratch, source=source[:rows],
                         packed_weight=packed, output=output[:rows])
 
-    binding = bind(capacity)
-    assert binding.split_k_partials.dtype == torch.float32
-    assert binding.split_k_partials.shape == (slices, capacity, n)
-    assert binding.split_k_partials.data_ptr() == scratch.data_ptr() + plan.split_k_offset_bytes
-    bfl.run(binding=binding)
-    pointers = (source.data_ptr(), scratch.data_ptr(), output.data_ptr())
-    freeze_kernel_resolution("block32 FP32 partials at fixed decode capacity")
-    try:
+    def prepare(state):
+        trial = state.bind(scratch=scratch, source=source, packed_weight=packed, output=output)
+        return PreparedCall(run=lambda: state.run_binding(trial))
+
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare((plan.request(name="split-k", prepare_call=prepare),))
+        binding = bind(capacity)
+        assert binding.workspace.dtype == torch.float32
+        assert binding.workspace.numel() == slices * capacity * n
+        bfl.run(binding=binding)
+        pointers = (source.data_ptr(), scratch.data_ptr(), output.data_ptr())
+        session.freeze()
         for rows in sorted({1, max(1, capacity - 1), capacity}):
             bound = bind(rows)
             graph = torch.cuda.CUDAGraph()
@@ -117,9 +107,8 @@ def test_splitk_public_plan_frozen_live_rows_and_fp64_oracle(capacity, n, slices
                 after = torch.cuda.memory_stats()
                 assert before["allocation.all.allocated"] == after["allocation.all.allocated"]
                 assert pointers == (source.data_ptr(), scratch.data_ptr(), output.data_ptr())
-                assert torch.isfinite(bound.split_k_partials).all()
+                assert torch.isfinite(bound.workspace[:slices * rows * n]).all()
                 _assert_v41_accumulation_matches_reference(
                     source[:rows], weight, scales, output[:rows, :, 0],
                 )
-    finally:
-        unfreeze_kernel_resolution()
+            graph.reset()

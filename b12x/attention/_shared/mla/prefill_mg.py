@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -26,7 +27,8 @@ from b12x._lib.compiler import (
     key_field,
     tensor_key,
 )
-from b12x._lib.compiler import launch as b12x_launch
+from b12x._lib.compiler import launch as b12x_launch, run_compiled
+from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
     atomic_max_shared_f32_offset,
     byte_perm,
@@ -65,8 +67,8 @@ from .decode_math import (
     _nvfp4_pair_bfloat2,
     _ue8m0_zext_byte_to_fp32,
     ld_shared_f32,
-    s0_normalize_dsv41_kv_to_fp8,
     s0_quantize_q_to_smem,
+    s0_normalize_dsv41_kv_to_fp8,
     s1_qk_nope_block_scaled,
     s6_xv_nope,
     st_shared_f32,
@@ -175,6 +177,12 @@ def _wfp8_row_xor(row: Int32) -> Int32:
 
 
 def _to_cute(x, dtype, align=16, dynamic_layout=False):
+    if x.device.type == "meta" and compile_only_launches_enabled():
+        if dynamic_layout:
+            raise ValueError("metadata cache descriptors require the production static layout")
+        from cutlass.cute.runtime import make_fake_tensor
+
+        return make_fake_tensor(dtype, tuple(x.shape), tuple(x.stride()), assumed_align=align)
     c = from_dlpack(x, assumed_align=align)
     c.element_type = dtype
     if dynamic_layout and x.ndim >= 1:
@@ -860,9 +868,6 @@ def _nvfp4_pair_bfloat2_mg(
     outer = latent_scale
     if cutlass.const_expr(latent_scale_per_token):
         outer = ld_shared_f32(kv_sc_base_addr + entry * Int32(4))
-    # Prefill QK has its own MG B-operand loader.  Restore the outer scale
-    # here, before BF16 packing/MMA, to match decode QK and the shared decode
-    # P.V helper.
     return pack_f32x2_to_bfloat2(
         (v0 * scale_f) * outer,
         (v1 * scale_f) * outer,
@@ -3851,17 +3856,16 @@ def _sparse_mla_prefill_mg_flat_launch(
     head_offset: int = 0,
     latent_scale_per_token: bool = False,
     fp8_internal: bool = False,
+    prepared: object | None = None,
 ) -> None:
-    traits = replace(
-        make_unified_traits(
-            int(model_type),
-            compute_mode,
-            int(scale_format),
-            fp8_rope=bool(fp8_rope),
-            latent_scale_per_token=bool(latent_scale_per_token),
-        ),
-        fp8_internal=bool(fp8_internal),
+    traits = make_unified_traits(
+        int(model_type),
+        compute_mode,
+        int(scale_format),
+        fp8_rope=bool(fp8_rope),
+        latent_scale_per_token=bool(latent_scale_per_token),
     )
+    traits = replace(traits, fp8_internal=bool(fp8_internal))
     layout = make_smem_layout_mg(traits, int(mg_n_hg))
     q_head_dim = int(q.shape[2])
     total_heads = int(q.shape[1])
@@ -4002,7 +4006,8 @@ def _sparse_mla_prefill_mg_flat_launch(
         )
     if has_extra:
         # The dual key_fields are appended ONLY for has_extra so the single-cache
-        # shape key remains free of dual-only fields.
+        # shape key remains free of dual-only fields. The explicit v2 version
+        # below deliberately invalidates the old device ABI.
         spec_fields.extend(
             [
                 key_field("has_extra", int(has_extra)),
@@ -4019,8 +4024,13 @@ def _sparse_mla_prefill_mg_flat_launch(
         )
     compile_spec = KernelCompileSpec.from_fields(
         "attention.mla.sm120.prefill_mg",
-        # v14: V4.1 shares canonical FP8 KV across DSV4-style BF16 QK / FP8 PV.
-        14,
+        # v4: latent_scale == 1.0 is folded out at trace time, producing a
+        # cubin without the outer-scale multiply; the identity and dynamic
+        # variants must not share a cache entry.
+        # v5: latent_scale_per_token joins the key (per-candidate fp32 scale
+        # read from kv_sc smem). In that mode the launch scalar is dead, so the
+        # identity fold is forced ON -- no per-scalar variants get compiled.
+        5,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),
@@ -4028,7 +4038,9 @@ def _sparse_mla_prefill_mg_flat_launch(
         *spec_fields,
     )
     entry = kernel.call_dual if has_extra else kernel
-    b12x_launch(entry, compile_spec=compile_spec, compile_args=args, runtime_args=args)
+    if prepared is not None:
+        return run_compiled(prepared, args)
+    return b12x_launch(entry, compile_spec=compile_spec, compile_args=args, runtime_args=args)
 
 
 @torch.library.custom_op(
@@ -4245,6 +4257,7 @@ def run_unified_prefill_mg(
     active_heads: int | None = None,
     head_offset: int = 0,
     traits_override: UnifiedMLATraits | None = None,
+    prepared: object | None = None,
 ):
     if traits_override is not None:
         model_type = int(traits_override.model_type)
@@ -4350,7 +4363,7 @@ def run_unified_prefill_mg(
         # argument. Reuse one caller-owned int32 length word as an f32-typed
         # placeholder instead of allocating a CUDA tensor on every serving
         # launch (including during graph capture).
-        attn_sink_t = topk_length.view(torch.float32)[:1]
+        attn_sink_t = topk_length.view(torch.float32).as_strided((1,), (1,))
 
     if stride_kv_block is None:
         if model_type == ModelType.DSV41:
@@ -4406,6 +4419,8 @@ def run_unified_prefill_mg(
             and active_heads == total_heads
             and head_offset == 0
             and not traits.fp8_internal
+            and prepared is None
+            and not compile_only_launches_enabled()
         ):
             torch.ops.b12x.sparse_mla_sm120_prefill_mg_dual(
                 q, _cache_base_tensor(kv_cache), topk_indices, topk_length,
@@ -4417,7 +4432,7 @@ def run_unified_prefill_mg(
                 int(stride_extra_kv_block), bool(row_xor),
             )
         else:
-            _sparse_mla_prefill_mg_flat_launch(
+            result = _sparse_mla_prefill_mg_flat_launch(
                 q, _cache_base_tensor(kv_cache), topk_indices, topk_length,
                 attn_sink_t, output, lse_out, _cache_base_tensor(extra_kv_cache),
                 extra_indices_t, extra_len_t, float(sm_scale), float(latent_scale),
@@ -4427,7 +4442,10 @@ def run_unified_prefill_mg(
                 int(pbs_extra), int(stride_extra_kv_block), bool(row_xor),
                 active_heads=active_heads, head_offset=head_offset,
                 fp8_internal=bool(traits.fp8_internal),
+                prepared=prepared,
             )
+            if compile_only_launches_enabled():
+                return result
         return output, lse_out
 
     if (
@@ -4435,6 +4453,8 @@ def run_unified_prefill_mg(
         and active_heads == total_heads
         and head_offset == 0
         and not traits.fp8_internal
+        and prepared is None
+        and not compile_only_launches_enabled()
     ):
         torch.ops.b12x.sparse_mla_sm120_prefill_mg(
             q,
@@ -4459,7 +4479,7 @@ def run_unified_prefill_mg(
             bool(latent_scale_per_token),
         )
     else:
-        _sparse_mla_prefill_mg_flat_launch(
+        result = _sparse_mla_prefill_mg_flat_launch(
             q,
             _cache_base_tensor(kv_cache),
             topk_indices,
@@ -4492,5 +4512,8 @@ def run_unified_prefill_mg(
             head_offset=head_offset,
             latent_scale_per_token=bool(latent_scale_per_token),
             fp8_internal=bool(traits.fp8_internal),
+            prepared=prepared,
         )
+        if compile_only_launches_enabled():
+            return result
     return output, lse_out
