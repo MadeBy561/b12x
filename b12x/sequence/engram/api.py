@@ -127,9 +127,9 @@ class DiskTable:
     eager-only; downstream graphs consume the binding's stable BF16 output.
 
     resident_scales retains the owned original E8M0 bytes in mapped host RAM
-    and removes scale-plane disk reads. prefetch allows one outstanding read
-    per table. Both are opt-in; callers must budget scale RAM and drain reads
-    before reusing request state.
+    and removes scale-plane disk reads. It is opt-in; callers must budget
+    scale RAM. Disk lookup is synchronous. The legacy prefetch argument and
+    methods are accepted as no-ops for integrations that still pass them.
     """
 
     def __init__(
@@ -141,7 +141,7 @@ class DiskTable:
         resident_scales: bool = False,
         prefetch: bool = False,
     ) -> None:
-        from .._shared.disk_table import DiskPrefetch, DiskRowCache, MappedHostAllocation
+        from .._shared.disk_table import DiskRowCache, MappedHostAllocation
 
         if not isinstance(plan, Plan):
             raise TypeError("plan must be Plan")
@@ -175,50 +175,20 @@ class DiskTable:
             )
             self._scale_owner.host_view.zero_()
             self.scale_bytes = self._scale_owner.device_view
-        self._prefetch = DiskPrefetch(self._cache) if prefetch else None
-        self._prefetch_binding = None
 
     @property
     def prefetch_pending(self) -> bool:
-        """Whether staging is still owned by an unconsumed prefetch."""
-        return self._prefetch is not None and self._prefetch.pending
+        """Legacy compatibility: no disk reads remain pending between lookups."""
+        return False
 
     def prefetch(self, binding: LookupBinding, token_count: int) -> None:
-        """Start a bounded read; run_lookup consumes it without repeating I/O.
-
-        All IDs and num_tokens must stay immutable until consumption. Independent
-        tables may begin reads before either is consumed. Both calls must be on
-        the same host thread and CUDA stream, outside compilation/capture.
-        """
-        if self._prefetch is None:
-            raise RuntimeError("disk prefetch must be enabled at construction")
-        if binding.disk_table is not self:
-            raise ValueError("binding belongs to another disk table")
-        if self._prefetch_binding is not None:
-            raise RuntimeError("disk table has an unconsumed prefetch")
-        token_count = operator.index(token_count)
-        if not 0 <= token_count <= self.plan.caps.max_tokens:
-            raise ValueError("token_count exceeds planned capacity")
-        self._prefetch.begin(binding.hash_ids, token_count * 24)
-        self._prefetch_binding = binding
+        """Legacy no-op; run_lookup reads and consumes the current rows."""
 
     def abort_prefetch(self) -> None:
-        """Drain a failed/cancelled request before its staging can be reused."""
-        try:
-            if self._prefetch is not None:
-                self._prefetch.abort()
-        finally:
-            if self._prefetch is None or not self._prefetch.pending:
-                self._prefetch_binding = None
+        """Legacy no-op; synchronous lookup owns its entire transaction."""
 
     def close(self) -> None:
-        """Join any outstanding I/O worker; existing GPU storage stays owned."""
-        try:
-            if self._prefetch is not None:
-                self._prefetch.close()
-        finally:
-            if self._prefetch is None or not self._prefetch.pending:
-                self._prefetch_binding = None
+        """Legacy no-op; there is no background I/O worker to join."""
 
     def add_shard(
         self, index: int, path: str, offset: int, *, scale: bool = False
@@ -582,34 +552,22 @@ def run_lookup(
     else:
         _require_disk_eager(p.caps.device)
         cache = b.disk_table._cache
-        prefetched = b.disk_table._prefetch_binding
-        if prefetched is not None and prefetched is not b:
-            raise ValueError("disk table has a prefetch for a different binding")
-        context = (
-            b.disk_table._prefetch.consume(b.hash_ids, prepared * 24)
-            if prefetched is not None else cache.transaction()
-        )
-        try:
-            with context:
-                if prefetched is None:
-                    cache.read_rows(b.hash_ids, prepared * 24)
-                lookup_op(
-                    b.weight,
-                    b.scale_bytes,
-                    b.hash_ids,
-                    b.num_tokens,
-                    b.out,
-                    p.table_rows,
-                    p.shard_start,
-                    p.shard_end,
-                    compact_rows=True,
-                    resident_scales=b.disk_table.resident_scales,
-                    prepared_tokens=prepared,
-                    clear_tail=clear_tail,
-                )
-        finally:
-            if prefetched is not None and not b.disk_table._prefetch.pending:
-                b.disk_table._prefetch_binding = None
+        with cache.transaction():
+            cache.read_rows(b.hash_ids, prepared * 24)
+            lookup_op(
+                b.weight,
+                b.scale_bytes,
+                b.hash_ids,
+                b.num_tokens,
+                b.out,
+                p.table_rows,
+                p.shard_start,
+                p.shard_end,
+                compact_rows=True,
+                resident_scales=b.disk_table.resident_scales,
+                prepared_tokens=prepared,
+                clear_tail=clear_tail,
+            )
     return b.out
 
 
