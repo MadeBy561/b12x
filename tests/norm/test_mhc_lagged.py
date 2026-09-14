@@ -303,3 +303,63 @@ def test_standalone_collapse_fp32_accumulation_and_frozen_replay(hidden, mhc_ses
         assert bool(torch.isnan(weighted[rows:]).all())
         assert bool(torch.isnan(mean[rows:]).all())
         graph.reset()
+
+
+@pytest.mark.parametrize("tile_k,stages", [(32, 3), (64, 2)])
+@pytest.mark.parametrize("tokens", [1, 17])
+def test_lagged_post_pre_tf32_small_projection_tile(tile_k, stages, tokens, mhc_session):
+    device = require_sm120()
+    hidden = 5120
+    residual, x, fn, scale, bias = _make_inputs(
+        tokens=tokens, hidden_size=hidden, seed=92154, device=device,
+    )
+    _, prev_post, prev_comb = _mhc_pre_reference(
+        residual, fn, scale, bias, rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20,
+    )
+    prev_post, prev_comb = prev_post.contiguous(), prev_comb.contiguous()
+    incoming = torch.zeros((tokens, 4), device=device)
+    incoming[:, 0] = 1
+    weight = torch.ones(hidden, dtype=torch.bfloat16, device=device)
+    options = dict(pre_mix=incoming, norm_weight=weight, norm_eps=1e-20,
+                   rms_eps=1e-20, hc_eps=1e-6, sinkhorn_iters=20)
+    config = mhc.MhcConfig(
+        backend="tf32_tma", projection_tile_m=16, projection_tile_n=8,
+        projection_tile_k=tile_k, projection_num_stages=stages,
+        projection_num_m_warps=1, projection_num_n_warps=1,
+        projection_k_splits=2, lagged_prepare=False,
+    )
+    from b12x.preparation import FrozenMapping
+    plan = mhc.plan(
+        mhc.Caps(device=device, max_tokens=tokens, hidden_size=hidden),
+        invocation=FrozenMapping(dict(operation="post_pre", lagged_mix=True,
+            has_norm_weight=True, norm_eps=1e-20, rms_eps=1e-20,
+            hc_eps=1e-6, sinkhorn_iters=20)), override=config,
+    )
+    args = (x, residual, prev_post, prev_comb, fn, scale, bias)
+    prepare(mhc_session, "post_pre", args, options, plan=plan)
+    predicted = torch.empty_like(incoming)
+    binding = bind(plan, pre_out=predicted)
+    mhc_session.freeze()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with mhc_session.capture(), torch.cuda.graph(graph):
+            actual = mhc.run_post_pre(*args, **options, binding=binding)
+        pointers = tuple(t.data_ptr() for t in (*actual, predicted))
+        incoming.copy_(incoming.roll(1, dims=1))
+        x.neg_()
+        for output in (*actual, predicted):
+            output.fill_(float("nan"))
+        allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+        assert tuple(t.data_ptr() for t in (*actual, predicted)) == pointers
+        current = _mhc_post_reference(x, residual, prev_post, prev_comb)
+        torch.testing.assert_close(actual[0], current, rtol=0, atol=0.008)
+        expected = _lagged_reference(actual[0], fn, scale, bias, incoming, weight)
+        for got, want in zip((*actual[1:], predicted), expected, strict=True):
+            assert bool(torch.isfinite(got).all()) and bool(got.count_nonzero())
+            torch.testing.assert_close(got, want, rtol=2e-5,
+                atol=0.008 if got.dtype == torch.bfloat16 else 4e-5)
+    finally:
+        graph.reset()

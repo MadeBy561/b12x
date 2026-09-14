@@ -334,6 +334,39 @@ def test_mhc_predicates_remove_inactive_work_without_rejecting_useful_tails():
         )
 
 
+@pytest.mark.parametrize("tile_k", [8, 16])
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
+    from b12x.norm.mhc import _tuning as component
+    from b12x.norm.mhc._kernels import MHCPrefillTf32ProjectTmaKernel
+
+    query = component.MhcQuery(
+        dtype="bfloat16", max_tokens=1, hidden_size=5120, split_k=80,
+        operation=operation, has_norm_weight=True, lagged_mix=True,
+        expanded_residual=operation == "pre", norm_eps=1e-20,
+        rms_eps=1e-20, smem_limit=100 << 10,
+    )
+    choice = dict(
+        backend="tf32_tma", lagged_prepare=False, projection_tile_n=8,
+        projection_tile_k=tile_k, projection_num_stages=3,
+        projection_num_m_warps=1, projection_num_n_warps=1,
+        projection_k_splits=2,
+    )
+    space = component.TUNING.parameter_space(query, None)
+    with pytest.raises(ValueError, match="predicates"):
+        space.validate(choice)
+    config = component.MhcConfig(projection_tile_m=16, **choice)
+    with pytest.raises(ValueError, match="at least 32"):
+        component.TUNING.validate_config(query, config, None)
+    with pytest.raises(ValueError, match="at least 32"):
+        MHCPrefillTf32ProjectTmaKernel(
+            hidden_size=5120, split_k=80, tile_m=16, tile_n=8,
+            tile_k=tile_k, num_stages=3, num_m_warps=1, num_n_warps=1,
+            k_splits=2, split_fp32_fn=True,
+        )
+    space.validate({**choice, "projection_tile_k": 32})
+
+
 def _thawed(value):
     if isinstance(value, dict):
         return FrozenMapping({name: _thawed(item) for name, item in value.items()})

@@ -29,7 +29,7 @@ def _batched_payload(query_payload, invocation):
     values = dict(invocation)
     return query, (
         tuple(values["q_shape"]), tuple(values["k_shape"]), tuple(values["v_shape"]),
-        torch.device("cuda", int(values["device_index"])), getattr(torch, values["dtype"]),
+        getattr(torch, values["dtype"]),
         bool(values["causal"]), int(values["window_size_left"]),
         int(values["window_size_right"]), bool(values["has_attention_sink_bias"]),
     ), contiguous
@@ -43,7 +43,7 @@ def _varlen_payload(query_payload, invocation):
     return query, (
         tuple(values["q_shape"]), tuple(values["k_shape"]), tuple(values["v_shape"]),
         tuple(values["cu_seqlens_q_shape"]), tuple(values["cu_seqlens_k_shape"]),
-        torch.device("cuda", int(values["device_index"])), getattr(torch, values["dtype"]),
+        getattr(torch, values["dtype"]),
         bool(values["causal"]), int(values["window_size_left"]),
         int(values["window_size_right"]), bool(values["has_attention_sink_bias"]),
         int(values["max_seqlen_q"]), int(values["max_seqlen_k"]),
@@ -55,7 +55,7 @@ def compile_batched_attention(query_payload, invocation, config_payload, ordinal
     config = VarlenAttentionConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
     TUNING.validate_config(query, config, None)
-    q_shape, k_shape, v_shape, _device, dtype, causal, left, right, has_sink = values
+    q_shape, k_shape, v_shape, dtype, causal, left, right, has_sink = values
     with torch.cuda.device(ordinal):
         return contiguous._compile_attention(
             q_shape, k_shape, v_shape, dtype, causal, left, right, has_sink,
@@ -68,7 +68,7 @@ def compile_varlen_attention(query_payload, invocation, config_payload, ordinal)
     config = VarlenAttentionConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
     TUNING.validate_config(query, config, None)
-    (*shapes, _device, dtype, causal, left, right, has_sink, max_q, max_k) = values
+    (*shapes, dtype, causal, left, right, has_sink, max_q, max_k) = values
     q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape = shapes
     with torch.cuda.device(ordinal):
         return contiguous._compile_varlen_attention(
@@ -222,7 +222,7 @@ def _batched_invocation(q, k, v, *, causal, window_size, attention_sink_bias):
     )
     return query, FrozenMapping({
         "q_shape": q_shape, "k_shape": k_shape, "v_shape": v_shape,
-        "device_index": contiguous._cuda_device_index(device), "dtype": _dtype_name(dtype),
+        "dtype": _dtype_name(dtype),
         "causal": bool(causal), "window_size_left": left, "window_size_right": right,
         "has_attention_sink_bias": sink is not None,
         "sink_requires_copy": contiguous._attention_sink_requires_copy(sink),
@@ -254,7 +254,7 @@ def _varlen_invocation(q, k, v, cu_seqlens_q, cu_seqlens_k, *, max_seqlen_q, max
     return query, FrozenMapping({
         "q_shape": q_shape, "k_shape": k_shape, "v_shape": v_shape,
         "cu_seqlens_q_shape": cu_q_shape, "cu_seqlens_k_shape": cu_k_shape,
-        "device_index": contiguous._cuda_device_index(device), "dtype": _dtype_name(dtype),
+        "dtype": _dtype_name(dtype),
         "causal": bool(causal), "window_size_left": left, "window_size_right": right,
         "has_attention_sink_bias": sink is not None,
         "sink_requires_copy": contiguous._attention_sink_requires_copy(sink),
@@ -331,7 +331,7 @@ def plan_batched(q, k, v, *, causal=True, window_size=None, attention_sink_bias=
 
     def materialize(selection, device):
         _, values, contiguous = _batched_payload(TUNING.encode_query(query), invocation)
-        q_shape, k_shape, v_shape, _device, dtype, selected_causal, left, right, has_sink = values
+        q_shape, k_shape, v_shape, dtype, selected_causal, left, right, has_sink = values
         concrete = contiguous._get_attention_plan(
             q_shape, k_shape, v_shape, device.ordinal, dtype, selected_causal, left, right,
             has_sink, selection.config.tile_m, selection.config.tile_n,
@@ -360,7 +360,7 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
 
     def materialize(selection, device):
         _, values, contiguous = _varlen_payload(TUNING.encode_query(query), invocation)
-        (*shapes, _device, dtype, selected_causal, left, right, has_sink, max_q, max_k) = values
+        (*shapes, dtype, selected_causal, left, right, has_sink, max_q, max_k) = values
         q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape = shapes
         concrete = contiguous._get_varlen_attention_plan(
             q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape, device.ordinal, dtype,

@@ -37,6 +37,7 @@ class DenseGemmQuery:
     workspace_nbytes: int | None = None
     sm_count: int | None = None
     workspace_form: str = "owned"
+    sfb_k_replicated: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "overrides", FrozenMapping(self.overrides))
@@ -90,6 +91,10 @@ def validate_query(query):
         raise ValueError("expected_m must be a positive integer or None")
     if query.sm_count is not None and (type(query.sm_count) is not int or query.sm_count <= 0):
         raise ValueError("SM capacity must be a positive integer or None")
+    if type(query.sfb_k_replicated) is not bool:
+        raise TypeError("weight-scale replication must be a boolean")
+    if query.sfb_k_replicated and query.recipe != "mxfp8":
+        raise ValueError("weight-scale replication requires MXFP8")
     if query.codegen != _codegen_snapshot():
         raise ValueError("dense declaration code-generation controls differ from the loaded kernels")
     allowed = {
@@ -130,6 +135,7 @@ def operand_options(query):
         sf_vec_size={"nvfp4": 16, "block_fp8": 128}.get(recipe, 32),
         plain_fp8=recipe == "tensor_fp8",
         block_fp8=recipe == "block_fp8",
+        sfb_k_replicated=query.sfb_k_replicated,
     )
 
 
@@ -170,10 +176,8 @@ def query_from_call(lhs, rhs, out=None, *, entry_point, options):
         )
         if options.get(name) is not None
     )
-    if unsupported or options.get("sfb_k_replicated", False):
-        raise ValueError(
-            f"dense search does not model auxiliary operands: {unsupported or ('sfb_k_replicated',)}"
-        )
+    if unsupported:
+        raise ValueError(f"dense search does not model auxiliary operands: {unsupported}")
     ab, sf, vec = (
         options.get(name) for name in ("ab_dtype", "sf_dtype", "sf_vec_size")
     )
@@ -305,6 +309,7 @@ def query_from_call(lhs, rhs, out=None, *, entry_point, options):
         alpha_mode="unit" if alpha is None else "tensor",
         expected_m=expected_m,
         sm_count=options.get("sm_count"),
+        sfb_k_replicated=options.get("sfb_k_replicated", False),
         workspace_nbytes=None if workspace is None else workspace.numel() * workspace.element_size(),
         workspace_form="owned" if workspace is None else "provided",
         overrides=FrozenMapping({
@@ -513,7 +518,7 @@ def _validate_query(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.mm",
-    query_schema_version=5,
+    query_schema_version=6,
     config_schema_version=2,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),

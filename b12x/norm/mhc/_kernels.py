@@ -2656,6 +2656,8 @@ class MHCPrefillTf32ProjectTmaKernel:
             )
         if self.tile_k % 8 != 0:
             raise ValueError(f"TF32 TMA tile_k={self.tile_k} must be divisible by 8")
+        if self.tile_k < 32:
+            raise ValueError("TF32 TMA projection requires at least 32 FP32 weights per row")
         if self.tile_n <= 0 or self.tile_n % 8 != 0:
             raise ValueError(
                 f"TF32 TMA tile_n={self.tile_n} must be a positive multiple of 8 "

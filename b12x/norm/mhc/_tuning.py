@@ -245,6 +245,8 @@ def _validate(
     total_k = _MHC_MULT * query.hidden_size
     if config.projection_tile_k <= 0 or config.projection_tile_k % 8:
         raise ValueError("projection_tile_k must be a positive multiple of 8")
+    if config.projection_tile_k < 32:
+        raise ValueError("TF32 TMA projection requires at least 32 FP32 weights per row")
     if total_k % config.projection_tile_k:
         raise ValueError("projection_tile_k must divide the flattened hidden width")
     k_tiles = total_k // config.projection_tile_k
@@ -358,6 +360,8 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
         TUNING.knobs,
         values=values,
         predicates=(
+            # Smaller FP32 weight rows produce invalid split TMA copies.
+            lambda p: p["backend"] != "tf32_tma" or p["projection_tile_k"] >= 32,
             # Each M warp owns 16 rows. Do not launch warps that are inactive even
             # in the first tile; partial final tiles remain useful and eligible.
             lambda p: (
@@ -417,7 +421,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=8,
+    candidate_contract_version=9,
     knobs=(
         Knob(
             name="backend",
