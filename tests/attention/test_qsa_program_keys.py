@@ -49,7 +49,7 @@ def _qsa_corpus_queries() -> list[dict[str, object]]:
     return queries
 
 
-def _program_keys_by_geometry(payload: dict[str, object], connection) -> None:
+def _program_keys_by_geometry(payload: dict[str, object] | None, connection) -> None:
     """Report the planned program keys of each page-count variant of one query."""
     try:
         from b12x._lib import compile_pool
@@ -62,10 +62,38 @@ def _program_keys_by_geometry(payload: dict[str, object], connection) -> None:
             0, (12, 0), DEVICE_UUID, PRODUCT_NAME, 170, 232448, 232448, activity,
         )
         identity = DeviceIdentity("nvidia", (12, 0), 170, PRODUCT_NAME)
+        if payload is None:
+            import torch
+
+            from b12x.attention.qsa._contract import Caps, _query_from_caps
+            from b12x.preparation import FrozenMapping
+
+            caps = Caps(
+                device=torch.device("cuda:0"),
+                max_batch=4,
+                max_raw_state_slots=4,
+                max_q_rows=4096,
+                max_seq_len=262144,
+                num_main_cache_pages=1400,
+                num_compressed_cache_pages=1400,
+                main_page_size=1504,
+                compressed_page_size=376,
+                max_speculative_tokens=3,
+                q_heads=12,
+                kv_heads=1,
+                index_heads=4,
+                position_axes=3,
+                mrope_interleaved=True,
+                mrope_sections=(11, 11, 10),
+            )
+            payload = _query_from_caps(caps, FrozenMapping()).to_dict()
         keys = {}
+        minimum_main, minimum_compressed = _smallest_legal_page_counts(payload)
         for main_pages, compressed_pages in (
             *PAGE_COUNTS, _smallest_legal_page_counts(payload),
         ):
+            if main_pages < minimum_main or compressed_pages < minimum_compressed:
+                continue
             query = QsaQuery(**{
                 **payload,
                 "num_main_cache_pages": main_pages,
@@ -131,3 +159,18 @@ def test_qsa_program_keys_ignore_the_cache_page_counts(payload, tmp_path) -> Non
             f"QSA programs for page counts {geometry} differ from {reference_geometry}: "
             f"{sorted(set(map(tuple, programs)) ^ set(map(tuple, reference)))}"
         )
+
+
+def test_qsa_multi_chunk_programs_are_retained(tmp_path) -> None:
+    pytest.importorskip("cutlass")
+    pytest.importorskip("triton")
+    keys = _plan_in_offline_worker(None, tmp_path)
+    reference = next(iter(keys.values()))
+    for programs in keys.values():
+        assert programs == reference
+    for name in (
+        "_stage_topk_carry_kernel",
+        "_remap_topk_group_ids_kernel",
+        "_emit_stable_topk_kernel",
+    ):
+        assert sum(program[2] == name for program in reference) > 1, name

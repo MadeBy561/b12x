@@ -425,7 +425,7 @@ def test_disk_preparation_matches_resident_and_graph_consumes_only_output(
     graph.replay()
     torch.testing.assert_close(consumed, expected * 2, rtol=0, atol=0)
     with monkeypatch.context() as patch:
-        patch.setattr(table._native, "ple_reader_run", lambda *args: pytest.fail("consumer graph must not issue disk I/O"))
+        patch.setattr(table._cache, "read_rows", lambda *args: pytest.fail("consumer graph must not issue disk I/O"))
         graph.replay()
         torch.testing.assert_close(consumed, expected * 2, rtol=0, atol=0)
     with monkeypatch.context() as patch:
@@ -448,8 +448,9 @@ def test_disk_compact_rows_preserve_duplicates_and_tp_shard_boundaries(resources
         [edge + 1, edge - 1, layout.shard_start, -2], [-1, -1, -1, -1]], dtype=torch.int64)
     binding._ids.copy_(ids.to(device))
     torch.cuda.synchronize(binding.out.device)
-    table.ids_host.copy_(ids)
-    table._native.ple_reader_run(table._reader, table._ids_buffer, table._weight_buffer, table._scale_buffer, ids.numel())
+    with table._cache.transaction():
+        table._cache.read_rows(binding._ids, ids.numel())
+        torch.cuda.synchronize(binding.out.device)
     binding.num_tokens.fill_(4)
     state = require_prepared(binding.plan, "sequence.ple_embedding", binding.out.device)
     scale = table.weight_scale if quant_mode == "nvfp4_group16" else binding.weight_scale

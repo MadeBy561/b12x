@@ -60,11 +60,15 @@ def compile_engram(query_payload, config_payload, ordinal):
     shard_end = (query.tp_rank + 1) * shard_rows
     with torch.cuda.device(ordinal):
         if query.operation == "lookup":
+            gather = ()
+            if query.compact_rows:
+                from .._shared._gds import compile_gather
+                gather = (compile_gather(ordinal),)
             return (kernels._lookup.warmup(
                 p["weight"], p["scales"], p["hashes"], p["num_tokens"], p["out"], t,
                 T=t, ROWS=query.table_rows, START=shard_start, END=shard_end,
                 COMPACT=query.compact_rows, RESIDENT_SCALES=query.resident_scales, num_warps=4, grid=(t, 24, 1),
-            ),)
+            ), *gather)
         return (
             kernels._compress.warmup(
                 p["ids"], p["mask"], p["token_map"], p["num_tokens"], p["compressed"],

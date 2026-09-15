@@ -820,10 +820,11 @@ _support_launch_context: contextvars.ContextVar[
 
 def _support_kernel_key(kernel: object, constexprs: Mapping[str, object]) -> str:
     key = _SUPPORT_KERNEL_KEYS[kernel]
-    # The final score chunk may have a shorter legal static GROUP_COUNT ABI.
-    # It is a declared variant, not a runtime compiler/cache resolution.
+    # Planned score chunks have distinct static offsets and final chunk sizes.
     if kernel is _score_representatives_kernel:
-        return f"{key}/groups-{int(constexprs['GROUP_COUNT'])}"
+        key = f"{key}/groups-{int(constexprs['GROUP_COUNT'])}"
+    if "GROUP_OFFSET" in constexprs:
+        key = f"{key}/offset-{int(constexprs['GROUP_OFFSET'])}"
     return key
 
 

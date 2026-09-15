@@ -19,6 +19,11 @@ compiler and its CUDA 13 libraries come in as wheel dependencies
 (`nvidia-cutlass-dsl == 4.6.2`), so there is no separate build step. A
 `PreparationSession` compiles missing kernels before publishing execution.
 
+The optional vLLM [checkpoint loader](docs/checkpoint-loading.md) uses
+`--load-format b12x`: coherent managed-memory direct I/O on Spark, and shared
+GPUDirect Storage into device memory on discrete GPUs. Enable its
+`b12x_loader` vLLM plugin; the device selects the transport automatically.
+
 ## What's in here
 
 Every kernel is one op at `b12x.<group>.<op>`; `list_ops()` enumerates the
@@ -89,9 +94,12 @@ with `zero_centered=False`. `norm.mhc.run_pre` and `run_post_pre` accept
 incoming `pre_mix` and caller-owned `pre_out` for lagged V4.1 mixing, while
 `run_collapse` supports the final weighted collapse and uniform stream mean.
 
-PLE and Engram share the bounded io_uring row cache in
+PLE and Engram share the bounded disk row cache in
 `sequence._shared.disk_table`: registered file regions, aligned O_DIRECT reads,
-block deduplication/coalescing, mapped-host staging, and stream-safe reuse.
+block deduplication/coalescing, and stream-safe reuse. The default io_uring
+transport stages rows in mapped host memory. `B12X_DISK_BACKEND=gds` selects
+optional cuFile batch reads and GPU row gathering with device staging;
+see [disk transport requirements and qualification](docs/disk-embedding-backends.md).
 Their hashing and decoding stay separate. Engram's `DiskTable` reads the
 checkpoint's FP8 weight rows and separate E8M0 scale rows without conversion or
 full-table allocation; `run_lookup(..., token_count=...)` prepares fixed GPU

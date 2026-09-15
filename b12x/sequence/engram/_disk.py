@@ -172,5 +172,5 @@ class DiskTable:
         self._require_open()
         result = self._cache.stats()
         result["resident_scale_bytes"] = self._scale_owner.nbytes if self._scale_owner else 0
-        result["owned_host_bytes"] = result["owned_staging_bytes"] + result["resident_scale_bytes"]
+        result["owned_host_bytes"] = result["owned_host_bytes"] + result["resident_scale_bytes"]
         return result

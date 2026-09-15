@@ -44,7 +44,7 @@ from b12x.sequence.ple_embedding.reference import _dequantize_selected_nvfp4
 ENGRAM_PATH = "/data/cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/fb2764a5cf321eaa5070ca8f9e892818f477c16d"
 QWEN_PATH = "/data/models/qwen3.8-flash-next-mixed/qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1"
 PLE_PREFIX = "model.language_model.layers.1.ple.ple_embedding."
-WARNING = "Native hash/D2H/event/io_uring/GPU-decode transaction timing; NOT full model inference or TP projection timing."
+WARNING = "Native hash/D2H/event/disk/GPU-decode transaction timing; NOT full model inference or TP projection timing."
 
 
 def digest(path: pathlib.Path) -> str:
@@ -111,18 +111,21 @@ def select_native_reader(reader_library: pathlib.Path | None) -> pathlib.Path:
     return pathlib.Path(module.__file__).resolve()
 
 
+@dataclass(frozen=True)
+class FilePlane:
+    path: str
+    offset: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
 class Checkpoint:
     def __init__(self, root: pathlib.Path):
-        from vllm.model_executor.model_loader.weight_utils import (
-            safetensors_file_sources,
-        )
-
         self.root = root
         self.config = json.loads((root / "config.json").read_text())
         self.index = json.loads((root / "model.safetensors.index.json").read_text())[
             "weight_map"
         ]
-        self.header_reader = safetensors_file_sources
         self.headers: dict[str, Any] = {}
         self.sources: dict[str, Any] = {}
         self.files: dict[str, Any] = {}
@@ -132,8 +135,26 @@ class Checkpoint:
         if filename not in self.headers:
             path = self.root / filename
             self.files[filename] = file_identity(path)
-            self.headers[filename] = self.header_reader(str(path))
-        source = self.headers[filename][key]
+            from b12x.loader._checkpoint import _unique_object
+            with path.open("rb", buffering=0) as stream:
+                size = int.from_bytes(stream.read(8), "little")
+                if not 0 < size <= 64 << 20 or size + 8 > self.files[filename]["size"]:
+                    raise ValueError(f"Invalid safetensors header length: {path}")
+                header = json.loads(stream.read(size), object_pairs_hook=_unique_object)
+            self.headers[filename] = (8 + size, header)
+        origin, header = self.headers[filename]
+        entry = header[key]
+        dtypes = {"F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8m0fnu,
+                  "U8": torch.uint8, "BF16": torch.bfloat16, "F32": torch.float32,
+                  "I64": torch.int64, "I32": torch.int32}
+        dtype = dtypes[entry["dtype"]]
+        begin, end = entry["data_offsets"]
+        shape = tuple(entry["shape"])
+        if any(type(x) is not int or x < 0 for x in (*shape, begin, end)) or not begin <= end:
+            raise ValueError(f"Invalid safetensors range: {key}")
+        if math.prod(shape) * dtype.itemsize != end - begin or origin + end > self.files[filename]["size"]:
+            raise ValueError(f"Safetensors extent mismatch: {key}")
+        source = FilePlane(str(self.root / filename), origin + begin, shape, dtype)
         self.sources[key] = source
         return source
 
@@ -375,10 +396,6 @@ class Case:
 
     def check(self, query: dict[str, Any], prepared: int, count: int) -> dict[str, Any]:
         live = len(query["tokens"])
-        if int(self.binding.error_code.item()) != 0:
-            raise AssertionError(
-                f"Native metadata error: {self.binding.error_code.item()}"
-            )
         torch.testing.assert_close(
             self.ids[:live].cpu(), self.expected_hashes(query), rtol=0, atol=0
         )
@@ -482,8 +499,10 @@ def make_case(args, checkpoint, model, owner, capacity, token_map, initial_query
             raise ValueError("Engram checkpoint row counts differ from planned geometry")
         caps = engram.Caps(**common, max_requests=args.max_seqs, vocab_size=config["vocab_size"], layer_id=owner)
         plan = engram.plan(caps, token_map=token_map, geometry=geometry)
+        reader_options["resident_scales"] = args.engram_resident_scales
         lookup_plan = engram.plan(caps, token_map=token_map, geometry=geometry,
-                                  invocation={"operation": "lookup", "compact_rows": True})
+                                  invocation={"operation": "lookup", "compact_rows": True,
+                                              "resident_scales": args.engram_resident_scales})
         source_rows = plan.query.table_rows
         planes = {0: (f"layers.{owner}.engram.embed.weight", f"layers.{owner}.engram.embed.scale")}
         widths, dtypes = (256, 8), (torch.float8_e4m3fn, (torch.uint8, torch.float8_e8m0fnu))
@@ -582,7 +601,6 @@ def make_case(args, checkpoint, model, owner, capacity, token_map, initial_query
             session.prepare((plan.request(name="ple-embedding", prepare_call=prime),))
             binding = ple_embedding.bind(plan, **arguments)
             lookup = None
-        session.freeze()
         result = Case(model, owner, layout, session, table, binding, lookup,
                       checkpoint, planes, source_rows, token_map, args.engram_token_bound)
         cleanup.pop_all()
@@ -654,17 +672,27 @@ def measure(case: Case, prepared: int, flush: Any) -> dict[str, Any]:
     if flush is not None:
         flush()
     torch.cuda.synchronize()
+    gds = case.table._cache._gds
+    before = gds.native.transport_stats() if gds else None
     start = time.perf_counter_ns()
     case.run(prepared)
     torch.cuda.synchronize()
     wall_ms = (time.perf_counter_ns() - start) / 1e6
     io = case.table.stats()
     requested = io["requested_bytes"]
+    transport = None
+    if gds:
+        after = gds.native.transport_stats()
+        transport = {key: after[key] - before[key] for key in after}
+        if any(transport[key] for key in ("posix_ops", "aio_ops", "iouring_ops", "read_errors")):
+            raise RuntimeError(f"GDS direct-path qualification failed: {transport}")
     return {
+        "backend": case.table._cache._backend,
+        "transport": transport,
         "wall_ms": wall_ms,
         "io": io,
         "d2h_id_bytes": prepared * case.heads * 8,
-        "local_row_occurrences": requested // (264 if case.model == "engram" else 90),
+        "local_row_occurrences": requested // ((256 if case.table.resident_scales else 264) if case.model == "engram" else 90),
         "physical_over_logical_bytes": io["read_bytes"] / requested
         if requested
         else None,
@@ -681,6 +709,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--qwen-checkpoint", type=pathlib.Path, default=pathlib.Path(QWEN_PATH)
     )
+    parser.add_argument("--backends", default=os.environ.get("B12X_DISK_BACKEND", "io_uring"))
     parser.add_argument("--models", choices=("both", "engram", "qwen"), default="both")
     parser.add_argument("--capacities", default="256,1024,4096")
     parser.add_argument("--tokens", default="1,6,24,256,4096")
@@ -721,10 +750,12 @@ def arguments() -> argparse.Namespace:
         help="Same UTF-8 text tokenized separately with each actual tokenizer; cyclic continuation",
     )
     parser.add_argument("--check-rows", type=int, default=8)
+    parser.add_argument("--engram-resident-scales", action="store_true",
+                        help="Keep the Engram E8M0 plane in mapped host memory")
     parser.add_argument(
         "--engram-token-bound",
         action="store_true",
-        help="AFTER treatment: run(binding, token_count=T), requires new Engram API",
+        help="Limit Engram hashing and lookup to token_count=T",
     )
     parser.add_argument(
         "--l2-flush", action=argparse.BooleanOptionalAction, default=True
@@ -738,6 +769,11 @@ def arguments() -> argparse.Namespace:
         "--output", type=pathlib.Path, default=pathlib.Path("/tmp/b12x-ngram-ssd.json")
     )
     args = parser.parse_args()
+    args.backends = args.backends.split(",")
+    if not args.backends or len(set(args.backends)) != len(args.backends) or set(args.backends) - {"io_uring", "gds"}:
+        parser.error("backends must be io_uring, gds, or io_uring,gds")
+    if args.reader_library and args.backends != ["io_uring"]:
+        parser.error("reader-library selects only an io_uring object")
     try:
         args.capacities = sorted(set(map(int, args.capacities.split(","))))
         args.tokens = sorted(set(map(int, args.tokens.split(","))))
@@ -788,12 +824,17 @@ def main() -> None:
     args = arguments()
     torch.cuda.set_device(args.device)
     root = pathlib.Path(__file__).resolve().parents[1]
-    native_reader_path = select_native_reader(args.reader_library)
-    native_reader_object = {
-        **file_identity(native_reader_path),
-        "sha256": digest(native_reader_path),
-        "selection": "override" if args.reader_library else "default",
-    }
+    native_reader_objects = {}
+    for backend in args.backends:
+        if backend == "gds":
+            from b12x.loader._gds_native import load
+            native_reader_path = pathlib.Path(load().__file__).resolve()
+        else:
+            native_reader_path = select_native_reader(args.reader_library)
+        native_reader_objects[backend] = {
+            **file_identity(native_reader_path), "sha256": digest(native_reader_path),
+            "selection": "override" if args.reader_library else "default",
+        }
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=root, text=True
     ).strip()
@@ -816,7 +857,7 @@ def main() -> None:
         },
         "command_argv": [sys.executable, *sys.argv],
         "worktree_identity": worktree_identity,
-        "native_reader_object": native_reader_object,
+        "native_reader_objects": native_reader_objects,
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -842,11 +883,21 @@ def main() -> None:
                 "b12x/sequence/_shared/disk_table.py",
                 "b12x/loader/_native.py",
                 "b12x/loader/_ple_reader.c",
+                "b12x/loader/_row_plan.h",
+                "b12x/loader/_gds_reader.c",
+                "b12x/loader/_gds_native.py",
+                "b12x/sequence/_shared/_gds.py",
+                "b12x/sequence/engram/_preparation.py",
+                "b12x/sequence/ple_embedding/_preparation.py",
             )
         },
         "gpu_start": nvidia_smi_gpu_mode_snapshot(),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "mode": "io_uring O_DIRECT eager, isolated single rank; no graph capture or TP collective",
+        "mode": "O_DIRECT eager disk transaction, isolated single rank; no graph capture or TP collective",
+        "ordering": "reverse backend order on alternate query/repeat pairs",
+        "ratio_direction": "io_uring latency / GDS latency; greater than one favors GDS",
+        "cufile_config": os.environ.get("CUFILE_ENV_PATH_JSON"),
+        "cufile_config_sha256": digest(pathlib.Path(os.environ["CUFILE_ENV_PATH_JSON"])) if os.environ.get("CUFILE_ENV_PATH_JSON") else None,
         "query_domain": "matched text, separately tokenized cyclic streams"
         if args.text_file
         else "valid-domain random raw IDs; distinct model seeds, NOT semantically matched IDs",
@@ -906,127 +957,96 @@ def main() -> None:
                         continue
                     initial_query = next(query_stream(args, model, checkpoint.config["text_config"],
                                                       planned_tokens, 0, text_ids))
-                    case = make_case(args, checkpoint, model, owner, capacity, token_map,
-                                     initial_query, planned_tokens)
-                    try:
-                        boundary = case.boundary_check()
-                        payload["cases"].append(
-                            {
-                                "model": model,
-                                "owner": owner,
-                                "capacity": capacity,
-                                "shard_start": case.layout.shard_start,
-                                "shard_end": case.layout.shard_end,
-                                "table_rows": case.rows,
-                                "source_rows": case.source_rows,
-                                "registered_shards": list(case.planes),
-                                "boundary_correctness": boundary,
-                                "allocation_stats": case.table.stats(),
+                    with ExitStack() as resources:
+                        cases = {}
+                        selected_backend = os.environ.get("B12X_DISK_BACKEND")
+                        try:
+                            for backend in args.backends:
+                                os.environ["B12X_DISK_BACKEND"] = backend
+                                case = make_case(args, checkpoint, model, owner, capacity, token_map,
+                                                 initial_query, planned_tokens)
+                                resources.callback(case.close)
+                                cases[backend] = case
+                                if case.table._cache._gds:
+                                    case.table._cache._gds.native.start_stats()
+                        finally:
+                            if selected_backend is None:
+                                os.environ.pop("B12X_DISK_BACKEND", None)
+                            else:
+                                os.environ["B12X_DISK_BACKEND"] = selected_backend
+                        for backend, case in cases.items():
+                            case.session.freeze()
+                            boundary = case.boundary_check()
+                            payload["cases"].append({
+                                "model": model, "backend": backend, "owner": owner,
+                                "capacity": capacity, "shard_start": case.layout.shard_start,
+                                "shard_end": case.layout.shard_end, "table_rows": case.rows,
+                                "source_rows": case.source_rows, "registered_shards": list(case.planes),
+                                "boundary_correctness": boundary, "allocation_stats": case.table.stats(),
                                 "output_bytes": case.out.numel() * case.out.element_size(),
-                            }
-                        )
+                            })
                         for prepared in args.tokens:
                             if not args.tail_tokens < prepared <= capacity:
                                 continue
-                            first = next(
-                                query_stream(
-                                    args,
-                                    model,
-                                    checkpoint.config["text_config"],
-                                    prepared,
-                                    0,
-                                    text_ids,
-                                )
-                            )
-                            case.prepare(first)
-                            case.run(prepared)  # One untimed warmup per C/T/owner shape.
-                            torch.cuda.synchronize()
-                            case.check(first, prepared, args.check_rows)
-                            times = []
+                            first = next(query_stream(args, model, checkpoint.config["text_config"], prepared, 0, text_ids))
+                            for case in cases.values():
+                                case.prepare(first)
+                                case.run(prepared)
+                                torch.cuda.synchronize()
+                                case.check(first, prepared, args.check_rows)
+                            times = {backend: [] for backend in args.backends}
                             for repeat in range(args.repeats):
-                                for query in query_stream(
-                                    args,
-                                    model,
-                                    checkpoint.config["text_config"],
-                                    prepared,
-                                    repeat,
-                                    text_ids,
-                                ):
-                                    case.prepare(query)
-                                    measured = measure(case, prepared, flush)
-                                    correctness = case.check(
-                                        query, prepared, args.check_rows
-                                    )
-                                    if (
-                                        measured["local_row_occurrences"]
-                                        != correctness["local_rows"]
-                                    ):
-                                        raise AssertionError(
-                                            "Reader logical byte count differs from actual local hashes"
-                                        )
-                                    if measured["io"]["lookups"] != prepared * case.heads:
-                                        raise AssertionError(
-                                            "Reader did not process exactly the prepared ID extent"
-                                        )
-                                    row = {
-                                        "model": model,
-                                        "owner": owner,
-                                        "capacity": capacity,
-                                        "prepared_tokens": prepared,
-                                        "repeat": repeat,
-                                        "query": query,
-                                        "engram_token_bound": args.engram_token_bound
-                                        if model == "engram"
-                                        else None,
-                                        "correctness": correctness,
-                                        **measured,
-                                    }
-                                    times.append(measured["wall_ms"])
-                                    raw.write(json.dumps(row) + "\n")
-                                    raw.flush()
-                            summary = {
-                                "model": model,
-                                "owner": owner,
-                                "capacity": capacity,
-                                "prepared_tokens": prepared,
-                                "live_tokens": prepared - args.tail_tokens,
-                                "median_ms": statistics.median(times),
-                                "min_ms": min(times),
-                                "max_ms": max(times),
-                                "samples": len(times),
-                            }
-                            payload["summaries"].append(summary)
-                            print(json.dumps(summary), flush=True)
+                                for query in query_stream(args, model, checkpoint.config["text_config"], prepared, repeat, text_ids):
+                                    order = args.backends if (repeat + query["index"]) % 2 == 0 else args.backends[::-1]
+                                    for backend in order:
+                                        case = cases[backend]
+                                        case.prepare(query)
+                                        measured = measure(case, prepared, flush)
+                                        correctness = case.check(query, prepared, args.check_rows)
+                                        if measured["local_row_occurrences"] != correctness["local_rows"]:
+                                            raise AssertionError("Reader logical byte count differs from actual local hashes")
+                                        if measured["io"]["lookups"] != prepared * case.heads:
+                                            raise AssertionError("Reader did not process exactly the prepared ID extent")
+                                        row = {
+                                            "model": model, "owner": owner, "capacity": capacity,
+                                            "prepared_tokens": prepared, "repeat": repeat, "query": query,
+                                            "engram_token_bound": args.engram_token_bound if model == "engram" else None,
+                                            "correctness": correctness, **measured,
+                                        }
+                                        times[backend].append(measured["wall_ms"])
+                                        raw.write(json.dumps(row) + "\n")
+                                        raw.flush()
+                            medians = {backend: statistics.median(values) for backend, values in times.items()}
+                            for backend, values in times.items():
+                                summary = {
+                                    "model": model, "backend": backend, "owner": owner,
+                                    "capacity": capacity, "prepared_tokens": prepared,
+                                    "live_tokens": prepared - args.tail_tokens,
+                                    "median_ms": medians[backend], "min_ms": min(values),
+                                    "max_ms": max(values), "samples": len(values),
+                                }
+                                if len(medians) == 2:
+                                    summary["io_uring_over_gds"] = medians["io_uring"] / medians["gds"]
+                                payload["summaries"].append(summary)
+                                print(json.dumps(summary), flush=True)
                         torch.cuda.synchronize()
-                    finally:
-                        case.close()
-                    del case
+                    del case, cases
                     gc.collect()
             checkpoint.unchanged()
             payload["checkpoints"][model] = checkpoint.report()
         metadata["gpu_end"] = nvidia_smi_gpu_mode_snapshot()
-    # Sum owner medians only as an explicitly labelled aggregate, not as a
-    # serving critical-path or concurrent-TP measurement.
-    for capacity in args.capacities:
-        for prepared in args.tokens:
-            owners = [
-                r
-                for r in payload["summaries"]
-                if r["model"] == "engram"
-                and r["capacity"] == capacity
-                and r["prepared_tokens"] == prepared
-            ]
-            if len(owners) == 2:
-                payload["summaries"].append(
-                    {
-                        "model": "engram_both_owners",
-                        "capacity": capacity,
-                        "prepared_tokens": prepared,
-                        "sum_isolated_owner_medians_ms": sum(
-                            r["median_ms"] for r in owners
-                        ),
-                    }
-                )
+    metadata["loaded_cufile"] = sorted({line.split()[-1] for line in pathlib.Path("/proc/self/maps").read_text().splitlines() if "libcufile" in line})
+    for backend in args.backends:
+        for capacity in args.capacities:
+            for prepared in args.tokens:
+                owners = [r for r in payload["summaries"] if r["model"] == "engram" and
+                          r["capacity"] == capacity and r["prepared_tokens"] == prepared and r["backend"] == backend]
+                if len(owners) == 2:
+                    payload["summaries"].append({
+                        "model": "engram_both_owners", "backend": backend,
+                        "capacity": capacity, "prepared_tokens": prepared,
+                        "sum_isolated_owner_medians_ms": sum(r["median_ms"] for r in owners),
+                    })
     del payload["results"]
     with args.output.open("w") as final, spool.open() as raw:
         prefix = json.dumps(payload, indent=2)

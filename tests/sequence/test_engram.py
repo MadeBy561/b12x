@@ -208,3 +208,78 @@ def test_prepared_lookup_accepts_e8m0_bytes_and_exact_row_shards():
         assert torch.count_nonzero(out[0].view(24, 256)[1::3]) == 0
     finally:
         result.close(); session.close()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("resident_scales", [False, True])
+def test_disk_lookup_matches_varied_rows_with_graph_replay_and_stream_reuse(
+    resident_scales, tmp_path, monkeypatch,
+):
+    from contextlib import ExitStack
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    device = require_b12x()
+    plan = _declaration(device, tokens=3, rank=1, tp=3,
+                        invocation={"operation": "lookup", "compact_rows": True,
+                                    "resident_scales": resident_scales})
+    rows = plan.query.table_rows
+    weights = torch.arange(rows * 256, dtype=torch.float32).remainder(15).sub(7).reshape(rows, 256).to(torch.float8_e4m3fn)
+    scales = torch.arange(rows * 8).remainder(5).add(125).to(torch.uint8).reshape(rows, 8)
+    paths = [tmp_path / 'weights.bin', tmp_path / 'scales.bin']
+    for path, data in zip(paths, (weights, scales)):
+        path.write_bytes(bytes(4093) + data.view(torch.uint8).numpy().tobytes())
+    ids = torch.full((3, 24), -1, dtype=torch.int64, device=device)
+    count = torch.tensor([3], dtype=torch.int32, device=device)
+    out = torch.full((3, 6144), 73, dtype=torch.bfloat16, device=device)
+    tables = []
+    with ExitStack() as resources:
+        session = resources.enter_context(PreparationSession(device=device, autotune=False, compile_workers=2))
+        def prepare_call(state):
+            table = engram.DiskTable(state, queue_depth=2, resident_scales=resident_scales)
+            resources.callback(table.close)
+            for scale, path in zip((False, True), paths):
+                table.add_shard(0, str(path), 4093, scale=scale)
+            tables.append(table)
+            trial = _impl._bind_lookup_state(state, disk_table=table, hash_ids=ids, num_tokens=count, out=out)
+            def run():
+                with table._cache.transaction():
+                    table._cache.read_rows(ids, 72)
+                    state.run_lookup(trial, 3, clear_tail=True)
+            return PreparedCall(run=run)
+        resources.enter_context(session.prepare((plan.request(name='engram-disk', prepare_call=prepare_call),)))
+        table = tables[-1]
+        binding = engram.bind_lookup(plan, disk_table=table, hash_ids=ids, num_tokens=count, out=out)
+        start, end = table.state.shard_start, min(table.state.shard_end, rows)
+        cases = torch.tensor([start, end - 1, start, start - 1, end, -1, start + 3, start + 17], device=device).repeat(9).reshape(3, 24)
+        ids.copy_(cases)
+        engram.run_lookup(binding)
+        consumed = torch.empty_like(out)
+        graph = torch.cuda.CUDAGraph()
+        resources.callback(graph.reset)
+        with session.capture(), torch.cuda.graph(graph):
+            torch.mul(out, 2, out=consumed)
+        pointers = out.data_ptr(), table.weight.data_ptr(), table.scale_bytes.data_ptr()
+        streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+        for iteration, live in enumerate([3, 1, 0, 2, 3]):
+            with torch.cuda.stream(streams[iteration % 2]), kernel_resolution_guard('disk lookup reuses prepared programs'):
+                count.fill_(live)
+                ids.copy_(cases.roll(iteration, dims=1))
+                out.fill_(73)
+                engram.run_lookup(binding, token_count=live)
+                graph.replay()
+                streams[iteration % 2].synchronize()
+            expected = torch.zeros((3, 24, 256), dtype=torch.bfloat16)
+            cpu_ids = ids.cpu()
+            valid = (cpu_ids[:live] >= start) & (cpu_ids[:live] < end)
+            selected = cpu_ids[:live][valid]
+            expected[:live][valid] = (weights.float()[selected] * scales[selected].view(torch.float8_e8m0fnu).float().repeat_interleave(32, dim=1)).to(torch.bfloat16)
+            torch.testing.assert_close(out.cpu(), expected.flatten(1), rtol=0, atol=0)
+            torch.testing.assert_close(consumed.cpu(), expected.flatten(1) * 2, rtol=0, atol=0)
+            assert pointers == (out.data_ptr(), table.weight.data_ptr(), table.scale_bytes.data_ptr())
+        with monkeypatch.context() as patch:
+            patch.setattr(table._cache, 'read_rows', lambda *a: pytest.fail('consumer replay cannot read disk'))
+            graph.replay()
+            torch.cuda.synchronize(device)
+        if table._cache._gds:
+            assert table._cache.weight_host is None
+            assert (table._scale_owner is not None) == resident_scales

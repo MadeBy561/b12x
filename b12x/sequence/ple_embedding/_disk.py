@@ -37,7 +37,7 @@ class DiskTable:
             queue_depth=queue_depth,
         )
         self.weight = self._cache.weight.view(layout.weight_dtype)
-        self.weight_host = self._cache.weight_host.view(layout.weight_dtype)
+        self.weight_host = self._cache.weight_host.view(layout.weight_dtype) if self._cache.weight_host is not None else None
         self.weight_scale = (
             self._cache.scale.view(torch.float8_e4m3fn)
             if self._cache.scale is not None

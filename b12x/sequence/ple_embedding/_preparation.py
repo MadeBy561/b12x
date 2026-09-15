@@ -79,7 +79,11 @@ def compile_embedding(query_payload, config_payload, ordinal):
             *operands, *_lookup_constants(query),
             grid=(query.max_tokens, query.head_count, (query.head_dim + 127) // 128), num_warps=4,
         )
-    return hash_programs, lookup
+    gather = None
+    if query.table_memory == "io_uring":
+        from .._shared._gds import compile_gather
+        gather = compile_gather(ordinal)
+    return hash_programs, lookup, gather
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,7 @@ class _EmbeddingState:
     lookup: object
     lookup_constants: tuple
     grid_tail: tuple[int, int]
+    disk_gather: object
 
     def _check_lookup(self, weight, weight_scale, weight_scale_2, out):
         values = (weight, weight_scale, weight_scale_2, out)
@@ -188,11 +193,12 @@ def make_plan(caps, *, geometry, prime_sizes, table_offsets, multipliers, invoca
         return MemoryRequirements(scratch=layout.scratch_specs(), persistent=(inputs.memory(caps.device),))
 
     def materialize(selection, device):
-        hash_programs, lookup = compile_embedding(TUNING.encode_query(query), selection.config.to_dict(), device.ordinal)
+        hash_programs, lookup, gather = compile_embedding(TUNING.encode_query(query), selection.config.to_dict(), device.ordinal)
         hash_state = _HashState(hash_query, layout._hash_layout, inputs.materialize(caps.device), hash_programs)
         return _EmbeddingState(
             query, layout, hash_state, lookup, _lookup_constants(query),
             (query.head_count, (query.head_dim + 127) // 128),
+            gather,
         )
 
     return Plan(

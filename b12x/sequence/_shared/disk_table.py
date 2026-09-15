@@ -1,4 +1,4 @@
-"""Bounded io_uring row staging shared by PLE and Engram.
+"""Bounded disk row staging shared by PLE and Engram.
 
 The native reader owns bounded request planning and I/O. This module owns
 storage, source registration and the host/GPU transaction boundary; hashing
@@ -124,7 +124,7 @@ class MappedHostAllocation:
 
 
 class DiskRowCache:
-    """Read immutable row planes into a reusable, batch-sized mapped cache.
+    """Read immutable row planes into a reusable, batch-sized cache.
 
     Source rows have one weight byte plane and an optional independent scale
     byte plane. Neither file data nor full table allocations are retained.
@@ -163,39 +163,54 @@ class DiskRowCache:
         queue_depth = operator.index(queue_depth)
         if not 0 < self.shard_rows <= (1 << 63) - 1:
             raise ValueError("shard_rows must be a positive signed int64")
-        self._native = load()
-        self._reader = self._native.ple_reader(
-            self.shard_rows,
-            self.table_rows,
-            self.shard_start,
-            self.shard_end,
-            self.weight_row_bytes,
-            self.scale_row_bytes,
-            self.max_lookups,
-            queue_depth,
-        )
+        self._backend = os.environ.get("B12X_DISK_BACKEND", "io_uring")
+        if self._backend not in ("io_uring", "gds"):
+            raise ValueError("B12X_DISK_BACKEND must be io_uring or gds")
+        self._gds = None
+        self._native = None
+        self._reader = None
+        if self._backend == "io_uring":
+            self._native = load()
+            self._reader = self._native.ple_reader(
+                self.shard_rows,
+                self.table_rows,
+                self.shard_start,
+                self.shard_end,
+                self.weight_row_bytes,
+                self.scale_row_bytes,
+                self.max_lookups,
+                queue_depth,
+            )
         self.shard_count = (self.table_rows + self.shard_rows - 1) // self.shard_rows
         self.ids_host = torch.empty(
             (self.max_lookups,), dtype=torch.int64, device="cpu", pin_memory=True
         )
         self._ids_buffer = memoryview(self.ids_host.numpy())
-        self._weight_allocation = MappedHostAllocation(
-            (self.max_lookups, self.weight_row_bytes), torch.uint8, device
-        )
-        self.weight = self._weight_allocation.device_view
-        self.weight_host = self._weight_allocation.host_view
-        self._weight_buffer = memoryview(self.weight_host.numpy())
-        self._scale_allocation = None
-        self.scale = None
-        self.scale_host = None
-        self._scale_buffer = None
-        if self.scale_row_bytes:
-            self._scale_allocation = MappedHostAllocation(
-                (self.max_lookups, self.scale_row_bytes), torch.uint8, device
+        self._weight_allocation = self._scale_allocation = None
+        self.weight_host = self.scale_host = None
+        self._weight_buffer = self._scale_buffer = None
+        if self._backend == "gds":
+            from ._gds import GdsRows
+            self._gds = GdsRows(self, queue_depth)
+            self.weight, self.scale = self._gds.weight, self._gds.scale
+        else:
+            self._weight_allocation = MappedHostAllocation(
+                (self.max_lookups, self.weight_row_bytes), torch.uint8, device
             )
-            self.scale = self._scale_allocation.device_view
-            self.scale_host = self._scale_allocation.host_view
-            self._scale_buffer = memoryview(self.scale_host.numpy())
+            self.weight = self._weight_allocation.device_view
+            self.weight_host = self._weight_allocation.host_view
+            self._weight_buffer = memoryview(self.weight_host.numpy())
+            self._scale_allocation = None
+            self.scale = None
+            self.scale_host = None
+            self._scale_buffer = None
+            if self.scale_row_bytes:
+                self._scale_allocation = MappedHostAllocation(
+                    (self.max_lookups, self.scale_row_bytes), torch.uint8, device
+                )
+                self.scale = self._scale_allocation.device_view
+                self.scale_host = self._scale_allocation.host_view
+                self._scale_buffer = memoryview(self.scale_host.numpy())
         self._sources: set[tuple[bool, int]] = set()
         self._frozen = False
         self._lock = threading.RLock()
@@ -210,6 +225,11 @@ class DiskRowCache:
         if self._closed:
             raise RuntimeError("disk row cache is closed")
 
+    def __del__(self):
+        if not getattr(self, "_closed", True):
+            with suppress(Exception):
+                self.close()
+
     def close(self):
         with self._lock:
             if self._closed:
@@ -219,6 +239,8 @@ class DiskRowCache:
             if self._cache_used:
                 with torch.cuda.device(self.device):
                     self._cache_done.synchronize()
+            if self._gds is not None:
+                self._gds.close()
             for allocation in (self._scale_allocation, self._weight_allocation):
                 if allocation is not None:
                     allocation.close()
@@ -247,9 +269,10 @@ class DiskRowCache:
             end = min(start + self.shard_rows, self.table_rows)
             if end <= self.shard_start or start >= self.shard_end:
                 return
-            self._native.ple_reader_add(
-                self._reader, shard_index, os.fspath(path), offset, scale
-            )
+            if self._gds is not None:
+                self._gds.native.add(self._gds.reader, shard_index, os.fspath(path), offset, scale)
+            else:
+                self._native.ple_reader_add(self._reader, shard_index, os.fspath(path), offset, scale)
             self._sources.add(key)
 
     def require_complete(self) -> None:
@@ -321,6 +344,9 @@ class DiskRowCache:
         # Completes ID production and all prior cache readers before host writes.
         with torch.cuda.device(self.device):
             self._ids_ready.synchronize()
+            if self._gds is not None:
+                self._gds.read(self._ids_buffer, count, self._transaction_stream)
+                return
             self._native.ple_reader_run(
                 self._reader,
                 self._ids_buffer,
@@ -332,13 +358,14 @@ class DiskRowCache:
     def stats(self) -> dict[str, int | float]:
         self._require_open()
         with self._lock:
-            result = dict(self._native.ple_reader_stats(self._reader))
+            result = dict(self._gds.native.stats(self._gds.reader) if self._gds is not None
+                          else self._native.ple_reader_stats(self._reader))
             result["ids_host_bytes"] = (
                 self.ids_host.numel() * self.ids_host.element_size()
             )
-            result["weight_cache_bytes"] = self._weight_allocation.nbytes
+            result["weight_cache_bytes"] = self.weight.numel() * self.weight.element_size()
             result["scale_cache_bytes"] = (
-                self._scale_allocation.nbytes if self._scale_allocation else 0
+                self.scale.numel() * self.scale.element_size() if self.scale is not None else 0
             )
             result["cache_bytes"] = (
                 result["weight_cache_bytes"] + result["scale_cache_bytes"]
@@ -348,4 +375,11 @@ class DiskRowCache:
                 + result["ids_host_bytes"]
                 + result["cache_bytes"]
             )
+            descriptors = result.get("descriptor_bytes", 0)
+            result["gds_enabled"] = int(self._gds is not None)
+            result["device_staging_bytes"] = (result["staging_bytes"] + result["cache_bytes"] + descriptors) if self._gds else 0
+            result["owned_host_bytes"] = result["ids_host_bytes"] + descriptors + result["metadata_bytes"]
+            if self._gds is None:
+                result["owned_host_bytes"] += result["staging_bytes"] + result["cache_bytes"]
+            result["owned_staging_bytes"] += 2 * descriptors
             return result

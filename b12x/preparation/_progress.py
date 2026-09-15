@@ -105,7 +105,7 @@ class PreparationDisplay:
     or a measurement object. Pipe output is plain milestone text.
     """
 
-    def __init__(self, *, global_rank: int, stream=None, title="b12x / one-time kernel autotuning", cancel_available=False):
+    def __init__(self, *, global_rank: int, stream=None, title="b12x / kernel autotuning", cancel_available=False):
         if type(global_rank) is not int or global_rank < 0:
             raise ValueError("progress display requires a nonnegative global rank")
         self._enabled = global_rank == 0
