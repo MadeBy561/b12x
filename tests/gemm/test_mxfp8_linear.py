@@ -145,16 +145,20 @@ def test_mm_persistent_ctas_complete_single_stage_epilogue_stores() -> None:
 
 
 @pytest.mark.parametrize("out_features", (12448, 12544, 14336))
-def test_mm_prefill_swizzle_bounds_weight_scales(out_features: int) -> None:
+@pytest.mark.parametrize("capture", (False, True), ids=("eager", "graph"))
+def test_mm_prefill_swizzle_bounds_weight_scales(
+    out_features: int, capture: bool
+) -> None:
     """BK64 swizzle padding must not read beyond the packed weight scales.
 
     N=12448 is a TP2 GLM KDA projection; N=12544 has full scale atoms but
     a partial 16-tile raster; N=14336 has a complete raster. Run under
-    compute-sanitizer with PYTORCH_NO_CUDA_MEMORY_CACHING=1 for access bounds.
+    compute-sanitizer with PYTORCH_NO_CUDA_MEMORY_CACHING=1 and select the
+    eager cases for physical allocation bounds. Graph cases require PyTorch's
+    caching allocator for capture-time output and workspace allocations.
     """
     require_b12x()
     require_mxf8_mma()
-    import b12x
 
     capacity, in_features = 4096, 4096
     source = torch.ones((capacity, in_features), dtype=torch.bfloat16, device="cuda")
@@ -168,34 +172,39 @@ def test_mm_prefill_swizzle_bounds_weight_scales(out_features: int) -> None:
     packed = blockscaled.pack_weight(weight, scales)
     expected = (in_features * 2.0 ** exponents).to(torch.bfloat16)
 
-    for tokens in (137, 2048, capacity):
-        actual = blockscaled.mm(
-            source[:tokens], packed, mode="quantized", expected_m=capacity
-        )
-        torch.cuda.synchronize()
-        torch.testing.assert_close(actual, expected.expand(tokens, -1), rtol=0, atol=0)
+    with prepared(
+        source, packed, activation_mode="quantized"
+    ) as plan:
+        for tokens in (137, 2048, capacity):
+            actual = blockscaled.mm(source[:tokens], packed, plan=plan)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected.expand(tokens, -1), rtol=0, atol=0)
 
-    b12x.freeze_kernel_resolution("MXFP8 swizzled prefill scale bounds")
-    try:
+        if not capture:
+            return
+
         for tokens in (127, 257):
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                actual = blockscaled.mm(
-                    source[:tokens], packed, mode="quantized", expected_m=capacity
-                )
-            address = actual.data_ptr()
-            for multiplier in (0.5, 2.0, 1.0):
-                source.fill_(multiplier)
-                actual.fill_(float("nan"))
-                graph.replay()
-                torch.cuda.synchronize()
-                assert actual.data_ptr() == address
-                torch.testing.assert_close(
-                    actual, (expected * multiplier).expand(tokens, -1), rtol=0, atol=0
-                )
-            graph.reset()
-    finally:
-        b12x.unfreeze_kernel_resolution()
+            try:
+                with torch.cuda.graph(graph):
+                    actual = blockscaled.mm(source[:tokens], packed, plan=plan)
+                address = actual.data_ptr()
+                for multiplier in (0.5, 2.0, 1.0):
+                    source.fill_(multiplier)
+                    actual.fill_(float("nan"))
+                    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    assert actual.data_ptr() == address
+                    assert (
+                        torch.cuda.memory_stats()["allocation.all.allocated"]
+                        == allocations
+                    )
+                    torch.testing.assert_close(
+                        actual, (expected * multiplier).expand(tokens, -1), rtol=0, atol=0
+                    )
+            finally:
+                graph.reset()
 
 
 @pytest.mark.parametrize("tokens", (2, 3, 8, 15, 16, 17, 32, 99))
