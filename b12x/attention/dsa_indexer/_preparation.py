@@ -182,6 +182,39 @@ def compile_indexer(query_payload, config_payload, ordinal):
             allow_transient_fold_buffers=False, launcher_sink=gathered,
         )
         if binding.route != "paged_fused":
+            # A single live supertile combines the first and final top-k arms.
+            short_width = min(
+                query.max_page_table_width,
+                max(1, int(binding.supertile_k) // query.page_size),
+            )
+            if short_width < query.max_page_table_width:
+                short_binding = layout.bind(
+                    scratch=scratch,
+                    real_page_table=torch.empty(
+                        (values["page_table"].shape[0], short_width),
+                        dtype=values["page_table"].dtype,
+                        device=device,
+                    ),
+                    cache_seqlens_int32=values["cache_lengths"],
+                    active_width=values["active_width"],
+                    expected_num_q_heads=query.num_q_heads,
+                    shared_page_table=query.shared_page_table,
+                    output_physical_slots=query.output_physical_slots,
+                    _initialize=False,
+                )
+                index_topk_fp8(
+                    q_fp8=values["q_fp8"], weights=values["query_weights"],
+                    index_k_cache=values["index_k_cache"], binding=short_binding,
+                    page_size=query.page_size, topk=query.top_k,
+                    expected_num_q_heads=query.num_q_heads,
+                    out_indices=values["output_indices"],
+                    out_scores=values["output_scores"],
+                    launchers=(
+                        {"paged": resolved[0], "tiled": None}
+                        if binding.route == "paged_tiled" else None
+                    ),
+                    allow_transient_fold_buffers=False, launcher_sink=gathered,
+                )
             # The two-stage fold is a declared native family even when this
             # serving state uses its fixed-scratch carry path. Compile its
             # final row fold from the same exact row/top-k ABI; it remains
