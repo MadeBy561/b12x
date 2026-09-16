@@ -20,6 +20,7 @@ from .test_session import _deterministic_timer, declaration
 @pytest.fixture
 def cache_device(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device", lambda *_args: nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda ordinal: "Test GPU B" if ordinal == 2 else "Test GPU A")
     monkeypatch.setattr(compiler, "_device_uuid_key", lambda ordinal: ("device_uuid", f"gpu-{ordinal}"))
     monkeypatch.delenv("B12X_TUNING_CACHE_VERSION", raising=False)
 
@@ -53,9 +54,26 @@ def test_invalid_tuning_version_fails_before_cache_access(cache_device, monkeypa
         cache_identity({}, 0)
 
 
-def test_decisions_remain_device_and_model_specific(cache_device):
+def test_decisions_remain_device_name_and_model_specific(cache_device):
     assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "b"}, 0)
-    assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "a"}, 1)
+    assert cache_identity({"model": "a"}, 0) == cache_identity({"model": "a"}, 1)
+    assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "a"}, 2)
+
+
+def test_cached_choices_survive_uuid_and_ordinal_changes(cache_device, tmp_path, monkeypatch):
+    original = SelectionCache(tmp_path, cache_identity({"model": "a"}, 0))
+    _save_choice(original)
+    monkeypatch.setattr(compiler, "_device_uuid_key", lambda ordinal: ("device_uuid", "replacement-gpu"))
+    moved = SelectionCache(tmp_path, cache_identity({"model": "a"}, 1))
+    assert moved.path == original.path
+    assert moved.get("shape") == original.get("shape")
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+def test_missing_device_name_fails_before_cache_access(cache_device, monkeypatch, name):
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda ordinal: name)
+    with pytest.raises(RuntimeError, match="CUDA device name is unavailable"):
+        cache_identity({}, 0)
 
 
 def test_source_and_toolchain_changes_rekey_kernels_without_rekeying_decisions(cache_device, tmp_path, monkeypatch):
@@ -64,7 +82,9 @@ def test_source_and_toolchain_changes_rekey_kernels_without_rekeying_decisions(c
     monkeypatch.setattr(compiler, "_PACKAGE_ROOT", tmp_path)
     monkeypatch.setattr(compiler, "_b12x_package_fingerprint", compiler._compute_b12x_package_fingerprint)
     monkeypatch.setattr(compiler, "_runtime_toolchain_key", lambda: ("compiler-a",))
-    compile_context = lambda: compiler._static_compile_cache_context.__wrapped__(object())
+    def compile_context():
+        return compiler._static_compile_cache_context.__wrapped__(object())
+
     compiler._compile_environment_key.cache_clear()
     try:
         decision = cache_identity({}, 0)
@@ -130,7 +150,7 @@ def test_cached_choice_rebuilds_changed_program_without_racing(cache_device, tmp
     monkeypatch.setattr(session_module, "compiled_program_available", lambda program: program in available)
     monkeypatch.setattr(session_module, "compile_in_process", build)
 
-    def prepare():
+    def prepare(ordinal=0):
         def materialize(selection, device):
             program = ProgramKey("cute", f"{source_version}-{selection.config.width}")
             return SimpleNamespace(value=selection.config.width * 3, program=program)
@@ -148,7 +168,7 @@ def test_cached_choice_rebuilds_changed_program_without_racing(cache_device, tmp
             _materialize=materialize,
         )
         with PreparationSession(device=DetectedDevice(None, None), compile_workers=0) as session:
-            session._cache = SelectionCache(tmp_path, cache_identity({}, 0))
+            session._cache = SelectionCache(tmp_path, cache_identity({}, ordinal))
             result = session.prepare((plan.request(name="query", prepare_call=factory, benchmark_call=factory),))
             return result.selections["query"].source, result.benchmarked_candidates
 
@@ -156,7 +176,7 @@ def test_cached_choice_rebuilds_changed_program_without_racing(cache_device, tmp
     assert set(built) == {"a-1", "a-2", "a-4"}
     source_version = "b"
     built.clear()
-    assert prepare() == ("cached", 0)
+    assert prepare(ordinal=1) == ("cached", 0)
     assert built == ["b-2"]
     monkeypatch.setenv("B12X_TUNING_CACHE_VERSION", "2")
     built.clear()

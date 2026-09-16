@@ -105,8 +105,9 @@ every rank. Increment it before launch to discard prior tuning decisions:
 export B12X_TUNING_CACHE_VERSION=2
 ```
 
-Decision identity includes that version, the model namespace and physical
-device identity. Source edits and compiler/toolchain changes do not invalidate
+Decision identity includes that version, the model namespace and reported
+CUDA device name. GPUs with the same name share choices regardless of UUID or
+visible ordinal. Source edits and compiler/toolchain changes do not invalidate
 decisions automatically. CuTe and Triton artifacts retain their source-based
 keys; the tuning-cache version is excluded from the compiler environment key.
 A cached decision still validates its assignment and configuration, then

@@ -24,7 +24,6 @@ def digest(value):
 
 def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
     import torch
-    from b12x._lib.compiler import _device_uuid_key
 
     raw_version = os.environ.get("B12X_TUNING_CACHE_VERSION", "1")
     try:
@@ -34,13 +33,12 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
     if version <= 0:
         raise ValueError("B12X_TUNING_CACHE_VERSION must be a positive integer")
     with torch.cuda.device(device_ordinal):
-        uuid = _device_uuid_key(device_ordinal)
-        if uuid is None:
-            raise RuntimeError("preparation requires a resolved physical CUDA device")
+        name = torch.cuda.get_device_name(device_ordinal).strip()
+        if not name:
+            raise RuntimeError("CUDA device name is unavailable")
         return {
             "schema_version": 5, "tuning_cache_version": version,
-            "namespace": dict(namespace), "device": uuid,
-            "visible_ordinal": device_ordinal,
+            "namespace": dict(namespace), "device_name": name,
         }
 
 
