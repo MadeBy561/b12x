@@ -192,6 +192,7 @@ class _CompilePointer:
 
 
 def compile_pooled_selection(query_payload, ordinal):
+    """Compile pooled selection from planned metadata, without cache contents."""
     query = SparseMlaQuery(**dict(query_payload))
     i32, i64 = _CompilePointer(torch.int32), _CompilePointer(torch.int64)
     with torch.cuda.device(ordinal):
@@ -241,15 +242,25 @@ def plan_pooled_selection(
     block_stride_rows: int | None = None,
     override: SparseMlaConfig | None = None,
 ) -> Plan:
-    """Declare the pool-to-physical-slot transform before graph capture."""
+    """Declare the pool-to-physical-slot transform before graph capture.
+
+    The plan owns the compiled program but no scratch or cache storage. Prepare
+    its request, then pass the plan to ``expand_pooled_topk_to_physical_slots``.
+    Live row counts do not specialize the compiled program.
+    """
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError("pooled selection requires a CUDA device")
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    if min(max_rows, page_size, max_page_table_width, num_cache_blocks,
-           pool_size, pool_topk) < 1:
-        raise ValueError("pooled selection capacities must be positive")
+    if any(
+        type(value) is not int or value <= 0
+        for value in (
+            max_rows, page_size, max_page_table_width, num_cache_blocks,
+            pool_size, pool_topk,
+        )
+    ):
+        raise ValueError("pooled-selection capacities must be positive integers")
     stride = page_size if block_stride_rows is None else block_stride_rows
     if stride < page_size:
         raise ValueError("physical cache block geometry is invalid")
