@@ -19,7 +19,7 @@ from .._shared.mla.api import (
 from .._shared.mla.api import (
     clear_mla_caches as clear_caches,
 )
-from .pooled_selection import expand_pooled_topk_to_physical_slots
+from .pooled_selection import expand_pooled_topk_to_physical_slots, plan_pooled_selection
 from ._scratch import (
     B12XSparseMLABinding as _RuntimeBinding,
 )
@@ -178,6 +178,7 @@ __all__ = [
     "bind",
     "run",
     "plan_cache_writer",
+    "plan_pooled_selection",
     "concat_and_cache_glm_next_mla",
     "concat_and_cache_glm_next_mla_fp8",
     "concat_and_cache_glm_next_mla_nvfp4",

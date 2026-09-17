@@ -195,7 +195,8 @@ def _pooled_selection_reference(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("rows", [1, 7, 32])
-def test_pooled_topk_expands_to_physical_slots(rows: int) -> None:
+@pytest.mark.parametrize("planned", [False, True])
+def test_pooled_topk_expands_to_physical_slots(rows: int, planned: bool) -> None:
     device = require_sm120()
     pool_size = 4
     block_size = 256
@@ -224,6 +225,25 @@ def test_pooled_topk_expands_to_physical_slots(rows: int) -> None:
     output = torch.empty((rows, 2051), dtype=torch.int32, device=device)
     active_counts = torch.empty(rows, dtype=torch.int32, device=device)
 
+    plan = None
+    if planned:
+        from b12x.preparation import PreparationSession, PreparedCall
+
+        plan = sparse_mla.plan_pooled_selection(
+            device=device, max_rows=32, page_size=block_size,
+            max_page_table_width=80, num_cache_blocks=num_cache_blocks,
+        )
+        request = plan.request(
+            name="pooled selection",
+            prepare_call=lambda state: PreparedCall(run=lambda: state.run(
+                pool_indices, positions, request_ids, block_table, output,
+                active_counts, pool_size=pool_size, block_size=block_size,
+                block_stride_rows=block_stride_rows,
+                num_cache_blocks=num_cache_blocks,
+            )),
+        )
+        PreparationSession(device=device, compile_workers=0).prepare((request,))
+
     sparse_mla.expand_pooled_topk_to_physical_slots(
         pool_indices,
         positions,
@@ -235,6 +255,7 @@ def test_pooled_topk_expands_to_physical_slots(rows: int) -> None:
         block_size=block_size,
         block_stride_rows=block_stride_rows,
         num_cache_blocks=num_cache_blocks,
+        plan=plan,
     )
     expected, expected_counts = _pooled_selection_reference(
         pool_indices,
