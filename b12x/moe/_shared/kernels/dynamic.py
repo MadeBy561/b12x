@@ -1829,6 +1829,41 @@ class MoEDynamicKernelBackend:
                 self.input_pair_barrier_4.arrive_and_wait()
 
     @cute.jit
+    def _down_scale_from_tile_amax(
+        self, intermediate, rows: Int32, buffer: Int32,
+        tidx: Int32, warp_idx: Int32, scratch_addr: Int32,
+    ):
+        local_max = cutlass.Float32(0.0)
+        scan_idx = tidx
+        cols = Int32(self.tile_shape_mnk[2])
+        while scan_idx < rows * cols:
+            value = cutlass.Float32(
+                intermediate[scan_idx // cols, scan_idx % cols, buffer]
+            )
+            local_max = fmax_f32(local_max, fabs_f32(value))
+            scan_idx += Int32(self.num_mma_warps * self.num_threads_per_warp)
+        warp_amax = warp_reduce(local_max, fmax_f32)
+        lane_id = tidx & Int32(31)
+        if lane_id == Int32(0):
+            st_shared_f32(scratch_addr + warp_idx * Int32(4), warp_amax)
+        self.epilog_sync_barrier.arrive_and_wait()
+        if warp_idx == 0:
+            tile_amax = cutlass.Float32(0.0)
+            if lane_id < Int32(self.num_mma_warps):
+                tile_amax = ld_shared_f32(scratch_addr + lane_id * Int32(4))
+            tile_amax = warp_reduce(tile_amax, fmax_f32)
+            if lane_id == Int32(0):
+                st_shared_f32(scratch_addr, tile_amax)
+        self.epilog_sync_barrier.arrive_and_wait()
+        tile_amax = ld_shared_f32(scratch_addr)
+        scale = cutlass.Float32(0.0)
+        if tile_amax > cutlass.Float32(0.0):
+            scale = cutlass.Float32(_FC2_TILE_RECIP_GS_NUM) / tile_amax
+        scale = fmax_f32(scale, cutlass.Float32(1.0e-12))
+        self.epilog_sync_barrier.arrive_and_wait()
+        return scale
+
+    @cute.jit
     def _sync_w4a8_stage_ready(self, stage: Int32):
         if stage == Int32(0):
             self.w4a8_ready_barrier_0.arrive_and_wait()
@@ -5260,6 +5295,8 @@ class MoEDynamicKernelBackend:
                 fc1_n_tiles = cute.size(tCrB, mode=[1])
                 slice_idx = Int32(0)
                 while slice_idx < task_slice_count_val:
+                    if cutlass.const_expr(self.dynamic_down_scale):
+                        fc2_down_alpha_value = down_alpha_value
                     # FC2 rebinds A/SFA to the quantized intermediate at offset
                     # zero. Restore FC1's routed-input slice before every
                     # additional intermediate slice in a grouped task.
@@ -5569,6 +5606,16 @@ class MoEDynamicKernelBackend:
                         if _epi_rows > Int32(self.epi_tile[0]):
                             _epi_rows = Int32(self.epi_tile[0])
                         _qgs = global_scale[task_expert_idx].to(cutlass.Float32)
+                        if cutlass.const_expr(self.dynamic_down_scale):
+                            if _epi_rows > Int32(0):
+                                tile_gs_value = self._down_scale_from_tile_amax(
+                                    sC, _epi_rows, Int32(0), Int32(tidx), warp_idx,
+                                    reduce_scratch_addr,
+                                )
+                                fc2_down_alpha_value = down_alpha_value * (
+                                    _qgs / tile_gs_value
+                                )
+                                _qgs = tile_gs_value
                         _qi = Int32(tidx)
                         while _qi < _epi_rows * sf_blocks_per_row:
                             _lr = _qi // sf_blocks_per_row
@@ -7355,8 +7402,6 @@ class MoEDynamicKernelBackend:
                             sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 16)
                             fc2_quant_block_elems = Int32(16)
                         gs_value = global_scale[task_expert_idx].to(cutlass.Float32)
-                        if cutlass.const_expr(self.dynamic_down_scale):
-                            fc2_down_alpha_value = down_alpha_value
 
                         for epi_m in cutlass.range_constexpr(epi_rest_m):
                             epi_m_valid = valid_rows - Int32(epi_m) * Int32(
@@ -7443,66 +7488,14 @@ class MoEDynamicKernelBackend:
                             quant_gs_value = gs_value
                             if cutlass.const_expr(self.dynamic_down_scale):
                                 if epi_rows > Int32(0):
-                                    local_max = cutlass.Float32(0.0)
-                                    scan_idx = Int32(tidx)
-                                    scan_total = (
-                                        epi_rows
-                                        * sf_blocks_per_row
-                                        * fc2_quant_block_elems
+                                    tile_gs_value = self._down_scale_from_tile_amax(
+                                        sC, epi_rows, epi_buffer, Int32(tidx), warp_idx,
+                                        reduce_scratch_addr,
                                     )
-                                    while scan_idx < scan_total:
-                                        sr = scan_idx // (
-                                            sf_blocks_per_row * fc2_quant_block_elems
-                                        )
-                                        sc = scan_idx % (
-                                            sf_blocks_per_row * fc2_quant_block_elems
-                                        )
-                                        local_max = fmax_f32(
-                                            local_max,
-                                            fabs_f32(
-                                                cutlass.Float32(sC[sr, sc, epi_buffer])
-                                            ),
-                                        )
-                                        scan_idx += Int32(
-                                            self.num_mma_warps
-                                            * self.num_threads_per_warp
-                                        )
-                                    warp_amax = warp_reduce(local_max, fmax_f32)
-                                    lane_id = Int32(tidx) & Int32(31)
-                                    if lane_id == Int32(0):
-                                        st_shared_f32(
-                                            reduce_scratch_addr + warp_idx * Int32(4),
-                                            warp_amax,
-                                        )
-                                    self.epilog_sync_barrier.arrive_and_wait()
-                                    if warp_idx == 0:
-                                        tile_amax = cutlass.Float32(0.0)
-                                        if lane_id < Int32(self.num_mma_warps):
-                                            tile_amax = ld_shared_f32(
-                                                reduce_scratch_addr + lane_id * Int32(4)
-                                            )
-                                        tile_amax = warp_reduce(tile_amax, fmax_f32)
-                                        if lane_id == Int32(0):
-                                            st_shared_f32(
-                                                reduce_scratch_addr, tile_amax
-                                            )
-                                    self.epilog_sync_barrier.arrive_and_wait()
-                                    tile_amax = ld_shared_f32(reduce_scratch_addr)
-                                    tile_gs_value = cutlass.Float32(0.0)
-                                    if tile_amax > cutlass.Float32(0.0):
-                                        tile_gs_value = (
-                                            cutlass.Float32(_FC2_TILE_RECIP_GS_NUM)
-                                            / tile_amax
-                                        )
-                                    tile_gs_value = fmax_f32(
-                                        tile_gs_value, cutlass.Float32(1.0e-12)
+                                    fc2_down_alpha_value = down_alpha_value * (
+                                        gs_value / tile_gs_value
                                     )
-                                    if tile_gs_value != cutlass.Float32(0.0):
-                                        fc2_down_alpha_value = down_alpha_value * (
-                                            gs_value / tile_gs_value
-                                        )
                                     quant_gs_value = tile_gs_value
-                                    self.epilog_sync_barrier.arrive_and_wait()
                             quant_idx = Int32(tidx)
                             while quant_idx < epi_rows * sf_blocks_per_row:
                                 local_row = quant_idx // sf_blocks_per_row
