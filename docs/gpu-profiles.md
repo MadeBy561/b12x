@@ -152,7 +152,14 @@ set). Preparation that performs no race does not build it.
 
 Each candidate is primed once. A batch times two representative samples
 per candidate by default, with L2 eviction and activation production before
-each timed invocation. The first scored invocation also sizes a 256-microsecond
+each timed invocation. A caller may supply `PreparedCall.benchmark_producers`
+to describe a fixed workload mix over the same binding. Each scored repetition
+visits every producer, with its own eviction, reset, and timed invocation;
+the score is the arithmetic mean across the complete mix. Candidates must
+declare the same workload count. Priming and restoration use `produce`.
+The invocation identity must version the corpus so old selections are not
+reused after a distribution change.
+The first scored invocation also sizes a 256-microsecond
 kernel-time budget per round; there are no unscored calibration replays.
 Every sample queues a CUDA stream memory wait before its start event and
 releases the wait through mapped host memory after its end event is queued.

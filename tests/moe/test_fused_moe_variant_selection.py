@@ -21,6 +21,29 @@ class _Variant:
         return (self.count, kwargs)
 
 
+@pytest.mark.parametrize(
+    "tokens,topk,experts,expected_unique",
+    ((1, 6, 384, 6), (4, 6, 384, 14), (6, 6, 384, 22), (8, 6, 384, 29),
+     (7, 3, 128, 13), (8, 6, 6, 6)),
+)
+def test_shared_40_workload_reuses_experts_across_distinct_topk_rows(
+    tokens, topk, experts, expected_unique,
+):
+    """Count reuse across the batch, never duplicate experts within a token."""
+    from b12x.moe.fused_moe.workloads import make_routing_ids
+
+    for seed in (42, 43, 44, 45):
+        ids = make_routing_ids(tokens, topk, experts, seed=seed)
+        assert ids.shape == (tokens, topk)
+        assert ids.dtype == torch.int32
+        assert ids.unique().numel() == expected_unique
+        assert all(row.unique().numel() == topk for row in ids)
+        assert ids.min() >= 0 and ids.max() < experts
+        torch.testing.assert_close(
+            ids, make_routing_ids(tokens, topk, experts, seed=seed),
+        )
+
+
 def test_variant_for_preserves_exact_counts_and_reuses_prefill_capacity():
     variants = {count: _Variant(count) for count in (1, 2, 4, 8, 125, 128)}
     assert variant_for(variants, 4) is variants[4]

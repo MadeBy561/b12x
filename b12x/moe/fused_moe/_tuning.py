@@ -9,6 +9,7 @@ from b12x.preparation import (
     FrozenMapping,
     Knob,
     ParameterBinding,
+    ParameterSpace,
     TuningContract,
     make_fixed_contract,
 )
@@ -178,6 +179,14 @@ def _nvfp4_query(query):
     )
 
 
+def _compact_w4a8_query(query):
+    return (
+        query.quant_mode == "w4a8_mx"
+        and query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 64
+    )
+
+
 def _nvfp4_materialization_eligible(query, config):
     tile = query.controls.get("dynamic_tile_mn")
     return bool(
@@ -276,8 +285,16 @@ def validate_moe_decode_config(
         raise ValueError("the Triton route planner only supports small NVFP4 SiLU workloads")
     if config.max_active_clusters is not None and config.max_active_clusters <= 0:
         raise ValueError("max_active_clusters must be positive when set")
-    if config.route_planner != "triton" and config.max_active_clusters is not None:
-        raise ValueError("max_active_clusters requires the Triton route planner")
+    if config.max_active_clusters is not None:
+        if config.route_planner != "triton" and not (
+            _compact_w4a8_query(query) and config.backend in {"micro", "dynamic"}
+        ):
+            raise ValueError("max_active_clusters requires Triton routing or compact W4A8")
+        if (
+            _compact_w4a8_query(query) and _device is not None
+            and config.max_active_clusters > _device.sm_count
+        ):
+            raise ValueError("max_active_clusters must not exceed the resident SM count")
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:
             raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")
@@ -361,6 +378,22 @@ def _materialize_tuning(query, device, choice):
 def _tuning_parameters(query, device):
     if device is None or device.sm_count <= 0:
         raise ValueError("MoE launch tuning requires the device SM count")
+    if _compact_w4a8_query(query):
+        # FC1 and FC2 expose different task counts. Retain the full SM ladder
+        # for both, plus half/three-quarter grids and the original uncapped path.
+        sms = device.sm_count
+        ladder = sorted(
+            {1 << exponent for exponent in range(sms.bit_length())}
+            | {max(1, sms // 2), max(1, 3 * sms // 4), sms}
+        )
+        return ParameterSpace.create(
+            tuple(
+                replace(knob, when=FrozenMapping())
+                if knob.name == "max_active_clusters" else knob
+                for knob in TUNING.knobs
+            ),
+            values={"max_active_clusters": (None, *ladder)},
+        )
     from ._impl import (
         _LEVEL_TILE_N,
         _dynamic_kernel_intermediate_size,
@@ -450,7 +483,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 TUNING = TuningContract(
     component_id="moe.decode",
     query_schema_version=8,
-    config_schema_version=4,
+    config_schema_version=5,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -459,7 +492,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=5,
+    candidate_contract_version=6,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),

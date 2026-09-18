@@ -11335,7 +11335,7 @@ def _launch_dynamic_flat(
             )
         effective_mac = min(effective_mac, direct_task_count)
     if (
-        external_route_plan
+        (external_route_plan or w4a8_n64_repacked)
         and policy_max_active_clusters > 0
         and _first_env(
             "B12X_DYNAMIC_MAX_ACTIVE_CLUSTERS",
@@ -13108,7 +13108,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             scratch=s.micro_intermediate,
             _prepared_kernel=compact.kernels[topk_ids.dtype],
             _prepared_quantize=compact.quantize,
-            _sm_count=compact.sm_count,
+            max_active_clusters=plan.decode_config.max_active_clusters,
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,

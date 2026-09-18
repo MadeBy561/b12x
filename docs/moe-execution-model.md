@@ -88,6 +88,20 @@ The current kernel families map onto those axes as follows:
 | native NVFP4 W4A16 decode | direct top-k | inline | persistent grid | source-native payload and block scales |
 | W4A16 tensor-core | sorted/padded; direct at small M for MMA-packed weights | precomputed; inline at small M | persistent grid | native payload and scales for AUTO; MMA-packed payload and scales for uniform A16 |
 
+## Compact W4A8 tails
+
+Native E8M0/K32 weights with a local intermediate width of `128k + 64`
+retain their exact storage extent. The decode tuner races direct micro and
+internal grouped M16 execution, including a runtime `max_active_clusters`
+ladder up to the device SM count. On GB10 the ladder is 1, 2, 4, 8, 16, 24,
+32, 36, and 48, plus the original default (`None`).
+
+The grouped front-end keeps at most that many cooperative CTAs; its separate
+projection kernels use twice that grid width. Direct micro caps both projection
+grids at twice the selected value and strides over the remaining work. Its
+default retains one CTA per tile. Grid limits do not specialize the compiled
+program or alter weight storage, scratch capacity, or quantization.
+
 ## Sharing NVFP4 storage across activation precisions
 
 **Implemented:** both ModelOpt NVFP4 W4A16 consumers read the same packed
@@ -308,3 +322,31 @@ The code now has:
 The remaining specialization is intentional: precision selects operand
 transport and MMA instructions; availability constrains legal schedulers; and
 measured cost variance selects among those schedulers.
+
+## Verification routing workload
+
+`b12x.moe.fused_moe.workloads.make_routing_ids` provides the `shared_40`
+workload. Sharing means `1 - distinct_experts / (tokens * top_k)` across the
+batch; each token still routes to distinct experts. Counts round to the nearest
+realizable value: top-6 batches of 4, 6, and 8 tokens use 14, 22, and 29 experts.
+Single-token batches cannot share, and a small expert pool can force more reuse.
+The deterministic generator spreads IDs across the expert pool and favors
+already popular experts when reusing them.
+
+The vLLM preparation adapter uses four seeded realizations for 2–8 token
+batches. Every candidate sees the same inputs and is scored over the complete
+mix before elimination. Other batch sizes retain cyclic, maximally spread
+routing. `shared_40_v1` versions selection-cache inputs; compiled kernels do not
+change when the tuning workload changes. This is a simple assumed workload,
+not a claim that all models or every layer have the same routing distribution.
+
+The assumption is informed by DSV4.1 TP4 serving observations on GB10: 179,600
+target-layer calls from short/medium-context reasoning and code requests showed
+36–42% reuse at observed 5/7/8-row verification sizes. The separate drafter was
+more concentrated (about 62% reuse). Raw traces are diagnostic artifacts, not
+runtime dependencies.
+
+Use `benchmarks/benchmark_moe.py --routing-workload shared_40 --batch-sizes 4 6 8`
+with the usual checkpoint, quantization, and validation arguments to exercise
+this workload in the pre-routed single-operation benchmark. Input generation
+and routing remain outside the timed region.

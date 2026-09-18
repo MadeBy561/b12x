@@ -323,6 +323,7 @@ class PreparedCall:
     owners: tuple[object, ...] = ()
     close: Callable[[], None] | None = None
     capture_safe: bool = True
+    benchmark_producers: tuple[Callable[[], None], ...] = ()
 
     def invoke(self):
         result = self.run()
