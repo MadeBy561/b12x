@@ -314,7 +314,17 @@ slice. An in-flight step finishes before the deadline is checked. Pending
 compilation, collective readiness and winner exchange return control
 immediately, so a driver can coordinate ranks before admitting dependent work.
 `configure_tuning_shard(rank, ranks)` assigns the process a disjoint share of
-every race; ranks exchange their local winners through `TuningRequirement`
+every race. Before its first distributed preparation, the session yields a
+`TuningCacheRequirement` in `progress.ready_cache`. The driver gathers one
+snapshot from each participant in rank order and passes that tuple back with
+`job.advance(cache=snapshots)`. b12x validates matching cache identities and
+completed records, then uses the first available record in rank order for
+each key. This session-local agreement handles missing and conflicting cache
+entries without copying executable artifacts or modifying another rank's
+disk cache. Each rank still compiles and primes its selected kernels locally.
+Queries missing from all snapshots are autotuned normally.
+
+Ranks exchange their local winners through `TuningRequirement`
 and install the global winner. Collective declarations are never raced; their
 priming is preceded by a `CollectiveRequirement` barrier that a distributed
 driver authorizes only when every participant is ready. `cancel_tuning()` is
