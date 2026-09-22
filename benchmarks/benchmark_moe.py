@@ -17,7 +17,7 @@ import os
 import pathlib
 import statistics
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Callable, Sequence
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -300,6 +300,22 @@ class ShapeSpec:
     top_k: int
 
 
+def logical_expert_bytes(
+    spec: ModelSpec, *, activation: str, quant_mode: str, source_format: str,
+) -> int:
+    """Unique weight payload, excluding padding, activations, and rereads."""
+    elements = spec.hidden_size * (
+        moe_activation_w1_rows(activation, spec.I_tp) + spec.I_tp
+    )
+    if source_format == "iq2_xs":
+        return elements // 256 * 74
+    if quant_mode == "w4a8_nvfp4":
+        # Native FP4 plus K32 exponents and K16 residual scales.
+        return elements // 2 + elements // 32 + elements // 16
+    block_size = 32 if source_format == "fp4_e8m0_k32" else 16
+    return elements // 2 + elements // block_size
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     label: str
@@ -343,6 +359,25 @@ MODEL_PROFILES = {
         tp_size=1,
         hf_repo_id=None,
         default_quant_mode="w4a16",
+    ),
+    # https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL/blob/main/config.json
+    "mimo26-flash-shape": ModelProfile(
+        label="MiMo V2.6 Flash MXFP4 (shape)",
+        checkpoint_family="mimo26_flash_shape",
+        default_layer_idx=1,
+        tp_size=2,
+        hf_repo_id=None,
+        default_quant_mode="w4a8_mx",
+        shape=ShapeSpec(4096, 2048, 256, 8),
+    ),
+    "mimo26-flash-nvfp4-shape": ModelProfile(
+        label="MiMo V2.6 Flash NVFP4 (synthetic comparison)",
+        checkpoint_family="mimo26_flash_nvfp4_shape",
+        default_layer_idx=1,
+        tp_size=2,
+        hf_repo_id=None,
+        default_quant_mode="nvfp4",
+        shape=ShapeSpec(4096, 2048, 256, 8),
     ),
     "qwen38-flash-next": ModelProfile(
         label="Qwen3.8 Flash Next",
@@ -872,13 +907,20 @@ def make_shape_only_expert_weights(
     else:
         w13_weight = torch.empty(E, w13_rows, K // 2, dtype=torch.uint8, device=device)
         w2_weight = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
-        w13_weight.fill_(0x11)
-        w2_weight.fill_(0x11)
-        w13_sf = torch.ones(E, w13_rows, K // 16, dtype=torch.float8_e4m3fn, device=device)
-        down_sf = torch.ones(E, K, I_tp // 16, dtype=torch.float8_e4m3fn, device=device)
+        # Distinct signed weights/scales expose route, layout, and scale bugs
+        # that identical experts with constant positive weights cannot catch.
+        gen = torch.Generator(device=device).manual_seed(10_000 + layer_idx)
+        w13_weight.random_(0, 256, generator=gen)
+        w2_weight.random_(0, 256, generator=gen)
+        w13_sf = torch.empty(E, w13_rows, K // 16, device=device).uniform_(
+            0.01, 0.03, generator=gen,
+        ).to(torch.float8_e4m3fn)
+        down_sf = torch.empty(E, K, I_tp // 16, device=device).uniform_(
+            0.01, 0.03, generator=gen,
+        ).to(torch.float8_e4m3fn)
         w13_blockscale_swizzled = swizzle_block_scale(w13_sf)
         w2_blockscale_swizzled = swizzle_block_scale(down_sf)
-        w13_layout = "w31"
+        w13_layout = "w31" if activation == SWIGLUOAI_UNINTERLEAVE else "w13"
 
     if source_format == "fp4_e8m0_k32":
         e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
@@ -900,6 +942,10 @@ def make_shape_only_expert_weights(
     w2_input_scale = w2_input_scale_per_expert.max()
     g1_alphas_per_expert = torch.ones(E, dtype=torch.float32, device=device)
     g2_alphas_per_expert = torch.ones(E, dtype=torch.float32, device=device)
+    if source_format == "modelopt_nvfp4":
+        # Normalize the synthetic down projection's output units. FC1 and
+        # activation quantization still see the full random dynamic range.
+        g2_alphas_per_expert.mul_(1.0 / 64.0)
     g1_alphas = g1_alphas_per_expert
     g2_alphas = g2_alphas_per_expert
     w13_input_scale_quant = (1.0 / w13_input_scale).to(torch.float32)
@@ -1001,9 +1047,13 @@ def load_expert_weights(
         "laguna_s21_shape",
         "minimax_m3_shape",
         "qwen38_flash_next_shape",
+        "mimo26_flash_shape",
+        "mimo26_flash_nvfp4_shape",
     }:
         shape_source_format = (
-            "fp4_e8m0_k32" if checkpoint_family == "dsv4f_shape" else "modelopt_nvfp4"
+            "fp4_e8m0_k32"
+            if checkpoint_family in {"dsv4f_shape", "mimo26_flash_shape"}
+            else "modelopt_nvfp4"
         )
         return make_shape_only_expert_weights(
             spec,
@@ -2412,6 +2462,7 @@ def make_oracle_reference(
     *,
     activation: str,
     activation_params: ActivationParams | None = None,
+    quant_scale_math: str = "direct_division",
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
     activation_params = activation_params or ActivationParams()
@@ -2581,6 +2632,9 @@ def make_oracle_reference(
     if oracle_mode == "w4a16":
         raise ValueError("--oracle-mode w4a16 requires --quant-mode w4a16")
     oracle_fn = moe_reference_nvfp4 if oracle_mode == "nvfp4" else moe_reference_f32
+    oracle_kwargs = (
+        {"quant_scale_math": quant_scale_math} if oracle_mode == "nvfp4" else {}
+    )
     return oracle_fn(
         x,
         weights.w13_weight,
@@ -2597,6 +2651,7 @@ def make_oracle_reference(
         spec.hidden_size,
         spec.I_tp,
         activation=activation,
+        **oracle_kwargs,
         **activation_params.kwargs(),
     )
 
@@ -2810,6 +2865,7 @@ def prepare_moe_execution(
     inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     outputs: dict[int, torch.Tensor],
     route_mode: str = "auto",
+    override: fused_moe.MoeDecodeConfig | None = None,
 ) -> object:
     """Prepare each exact benchmark M before binding its real caller buffers."""
     capacity = fused_moe.ExecutionCapacity(
@@ -2817,8 +2873,9 @@ def prepare_moe_execution(
         top_k=top_k,
         warmup_token_counts=tuple(inputs),
     )
-    override = None
     if route_mode != "auto":
+        if override is not None:
+            raise ValueError("route_mode and explicit MoE config cannot both be set")
         override = fused_moe.MoeDecodeConfig(
             backend="w4a16",
             route_planner="internal",
@@ -3214,6 +3271,18 @@ def bench_e2e() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
+        "--timing-backend", choices=("events", "cupti"), default="events",
+        help="CUPTI sums GPU kernel durations; events include graph gaps.",
+    )
+    parser.add_argument("--output-json", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--autotune", action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument(
+        "--moe-config", type=json.loads, default=None,
+        help="JSON MoeDecodeConfig override for controlled single-op experiments.",
+    )
+    parser.add_argument(
         "--repeats",
         type=int,
         default=5,
@@ -3245,6 +3314,10 @@ def bench_e2e() -> None:
     )
     parser.add_argument("--tp-size", type=int, default=None, help="Override TP size from model profile")
     parser.add_argument("--tp-rank", type=int, default=0, help="Rank slice to benchmark (default: 0)")
+    parser.add_argument(
+        "--intermediate-size", type=int, default=None,
+        help="Override the global expert width of a shape-only profile (before TP).",
+    )
     parser.add_argument("--tp-parallel", action="store_true", help="Load all TP rank slices and replay per-rank CUDA graphs in parallel streams")
     parser.add_argument("--model-path", type=pathlib.Path, default=None)
     parser.add_argument("--layer-idx", type=int, default=None)
@@ -3338,6 +3411,12 @@ def bench_e2e() -> None:
     )
     parser.add_argument("--validate", choices=["none", "oracle"], default=None)
     parser.add_argument(
+        "--oracle-quant-scale-math",
+        choices=("direct_division", "micro", "dynamic_fast", "dynamic_precise"),
+        default="direct_division",
+        help="NVFP4 oracle activation-quantization evaluation order.",
+    )
+    parser.add_argument(
         "--oracle-mode",
         choices=[
             "nvfp4",
@@ -3412,6 +3491,18 @@ def bench_e2e() -> None:
         or args.profile_once != "none" or not args.flush_l2
     ):
         parser.error("--profile-graphs requires cold-L2 single-op --graph-only execution")
+    if args.timing_backend == "cupti" and (
+        not args.graph_only or args.graph_mode != "single-op" or args.tp_parallel
+    ):
+        parser.error("CUPTI requires --graph-only, single-op, and one rank")
+    if (args.moe_config is not None or args.output_json is not None) and (
+        args.graph_mode != "single-op" or args.tp_parallel
+    ):
+        parser.error("--moe-config/--output-json require single-op and one rank")
+    config_override = (
+        fused_moe.MoeDecodeConfig(**args.moe_config)
+        if args.moe_config is not None else None
+    )
     model_profile = MODEL_PROFILES[args.model_profile]
     if args.activation is None:
         args.activation = model_profile.default_activation
@@ -3551,6 +3642,12 @@ def bench_e2e() -> None:
     spec = build_model_spec(
         model_path, model_profile, tp_size_override=args.tp_size, tp_rank=args.tp_rank, layer_idx=layer_idx,
     )
+    if args.intermediate_size is not None:
+        if model_profile.shape is None:
+            parser.error("--intermediate-size requires a shape-only profile")
+        if args.intermediate_size <= 0 or args.intermediate_size % spec.tp_size:
+            parser.error("--intermediate-size must be positive and divisible by TP")
+        spec = replace(spec, intermediate_size=args.intermediate_size)
     if args.top_k is not None:
         if model_profile.shape is None:
             raise ValueError("--top-k is limited to synthetic shape-only profiles")
@@ -3682,7 +3779,7 @@ def bench_e2e() -> None:
         w4a16_native=args.w4a16_native,
     )
     precomputed_oracles: dict[int, torch.Tensor] = {}
-    if args.validate == "oracle" and weight_plan._impl.reuses_source_storage:
+    if args.validate == "oracle":
         print(
             "  Precomputing oracle outputs before destructive weight "
             "preparation...",
@@ -3714,6 +3811,7 @@ def bench_e2e() -> None:
                 oracle_topk,
                 activation=args.activation,
                 activation_params=activation_params,
+                quant_scale_math=args.oracle_quant_scale_math,
             )
             # Outputs are the only state retained across the ownership
             # transfer.  Keep them off-device; never retain a second model.
@@ -3754,7 +3852,7 @@ def bench_e2e() -> None:
         plan=weight_plan,
     )
     _clear_b12x_caches()
-    b12x_session = PreparationSession(device=device)
+    b12x_session = PreparationSession(device=device, autotune=args.autotune)
     print("  Preparing b12x declarations...", end="", flush=True)
     x_warm, topk_ids_w, topk_weights_w = make_profile_routed_inputs(
         model_profile, weights, spec, 1, 42, device,
@@ -3768,6 +3866,7 @@ def bench_e2e() -> None:
         inputs={1: (x_warm, topk_ids_w, topk_weights_w)},
         outputs={1: warmup_output},
         route_mode=args.w4a16_route_policy,
+        override=config_override,
     )
     warmup_binding = bind_prepared_moe(
         warmup_execution,
@@ -3825,6 +3924,7 @@ def bench_e2e() -> None:
     batch_results: dict[int, BatchResult] = {}
     accuracy_failures: list[str] = []
     reference_warnings: list[str] = []
+    evidence: list[dict] = []
     for batch_size in batch_sizes:
         print(f"\n{'=' * 70}")
         print(f"  batch_size={batch_size}  (tokens*top_k = {batch_size * spec.top_k} expert calls)")
@@ -3883,6 +3983,7 @@ def bench_e2e() -> None:
             inputs={batch_size: (x, topk_ids, topk_weights)},
             outputs={batch_size: backend_output},
             route_mode=args.w4a16_route_policy,
+            override=config_override,
         )
         backend_binding = bind_prepared_moe(
             backend_execution,
@@ -3978,21 +4079,7 @@ def bench_e2e() -> None:
 
         oracle_ref = None
         if args.validate == "oracle":
-            precomputed = precomputed_oracles.pop(batch_size, None)
-            if precomputed is not None:
-                oracle_ref = precomputed.to(device=device)
-            else:
-                oracle_ref = make_oracle_reference(
-                    args.oracle_mode,
-                    args.quant_mode,
-                    x,
-                    weights,
-                    params,
-                    topk_ids,
-                    topk_weights,
-                    activation=args.activation,
-                    activation_params=activation_params,
-                )
+            oracle_ref = precomputed_oracles[batch_size].to(device=device)
             print(
                 "  oracle:".ljust(28),
                 f"norm={oracle_ref.float().norm().item():.5f}",
@@ -4007,6 +4094,11 @@ def bench_e2e() -> None:
 
         backend_out = backend_e2e().clone()
         torch.cuda.synchronize()
+        if not torch.isfinite(backend_out).all() or (
+            active_experts and not torch.count_nonzero(backend_out)
+        ):
+            raise RuntimeError(f"M={batch_size}: nonfinite or all-zero MoE output")
+        backend_metrics = None
 
         if ref_output is not None:
             ref_compare_metrics = compare_to_reference(backend_out, ref_output)
@@ -4039,6 +4131,26 @@ def bench_e2e() -> None:
                         min_cosine=args.min_cosine,
                     )
                 )
+
+        if accuracy_failures:
+            raise RuntimeError("Oracle failed before timing: " + "; ".join(accuracy_failures))
+        exact = getattr(backend_execution, "variants", {}).get(batch_size, backend_execution)
+        record = {
+            "tokens": batch_size,
+            "active_experts": active_experts,
+            "logical_weight_bytes": active_experts * logical_expert_bytes(
+                spec, activation=args.activation, quant_mode=args.quant_mode,
+                source_format=weights.source_format,
+            ),
+            "selection": {
+                "source": exact.selection.source,
+                "config": asdict(exact.selection.config),
+                "query": exact.selection.query.to_dict(),
+            },
+            "oracle": asdict(backend_metrics) if backend_metrics is not None else None,
+            "graph_samples_ms": {},
+        }
+        evidence.append(record)
 
         if args.profile_once != "none":
             if args.profile_once == "backend":
@@ -4152,15 +4264,24 @@ def bench_e2e() -> None:
                     # Warm graph replay separately; replay latency is the value
                     # that should drive the default summary.
                     device_before = nvidia_smi_gpu_mode_snapshot() if args.raw_samples_jsonl is not None else None
-                    graph_runs = [
-                        bench_events(
-                            replay,
-                            warmup=args.warmup,
-                            iters=args.iters,
-                            l2_flush=l2_flush,
-                        )
-                        for _ in range(args.repeats)
-                    ]
+                    if args.timing_backend == "cupti":
+                        from flashinfer.testing import bench_gpu_time_with_cupti
+
+                        graph_runs = [
+                            bench_gpu_time_with_cupti(
+                                fn, use_cuda_graph=True,
+                                cold_l2_cache=args.flush_l2,
+                                dry_run_iters=args.warmup, repeat_iters=args.iters,
+                            ) for _ in range(args.repeats)
+                        ]
+                    else:
+                        graph_runs = [
+                            bench_events(
+                                replay, warmup=args.warmup, iters=args.iters,
+                                l2_flush=l2_flush,
+                            ) for _ in range(args.repeats)
+                        ]
+                    record["graph_samples_ms"][name] = graph_runs
                     stats = summarize_timing_runs(graph_runs)
                     if args.raw_samples_jsonl is not None:
                         with args.raw_samples_jsonl.open("a") as handle:
@@ -4190,8 +4311,14 @@ def bench_e2e() -> None:
                             torch.cuda.synchronize()
                         finally:
                             torch.cuda.profiler.stop()
+                    if name == backend_label:
+                        bandwidth = record["logical_weight_bytes"] / stats.median_us / 1000
+                        record["useful_weight_GBps"] = bandwidth
+                        record["median_us"] = stats.median_us
+                        print(f"    useful weight bandwidth: {bandwidth:.1f} GB/s")
                 except Exception as exc:
                     print(f" FAILED ({type(exc).__name__}: {exc})")
+                    raise
 
             if ref_name in graph_stats_by_name and backend_label in graph_stats_by_name:
                 ref_graph_stats = graph_stats_by_name[ref_name]
@@ -4335,6 +4462,25 @@ def bench_e2e() -> None:
         del graph
     torch.cuda.synchronize()
     b12x_session.close()
+
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps({
+            "command": sys.argv,
+            "gpu": torch.cuda.get_device_name(),
+            "gpu_uuid": str(torch.cuda.get_device_properties(device).uuid),
+            "model_profile": args.model_profile,
+            "geometry": asdict(spec),
+            "quant_mode": args.quant_mode,
+            "source_format": weights.source_format,
+            "scale_contract": args.scale_contract,
+            "routing_workload": args.routing_workload,
+            "timing_backend": args.timing_backend,
+            "cold_l2": args.flush_l2,
+            "validation": args.validate,
+            "oracle_quant_scale_math": args.oracle_quant_scale_math,
+            "cases": evidence,
+        }, indent=2, default=str) + "\n")
 
     ratio_results = {
         batch_size: result.ratio_stats.median
