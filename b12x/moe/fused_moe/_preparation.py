@@ -480,6 +480,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             planned_tile_m=tile_m,
             dynamic_route_mode="direct" if direct_routing else "grouped",
             deterministic_output=plan.deterministic_output,
+            w4a8_n64_repacked=n64_repacked,
         )
         and _impl._env_flag(
             _impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV,
@@ -931,6 +932,8 @@ def compile_dynamic_route_plan(payload, ordinal):
             MockTensor(ids_dtype, (rows,)),
             MockTensor(torch.int32, (num_experts,)),
             MockTensor(torch.int32, (num_experts + 1,)),
+            MockTensor(torch.int32, (1,)),
+            MockTensor(torch.int32, (1,)),
             rows,
             NUM_EXPERTS=num_experts,
             TILE_M=tile_m,

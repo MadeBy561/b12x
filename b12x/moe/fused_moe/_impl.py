@@ -1952,13 +1952,17 @@ def _dynamic_route_plan_kernel(
     topk_ids,
     row_counts,
     expert_tile_base,
+    barrier_count,
+    barrier_epoch,
     live_routes,
     NUM_EXPERTS: tl.constexpr,
     TILE_M: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_ROUTES: tl.constexpr,
 ):
-    """Build the grouped expert histogram and padded tile prefix in one CTA."""
+    """Initialize grouped routing and its resident-grid barrier in one CTA."""
+    tl.store(barrier_count, 0)
+    tl.store(barrier_epoch, 0)
     experts = tl.arange(0, BLOCK_E)
     expert_mask = experts < NUM_EXPERTS
     tl.store(row_counts + experts, 0, mask=expert_mask)
@@ -2052,9 +2056,11 @@ def _dynamic_external_route_plan_supported(
     planned_tile_m: int,
     dynamic_route_mode: str,
     deterministic_output: bool,
+    w4a8_n64_repacked: bool = False,
 ) -> bool:
     return bool(
-        _normalize_quant_mode(quant_mode) == "nvfp4"
+        (_normalize_quant_mode(quant_mode) == "nvfp4"
+         or (_normalize_quant_mode(quant_mode) == "w4a8_mx" and w4a8_n64_repacked))
         and activation == "silu"
         and int(planned_tile_m) == 16
         and 0 < int(routed_rows) <= _DYNAMIC_EXTERNAL_ROUTE_PLAN_MAX_ROWS
@@ -11321,6 +11327,7 @@ def _launch_dynamic_flat(
         planned_tile_m=selected_tile_m,
         dynamic_route_mode=("direct" if direct_routing else "grouped"),
         deterministic_output=deterministic_output,
+        w4a8_n64_repacked=w4a8_n64_repacked,
     )
     external_route_plan = bool(
         external_route_plan_supported
@@ -11431,7 +11438,7 @@ def _launch_dynamic_flat(
         planned_tile_m=planned_tile_m,
         planned_num_tokens=planned_num_tokens,
     )
-    if volatile_launch_state:
+    if volatile_launch_state and not external_route_plan:
         barrier_count.zero_()
         barrier_epoch.zero_()
 
@@ -11446,6 +11453,8 @@ def _launch_dynamic_flat(
             flat_ids,
             row_counts,
             expert_tile_base,
+            barrier_count,
+            barrier_epoch,
             routed_rows,
             NUM_EXPERTS=E,
             TILE_M=selected_tile_m,

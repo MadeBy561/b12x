@@ -500,6 +500,9 @@ def _dense_gemm_policy_for(
                 and mma_tiler_mn == (16, 128)
                 else 2
             )
+    if not _B12X_DENSE_SPLITK_TURBO:
+        # The FP32 workspace reducer consumes exactly two partials.
+        split_k_slices = min(split_k_slices, 2)
     # A declared expected_m owns compile-time tuning for its regime. Without a
     # hint, keep the unroll choice stable throughout the persistent scheduler
     # regime so one warmed kernel covers every live M in that regime.

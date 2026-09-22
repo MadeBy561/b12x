@@ -1170,13 +1170,14 @@ class MoEDynamicKernelBackend:
                 "W4A8 MX (materialized execution is M16-only)"
             )
         if self.external_route_plan and not (
-            quant_recipe == "nvfp4"
+            (quant_recipe == "nvfp4"
+             or (quant_recipe == "w4a8_mx" and self.w4a8_n64_repacked))
             and not self.direct_routing
             and work_source
             in {_WORK_SOURCE_MATERIALIZED_QUEUE, _WORK_SOURCE_PERSISTENT_GRID}
         ):
             raise ValueError(
-                "external route planning requires grouped NVFP4 with the "
+                "external route planning requires grouped NVFP4 or compact W4A8 with the "
                 "materialized or persistent work source"
             )
         if self.is_w4a8 and swap_ab:
@@ -3464,7 +3465,7 @@ class MoEDynamicKernelBackend:
 
         # General grouped execution compacts routes by expert.  Tiny direct-
         # routing decode instead gives every routed pair its own physical M tile:
-        # this removes the histogram, serial expert prefix, and two resident-
+        # this removes the histogram, expert prefix, and two resident-
         # grid barriers while retaining the exact same compute/task body.
         # The external route-plan specialization gets the grouped histogram and
         # prefix from an ordered Triton launch and skips the same control phase.
@@ -3490,17 +3491,31 @@ class MoEDynamicKernelBackend:
                 is_cta_leader,
             )
 
-            if flat_tid == Int32(0):
+            # Scan coalesced chunks in one warp, preserving expert order.
+            if Int32(bidz) == Int32(0) and warp_idx == Int32(0):
+                prefix_lane = Int32(tidx) & Int32(31)
                 tile_acc = Int32(0)
-                expert_idx = Int32(0)
-                while expert_idx < num_experts:
-                    expert_tile_base[expert_idx] = tile_acc
-                    rows = row_counts[expert_idx]
-                    tile_acc += (
-                        rows + Int32(self.tile_shape_mnk[0]) - Int32(1)
-                    ) // Int32(self.tile_shape_mnk[0])
-                    expert_idx += Int32(1)
-                expert_tile_base[num_experts] = tile_acc
+                expert_chunk = Int32(0)
+                while expert_chunk < num_experts:
+                    expert_idx = expert_chunk + prefix_lane
+                    tiles = Int32(0)
+                    if expert_idx < num_experts:
+                        tiles = (
+                            row_counts[expert_idx]
+                            + Int32(self.tile_shape_mnk[0]) - Int32(1)
+                        ) // Int32(self.tile_shape_mnk[0])
+                    prefix = tiles
+                    for shift in cutlass.range_constexpr(5):
+                        offset = Int32(1 << shift)
+                        preceding = cute.arch.shuffle_sync(prefix, prefix_lane - offset)
+                        if prefix_lane >= offset:
+                            prefix += preceding
+                    if expert_idx < num_experts:
+                        expert_tile_base[expert_idx] = tile_acc + prefix - tiles
+                    tile_acc += cute.arch.shuffle_sync(prefix, Int32(31))
+                    expert_chunk += Int32(32)
+                if prefix_lane == Int32(0):
+                    expert_tile_base[num_experts] = tile_acc
 
             self._resident_grid_barrier(
                 barrier_count,

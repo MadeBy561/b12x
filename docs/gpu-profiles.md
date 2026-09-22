@@ -223,6 +223,11 @@ K512 prefill tiles outside short-K or narrow-output cases. MXFP8 retains
 16-row tiles through M128 and the legal BK64 row-tile exception. Explicit
 launch constraints bypass these search heuristics.
 
+Native lagged mHC races 4, 9, 13 and 25 partials per CTA when its fused
+producer is active. This compile-time parameter is inactive for other routes,
+so it does not multiply their candidate counts. `B12X_MHC_PARTIALS_PER_CTA`
+pins the grouping, while preparation without tuning retains the existing defaults.
+
 mHC prefill at M>=384 couples M warp groups, single N warps and 128–256
 buffered K elements. At M>=2048 it keeps N tiles covering all 24 projections
 and at least 2048 K elements per split. Beyond eight K splits, the grid is
