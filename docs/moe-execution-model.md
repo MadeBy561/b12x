@@ -352,5 +352,7 @@ runtime dependencies.
 
 Use `benchmarks/benchmark_moe.py --routing-workload shared_40 --batch-sizes 4 6 8`
 with the usual checkpoint, quantization, and validation arguments to exercise
-this workload in the pre-routed single-operation benchmark. Input generation
-and routing remain outside the timed region.
+this workload in the pre-routed single-operation benchmark. The CLI also accepts
+`shared_0`, `shared_20`, `shared_60`, `shared_80`, and `shared_100` for separate
+coverage measurements, and reports actual expert row counts after rounding.
+Input generation and routing remain outside the timed region.
