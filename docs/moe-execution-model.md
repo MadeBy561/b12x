@@ -38,11 +38,11 @@ The canonical numeric recipes are:
 | native W4A8-MX | MXFP8 E4M3 / E8M0 K/32 | E8M0 K/32 | E8M0 K/32 |
 | W4A16 | BF16 / none | E4M3 K/16 or E8M0 K/32 | source-preserving |
 
-## Coupled trellis transforms
+## Intermediate Hadamard trellis transforms
 
-Trellis-coded expert weights arrive in the BTX container
-(``docs/btx-checkpoint-format.md``), which stores a fixed-rate trellis
-payload for each expert matrix. Its coupled transform declaration applies
+Trellis-coded expert weights arrive in the EXL3 container
+(``docs/exl3-checkpoint-format.md``), which stores a fixed-rate trellis
+payload for each expert matrix. Its intermediate Hadamard declaration applies
 the same exact activation-boundary coordinate change at K2, K3, and K4:
 
 ```text
@@ -52,9 +52,9 @@ expert input
   -> ordinary 128-wide gate/up transforms
   -> compact trellis FC1
   -> inverse ordinary transforms
-  -> coupled gate/up signs and 128-wide transforms
+  -> intermediate gate/up signs and 128-wide transforms
   -> coordinatewise gated activation
-  -> coupled 128-wide post-activation transform
+  -> intermediate 128-wide post-activation transform
   -> ordinary down-projection transform
   -> compact trellis FC2
   -> route reduction
@@ -68,7 +68,7 @@ ordinary projection rows followed by two preactivation rows and one
 post-activation row. The local hidden width must be divisible by 512 and the
 local intermediate width by 128.
 
-The BTX manifest declares the transform explicitly (``hadamard.coupled``
+The EXL3 manifest declares the transform explicitly (``hadamard.intermediate_hadamard``
 with its block widths). Ordinary per-matrix transforms remain valid only for
 artifacts whose metadata specifies them; the runtime does not infer transform
 type from the trellis bit rate.

@@ -180,11 +180,11 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         ),
         "trellis_bits": plan.trellis_bits,
         "trellis_tile_config": plan.trellis_tile_config,
-        "coupled_hadamard": plan.coupled_hadamard,
+        "intermediate_hadamard": plan.intermediate_hadamard,
         "trellis_codebook": plan.trellis_codebook,
         "trellis_rate_granularity": plan.trellis_rate_granularity,
         "trellis_pair_kinds": None if plan.trellis_pair_kinds is None else tuple(plan.trellis_pair_kinds),
-        "coupled_hadamard_blocks": plan.coupled_hadamard_blocks,
+        "intermediate_hadamard_blocks": plan.intermediate_hadamard_blocks,
     }
 
 
@@ -628,7 +628,7 @@ def _program_carriers(
                         swiglu_beta=plan.swiglu_beta,
                         weight_layout=weight_layout,
                         trellis_bits=caps.weight_plan.trellis_bits or 0,
-                        trellis_coupled=caps.weight_plan.coupled_hadamard,
+                        trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                     )
                     launches.append(launch)
     elif plan.implementation == "dynamic":
@@ -648,7 +648,7 @@ def _program_carriers(
                 deterministic_output=plan.deterministic_output,
                 swiglu_limit=plan.swiglu_limit, swiglu_alpha=plan.swiglu_alpha,
                 swiglu_beta=plan.swiglu_beta, trellis_bits=caps.weight_plan.trellis_bits or 0,
-                trellis_coupled=caps.weight_plan.coupled_hadamard,
+                trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
             )
             launches.append(launch)

@@ -7353,7 +7353,7 @@ def _select_mxfp8_tile_k(
         and _use_low_sm_dense_tactics(sm_count)
     ):
         return 64
-    # Keep tile M and K coupled for the short-K, wide-output prefill plan.
+    # Keep tile M and K tied for the short-K, wide-output prefill plan.
     if (
         expected_m is not None
         and expected_m >= 2048
